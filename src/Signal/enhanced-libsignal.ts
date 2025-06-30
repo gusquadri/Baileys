@@ -1,11 +1,12 @@
 import * as libsignal from 'libsignal'
-import { GroupCipher, GroupSessionBuilder, SenderKeyDistributionMessage, SenderKeyName, SenderKeyRecord } from '../../WASignalGroup'
 import { SignalAuthState, SignalKeyStoreWithTransaction } from '../Types'
 import { SignalRepository } from '../Types/Signal'
 import { addEnhancedTransactionCapability, generateSignalPubKey } from '../Utils'
 import { jidDecode } from '../WABinary'
 import logger from '../Utils/logger'
-
+import { SenderKeyName } from './Group/sender-key-name'
+import { SenderKeyRecord } from './Group/sender-key-record'
+import { GroupCipher, GroupSessionBuilder, SenderKeyDistributionMessage } from './Group'
 /**
  * Enhanced version of the libsignal repository that uses the enhanced signal store
  * with improved locking mechanisms to prevent race conditions and data corruption.
