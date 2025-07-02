@@ -99,8 +99,6 @@ export const addTransactionCapability = (
 ): SignalKeyStoreWithTransaction => {
 	// Mutex for each key type (session, pre-key, etc.)
 	const keyTypeMutexes = new Map<string, Mutex>()
-	// Mutex for individual keysAdd commentMore actions
-	const keyMutexes = new Map<string, Mutex>()
 	// Global transaction mutex
 	const transactionMutex = new Mutex()
 
@@ -179,7 +177,8 @@ export const addTransactionCapability = (
 
 				try {
 					// Acquire all necessary mutexes to prevent concurrent access
-					for (const keyType in data) {
+					const sortedKeyTypes = Object.keys(data).sort()
+					for (const keyType of sortedKeyTypes) {
 						const typeMutex = getKeyTypeMutex(keyType)
 						await typeMutex.acquire()
 						mutexes.push(typeMutex)
@@ -222,37 +221,15 @@ export const addTransactionCapability = (
 						if (transactionsInProgress === 1) {
 							if (Object.keys(mutations).length) {
 								logger.trace('committing transaction')
-								// retry mechanism to ensure we've some recovery
-								// in case a transaction fails in the first attempt
-								let tries = maxCommitRetries
-								while (tries) {
-									tries -= 1
-									//eslint-disable-next-line max-depth
-									try {
-										// Acquire mutexes for all key types being modified
-										const mutexes: Mutex[] = []
-										for (const keyType in mutations) {
-											const typeMutex = getKeyTypeMutex(keyType)
-											await typeMutex.acquire()
-											mutexes.push(typeMutex)
-										}
-
-										try {
-											await state.set(mutations)
-											logger.trace({ dbQueriesInTransaction }, 'committed transaction')
-											break
-										} finally {
-											// Release all mutexes in reverse order
-											while (mutexes.length > 0) {
-												const mutex = mutexes.pop()
-												if (mutex) mutex.release()
-											}
-										}
-									} catch (error) {
-										logger.warn(`failed to commit ${Object.keys(mutations).length} mutations, tries left=${tries}`)
-										await delay(delayBetweenTriesMs)
-									}
-								}
+								await commitMutationsWithRetry(
+									mutations,
+									state,
+									logger,
+									maxCommitRetries,
+									delayBetweenTriesMs,
+									getKeyTypeMutex,
+									dbQueriesInTransaction
+								)
 							} else {
 								logger.trace('no mutations in transaction')
 							}
@@ -326,11 +303,13 @@ export const addTransactionCapability = (
 		if (!transactionCache[key]) {
 			transactionCache[key] = {}
 		}
+
 		transactionCache[key][keyId] = null
 
 		if (!mutations[key]) {
 			mutations[key] = {}
 		}
+
 		mutations[key][keyId] = null
 	}
 
@@ -345,21 +324,18 @@ export const addTransactionCapability = (
 		if (!transactionCache[key]) {
 			transactionCache[key] = {}
 		}
+
 		transactionCache[key][keyId] = keyValue
 
 		if (!mutations[key]) {
 			mutations[key] = {}
 		}
+
 		mutations[key][keyId] = keyValue
 	}
 
 	// Helper function to handle pre-key operations outside transaction
-	async function handlePreKeyOutsideTransaction(
-		keyType: string,
-		keyData: any,
-		state: SignalKeyStore,
-		logger: ILogger
-	) {
+	async function handlePreKeyOutsideTransaction(keyType: string, keyData: any, state: SignalKeyStore, logger: ILogger) {
 		for (const keyId in keyData) {
 			if (keyData[keyId] === null) {
 				const existingKeys = await state.get(keyType as any, [keyId])
@@ -367,6 +343,56 @@ export const addTransactionCapability = (
 					logger.warn(`Attempted to delete non-existent pre-key: ${keyId}`)
 					delete keyData[keyId]
 				}
+			}
+		}
+	}
+
+	// Helper function to commit mutations with retry logic
+	async function commitMutationsWithRetry(
+		mutations: SignalDataSet,
+		state: SignalKeyStore,
+		logger: ILogger,
+		maxRetries: number,
+		delayMs: number,
+		getKeyTypeMutex: (type: string) => Mutex,
+		dbQueriesInTransaction: number
+	): Promise<void> {
+		let tries = maxRetries
+		while (tries) {
+			tries -= 1
+			try {
+				await commitMutationsOnce(mutations, state, logger, getKeyTypeMutex, dbQueriesInTransaction)
+				break
+			} catch (error) {
+				logger.warn(`failed to commit ${Object.keys(mutations).length} mutations, tries left=${tries}`)
+				await delay(delayMs)
+			}
+		}
+	}
+
+	// Helper function to commit mutations once
+	async function commitMutationsOnce(
+		mutations: SignalDataSet,
+		state: SignalKeyStore,
+		logger: ILogger,
+		getKeyTypeMutex: (type: string) => Mutex,
+		dbQueriesInTransaction: number
+	): Promise<void> {
+		const mutexes: Mutex[] = []
+		const sortedKeyTypes = Object.keys(mutations).sort()
+		for (const keyType of sortedKeyTypes) {
+			const typeMutex = getKeyTypeMutex(keyType)
+			await typeMutex.acquire()
+			mutexes.push(typeMutex)
+		}
+
+		try {
+			await state.set(mutations)
+			logger.trace({ dbQueriesInTransaction }, 'committed transaction')
+		} finally {
+			while (mutexes.length > 0) {
+				const mutex = mutexes.pop()
+				if (mutex) mutex.release()
 			}
 		}
 	}
