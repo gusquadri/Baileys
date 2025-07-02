@@ -1,6 +1,7 @@
 import NodeCache from '@cacheable/node-cache'
-import {randomBytes} from 'crypto'
-import {DEFAULT_CACHE_TTLS} from '../Defaults'
+import { Mutex } from 'async-mutex'
+import { randomBytes } from 'crypto'
+import { DEFAULT_CACHE_TTLS } from '../Defaults'
 import type {
 	AuthenticationCreds,
 	CacheStore,
@@ -10,11 +11,9 @@ import type {
 	SignalKeyStoreWithTransaction,
 	TransactionCapabilityOptions
 } from '../Types'
-import {Curve, signedKeyPair} from './crypto'
-import {delay, generateRegistrationId} from './generics'
-import {ILogger} from './logger'
-import {Mutex} from 'async-mutex'
-
+import { Curve, signedKeyPair } from './crypto'
+import { delay, generateRegistrationId } from './generics'
+import { ILogger } from './logger'
 
 /**
  * Adds caching capability to a SignalKeyStore
@@ -31,7 +30,7 @@ export function makeCacheableSignalKeyStore(
 		_cache ||
 		new NodeCache({
 			stdTTL: DEFAULT_CACHE_TTLS.SIGNAL_STORE, // 5 minutes
-			useClones: false, // Critical: prevents Buffer serialization/cloning
+			useClones: false,
 			deleteOnExpire: true
 		})
 
@@ -39,59 +38,27 @@ export function makeCacheableSignalKeyStore(
 		return `${type}.${id}`
 	}
 
-	// Helper function to ensure we don't accidentally serialize Buffers
-	function validateBufferIntegrity<T>(data: T, context: string): T {
-		if (typeof data === 'object' && data !== null) {
-			// Walk through the object to find any Buffers that might have been converted
-			const checkForBuffers = (obj: unknown): void => {
-				if (obj && typeof obj === 'object') {
-					for (const [key, value] of Object.entries(obj)) {
-						if (value && typeof value === 'object') {
-							// Check if this looks like a serialized Buffer
-							if ('type' in value && 'data' in value && (value as {type: string}).type === 'Buffer') {
-								logger?.warn(`Detected serialized Buffer in ${context} at key ${key}. This may cause Signal operation failures.`)
-							}
-							// Recursively check nested objects
-							if (!Buffer.isBuffer(value)) {
-								checkForBuffers(value)
-							}
-						}
-					}
-				}
-			}
-			checkForBuffers(data)
-		}
-		return data
-	}
-
 	return {
 		async get(type, ids) {
 			const data: { [_: string]: SignalDataTypeMap[typeof type] } = {}
 			const idsToFetch: string[] = []
-			
 			for (const id of ids) {
 				const item = cache.get<SignalDataTypeMap[typeof type]>(getUniqueId(type, id))
 				if (typeof item !== 'undefined') {
-					// Validate that cached item hasn't had its Buffers corrupted
-					data[id] = validateBufferIntegrity(item, `cache get for ${type}:${id}`)
+					data[id] = item
 				} else {
 					idsToFetch.push(id)
 				}
 			}
 
 			if (idsToFetch.length) {
-				logger?.trace({items: idsToFetch.length}, 'loading from store')
+				logger?.trace({ items: idsToFetch.length }, 'loading from store')
 				const fetched = await store.get(type, idsToFetch)
-				
 				for (const id of idsToFetch) {
 					const item = fetched[id]
 					if (item) {
-						// Validate item from store before caching
-						const validatedItem = validateBufferIntegrity(item, `store fetch for ${type}:${id}`)
-						data[id] = validatedItem
-						
-						// Cache the item - NodeCache with useClones: false should preserve Buffers
-						cache.set(getUniqueId(type, id), validatedItem)
+						data[id] = item
+						cache.set(getUniqueId(type, id), item)
 					}
 				}
 			}
@@ -101,26 +68,14 @@ export function makeCacheableSignalKeyStore(
 		async set(data) {
 			let keys = 0
 			for (const type in data) {
-				const typeData = data[type]
-				if (!typeData) continue
-				
-				for (const id in typeData) {
-					const item = typeData[id]
-					if (item !== null && item !== undefined) {
-						// Validate before caching to ensure Buffers are intact
-						const validatedItem = validateBufferIntegrity(item, `cache set for ${type}:${id}`)
-						cache.set(getUniqueId(type, id), validatedItem)
-					} else {
-						// Handle null/undefined (deletion) explicitly
-						cache.set(getUniqueId(type, id), item)
-					}
+				for (const id in data[type]) {
+					cache.set(getUniqueId(type, id), data[type][id])
 					keys += 1
 				}
 			}
 
-			logger?.trace({keys}, 'updated cache')
+			logger?.trace({ keys }, 'updated cache')
 
-			// Pass original data to store to avoid any modifications
 			await store.set(data)
 		},
 		async clear() {
@@ -140,11 +95,12 @@ export function makeCacheableSignalKeyStore(
 export const addTransactionCapability = (
 	state: SignalKeyStore,
 	logger: ILogger,
-	{maxCommitRetries, delayBetweenTriesMs}: TransactionCapabilityOptions
+	{ maxCommitRetries, delayBetweenTriesMs }: TransactionCapabilityOptions
 ): SignalKeyStoreWithTransaction => {
-
 	// Mutex for each key type (session, pre-key, etc.)
 	const keyTypeMutexes = new Map<string, Mutex>()
+	// Mutex for individual keysAdd commentMore actions
+	const keyMutexes = new Map<string, Mutex>()
 	// Global transaction mutex
 	const transactionMutex = new Mutex()
 
@@ -155,181 +111,6 @@ export const addTransactionCapability = (
 	let mutations: SignalDataSet = {}
 
 	let transactionsInProgress = 0
-
-	// Helper function to handle pre-key deletion in transaction
-	function handlePreKeyDeletion(keyId: string, transactionCache: SignalDataSet, mutations: SignalDataSet, logger: ILogger): boolean {
-		// Only allow deletion if we have the key in cache
-		const preKeyCache = transactionCache['pre-key']
-		if (preKeyCache && preKeyCache[keyId]) {
-			// Ensure pre-key cache exists
-			if (!transactionCache['pre-key']) {
-				transactionCache['pre-key'] = {}
-			}
-			transactionCache['pre-key']![keyId] = null
-
-			if (!mutations['pre-key']) {
-				mutations['pre-key'] = {}
-			}
-			mutations['pre-key']![keyId] = null
-			return true
-		} else {
-			// Skip deletion if key doesn't exist in cache
-			logger.warn(`Attempted to delete non-existent pre-key: ${keyId}`)
-			return false
-		}
-	}
-
-	// Helper function to handle pre-key update in transaction
-	function handlePreKeyUpdate(keyId: string, value: SignalDataTypeMap['pre-key'], transactionCache: SignalDataSet, mutations: SignalDataSet) {
-		// Ensure we're not accidentally serializing Buffers in the transaction cache
-		if (value && typeof value === 'object' && 'privateKey' in value) {
-			// Verify privateKey is still a Buffer and hasn't been serialized
-			if (!Buffer.isBuffer(value.privateKey)) {
-				logger.warn(`PreKey ${keyId} privateKey is not a Buffer. This will cause Signal operations to fail.`)
-			}
-		}
-		
-		if (!transactionCache['pre-key']) {
-			transactionCache['pre-key'] = {}
-		}
-		transactionCache['pre-key']![keyId] = value
-
-		if (!mutations['pre-key']) {
-			mutations['pre-key'] = {}
-		}
-		mutations['pre-key']![keyId] = value
-	}
-
-	// Helper function to process pre-key data in transaction
-	function processPreKeyDataInTransaction(data: SignalDataSet, transactionCache: SignalDataSet, mutations: SignalDataSet, logger: ILogger) {
-		const preKeyData = data['pre-key']
-		if (!preKeyData) return
-		
-		for (const keyId in preKeyData) {
-			// If we're trying to delete a pre-key, check if we have it in cache first
-			if (preKeyData[keyId] === null) {
-				handlePreKeyDeletion(keyId, transactionCache, mutations, logger)
-			} else {
-				// Normal update
-				handlePreKeyUpdate(keyId, preKeyData[keyId], transactionCache, mutations)
-			}
-		}
-	}
-
-	// Helper function to process non-pre-key data in transaction
-	function processNormalKeyDataInTransaction(key: string, data: SignalDataSet, transactionCache: SignalDataSet, mutations: SignalDataSet) {
-		const keyData = data[key]
-		if (!keyData) return
-		
-		// Validate Buffer integrity for session data and other key types that contain Buffers
-		if (key === 'session' || key === 'sender-key') {
-			for (const id in keyData) {
-				const item = keyData[id]
-				if (item && typeof item === 'object') {
-					// Check for common Buffer fields that might get serialized
-					const bufferFields = ['chainKey', 'messageKey', 'privateKey', 'publicKey']
-					for (const field of bufferFields) {
-						if (field in item) {
-							const fieldValue = (item as Record<string, unknown>)[field]
-							if (fieldValue && typeof fieldValue === 'object' && !Buffer.isBuffer(fieldValue)) {
-								// Check if it's a serialized Buffer
-								if ('type' in fieldValue && 'data' in fieldValue && (fieldValue as {type: string}).type === 'Buffer') {
-									logger.warn(`${key}:${id}.${field} appears to be a serialized Buffer. This will break Signal operations.`)
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-		
-		if (!transactionCache[key]) {
-			transactionCache[key] = {}
-		}
-		Object.assign(transactionCache[key]!, keyData)
-
-		if (!mutations[key]) {
-			mutations[key] = {}
-		}
-		Object.assign(mutations[key]!, keyData)
-	}
-
-	// Helper function to handle pre-key validation outside transaction
-	async function validatePreKeyDeletion(keyId: string, data: SignalDataSet, state: SignalKeyStore, logger: ILogger) {
-		// Check if the key exists before deleting
-		const existingKeys = await state.get('pre-key', [keyId])
-		if (!existingKeys[keyId]) {
-			// Skip deletion if key doesn't exist
-			logger.warn(`Attempted to delete non-existent pre-key: ${keyId}`)
-			const preKeyData = data['pre-key']
-			if (preKeyData) {
-				delete preKeyData[keyId]
-			}
-		}
-	}
-
-	// Helper function to process pre-keys outside transaction
-	async function processPreKeysOutsideTransaction(data: SignalDataSet, state: SignalKeyStore, logger: ILogger) {
-		const preKeyData = data['pre-key']
-		if (!preKeyData) return
-		
-		for (const keyId in preKeyData) {
-			if (preKeyData[keyId] === null) {
-				await validatePreKeyDeletion(keyId, data, state, logger)
-			}
-		}
-	}
-
-	// Helper function to acquire mutexes for key types in deterministic order to prevent deadlocks
-	async function acquireMutexesForKeyTypes(data: SignalDataSet): Promise<Mutex[]> {
-		// Sort key types to ensure consistent ordering and prevent deadlocks
-		const sortedKeyTypes = Object.keys(data).sort()
-		const mutexes: Mutex[] = []
-		
-		for (const keyType of sortedKeyTypes) {
-			const typeMutex = getKeyTypeMutex(keyType)
-			await typeMutex.acquire()
-			mutexes.push(typeMutex)
-		}
-		
-		return mutexes
-	}
-
-	// Helper function to release mutexes
-	function releaseMutexes(mutexes: Mutex[]) {
-		while (mutexes.length > 0) {
-			const mutex = mutexes.pop()
-			if (mutex) mutex.release()
-		}
-	}
-
-	// Helper function to attempt commit with retry logic
-	async function attemptCommitWithRetry(mutations: SignalDataSet, state: SignalKeyStore, maxRetries: number, delayMs: number, logger: ILogger): Promise<void> {
-		let tries = maxRetries
-		
-		while (tries > 0) {
-			tries -= 1
-			
-			try {
-				// Acquire mutexes for all key types being modified
-				const mutexes = await acquireMutexesForKeyTypes(mutations)
-				try {
-					await state.set(mutations)
-					logger.trace({ dbQueriesInTransaction }, 'committed transaction')
-					return // Success, exit the retry loop
-				} finally {
-					releaseMutexes(mutexes)
-				}
-			} catch (error) {
-				logger.warn(`failed to commit ${Object.keys(mutations).length} mutations, tries left=${tries}`)
-				if (tries > 0) {
-					await delay(delayMs)
-				} else {
-					throw error // Re-throw on final attempt
-				}
-			}
-		}
-	}
 
 	return {
 		get: async (type, ids) => {
@@ -347,20 +128,18 @@ export const addTransactionCapability = (
 					try {
 						const result = await state.get(type, idsRequiringFetch)
 
-						// Update transaction cache - ensure we preserve Buffer objects
+						// Update transaction cache
 						transactionCache[type] ||= {}
-						// Use Object.assign to avoid any deep cloning that might serialize Buffers
 						Object.assign(transactionCache[type]!, result)
 					} finally {
 						typeMutex.release()
 					}
 				}
 
-				// Return data from transaction cache - direct reference to preserve Buffers
 				return ids.reduce((dict, id) => {
 					const value = transactionCache[type]?.[id]
 					if (value) {
-						dict[id] = value // Direct assignment to preserve Buffer references
+						dict[id] = value
 					}
 
 					return dict
@@ -368,7 +147,7 @@ export const addTransactionCapability = (
 			} else {
 				// Not in transaction, fetch directly with mutex protection
 				const typeMutex = getKeyTypeMutex(type as string)
-				return await typeMutex.acquire().then(async (release) => {
+				return await typeMutex.acquire().then(async release => {
 					try {
 						return await state.get(type, ids)
 					} finally {
@@ -379,50 +158,53 @@ export const addTransactionCapability = (
 		},
 		set: async data => {
 			if (isInTransaction()) {
-				logger.trace({types: Object.keys(data)}, 'caching in transaction')
+				logger.trace({ types: Object.keys(data) }, 'caching in transaction')
 				for (const key in data) {
 					transactionCache[key] = transactionCache[key] || {}
 
 					// Special handling for pre-keys to prevent unexpected deletion
 					if (key === 'pre-key') {
-						processPreKeyDataInTransaction(data, transactionCache, mutations, logger)
+						handlePreKeyInTransaction(key, data[key], transactionCache, mutations, logger)
 					} else {
 						// Normal handling for other key types
-						processNormalKeyDataInTransaction(key, data, transactionCache, mutations)
+						Object.assign(transactionCache[key], data[key])
+
+						mutations[key] = mutations[key] || {}
+						Object.assign(mutations[key], data[key])
 					}
 				}
 			} else {
 				// Not in transaction, apply directly with mutex protection
-				let mutexes: Mutex[] = []
+				const mutexes: Mutex[] = []
 
 				try {
-					// Sort key types to ensure consistent ordering and prevent deadlocks
-					const sortedKeyTypes = Object.keys(data).sort()
-					
 					// Acquire all necessary mutexes to prevent concurrent access
-					for (const keyType of sortedKeyTypes) {
+					for (const keyType in data) {
 						const typeMutex = getKeyTypeMutex(keyType)
 						await typeMutex.acquire()
 						mutexes.push(typeMutex)
 
 						// For pre-keys, we need special handling
 						if (keyType === 'pre-key') {
-							await processPreKeysOutsideTransaction(data, state, logger)
+							await handlePreKeyOutsideTransaction(keyType, data[keyType], state, logger)
 						}
 					}
 
 					// Apply changes to the store
 					await state.set(data)
 				} finally {
-					releaseMutexes(mutexes)
+					// Release all mutexes in reverse order
+					while (mutexes.length > 0) {
+						const mutex = mutexes.pop()
+						if (mutex) mutex.release()
+					}
 				}
 			}
 		},
 		isInTransaction,
 		...(state.clear ? { clear: state.clear } : {}),
 		async transaction(work) {
-			// Use the transaction mutex to ensure only one transaction at a time
-			return transactionMutex.acquire().then(async (releaseTxMutex) => {
+			return transactionMutex.acquire().then(async releaseTxMutex => {
 				let result: Awaited<ReturnType<typeof work>>
 				try {
 					transactionsInProgress += 1
@@ -430,33 +212,65 @@ export const addTransactionCapability = (
 						logger.trace('entering transaction')
 					}
 
-					// Execute the transaction work while holding the mutex
-					result = await work()
-					
-					// commit if this is the outermost transaction
-					if (transactionsInProgress === 1) {
-						if (Object.keys(mutations).length) {
-							logger.trace('committing transaction')
-							// retry mechanism to ensure we've some recovery
-							// in case a transaction fails in the first attempt
-							await attemptCommitWithRetry(mutations, state, maxCommitRetries, delayBetweenTriesMs, logger)
-						} else {
-							logger.trace('no mutations in transaction')
+					// Release the transaction mutex now that we've updated the counter
+					// This allows other transactions to start preparing
+					releaseTxMutex()
+
+					try {
+						result = await work()
+						// commit if this is the outermost transaction
+						if (transactionsInProgress === 1) {
+							if (Object.keys(mutations).length) {
+								logger.trace('committing transaction')
+								// retry mechanism to ensure we've some recovery
+								// in case a transaction fails in the first attempt
+								let tries = maxCommitRetries
+								while (tries) {
+									tries -= 1
+									//eslint-disable-next-line max-depth
+									try {
+										// Acquire mutexes for all key types being modified
+										const mutexes: Mutex[] = []
+										for (const keyType in mutations) {
+											const typeMutex = getKeyTypeMutex(keyType)
+											await typeMutex.acquire()
+											mutexes.push(typeMutex)
+										}
+
+										try {
+											await state.set(mutations)
+											logger.trace({ dbQueriesInTransaction }, 'committed transaction')
+											break
+										} finally {
+											// Release all mutexes in reverse order
+											while (mutexes.length > 0) {
+												const mutex = mutexes.pop()
+												if (mutex) mutex.release()
+											}
+										}
+									} catch (error) {
+										logger.warn(`failed to commit ${Object.keys(mutations).length} mutations, tries left=${tries}`)
+										await delay(delayBetweenTriesMs)
+									}
+								}
+							} else {
+								logger.trace('no mutations in transaction')
+							}
+						}
+					} finally {
+						transactionsInProgress -= 1
+						if (transactionsInProgress === 0) {
+							transactionCache = {}
+							mutations = {}
+							dbQueriesInTransaction = 0
 						}
 					}
 
 					return result
 				} catch (error) {
-					throw error
-				} finally {
-					transactionsInProgress -= 1
-					if (transactionsInProgress === 0) {
-						transactionCache = {}
-						mutations = {}
-						dbQueriesInTransaction = 0
-					}
-					// Always release the transaction mutex
+					// If we haven't released the transaction mutex yet, release it
 					releaseTxMutex()
+					throw error
 				}
 			})
 		}
@@ -469,12 +283,92 @@ export const addTransactionCapability = (
 			mutex = new Mutex()
 			keyTypeMutexes.set(type, mutex)
 		}
+
 		return mutex
 	}
-	
+
 	// Check if we are currently in a transaction
 	function isInTransaction() {
 		return transactionsInProgress > 0
+	}
+
+	// Helper function to handle pre-key operations in transaction
+	function handlePreKeyInTransaction(
+		key: string,
+		keyData: any,
+		transactionCache: SignalDataSet,
+		mutations: SignalDataSet,
+		logger: ILogger
+	) {
+		for (const keyId in keyData) {
+			const keyValue = keyData[keyId]
+			if (keyValue === null) {
+				handlePreKeyDeletion(key, keyId, transactionCache, mutations, logger)
+			} else {
+				handlePreKeyUpdate(key, keyId, keyValue, transactionCache, mutations)
+			}
+		}
+	}
+
+	// Helper function to handle pre-key deletion
+	function handlePreKeyDeletion(
+		key: string,
+		keyId: string,
+		transactionCache: SignalDataSet,
+		mutations: SignalDataSet,
+		logger: ILogger
+	) {
+		if (!transactionCache[key]?.[keyId]) {
+			logger.warn(`Attempted to delete non-existent pre-key: ${keyId}`)
+			return
+		}
+
+		if (!transactionCache[key]) {
+			transactionCache[key] = {}
+		}
+		transactionCache[key][keyId] = null
+
+		if (!mutations[key]) {
+			mutations[key] = {}
+		}
+		mutations[key][keyId] = null
+	}
+
+	// Helper function to handle pre-key update
+	function handlePreKeyUpdate(
+		key: string,
+		keyId: string,
+		keyValue: any,
+		transactionCache: SignalDataSet,
+		mutations: SignalDataSet
+	) {
+		if (!transactionCache[key]) {
+			transactionCache[key] = {}
+		}
+		transactionCache[key][keyId] = keyValue
+
+		if (!mutations[key]) {
+			mutations[key] = {}
+		}
+		mutations[key][keyId] = keyValue
+	}
+
+	// Helper function to handle pre-key operations outside transaction
+	async function handlePreKeyOutsideTransaction(
+		keyType: string,
+		keyData: any,
+		state: SignalKeyStore,
+		logger: ILogger
+	) {
+		for (const keyId in keyData) {
+			if (keyData[keyId] === null) {
+				const existingKeys = await state.get(keyType as any, [keyId])
+				if (!existingKeys[keyId]) {
+					logger.warn(`Attempted to delete non-existent pre-key: ${keyId}`)
+					delete keyData[keyId]
+				}
+			}
+		}
 	}
 }
 
