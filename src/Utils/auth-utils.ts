@@ -305,7 +305,12 @@ export const addTransactionCapability = (
 
 						// Update transaction cache
 						transactionCache[type] ||= {}
-						Object.assign(transactionCache[type]!, result)
+						const cacheObj = transactionCache[type]! as Record<string, any>
+						for (const [k, v] of Object.entries(result)) {
+							if (!(k in cacheObj)) {
+								cacheObj[k] = v
+							}
+						}
 					} finally {
 						typeMutex.release()
 					}
