@@ -272,11 +272,13 @@ export const addTransactionCapability = (
 	// Helper function to handle pre-key operations in transaction
 	function handlePreKeyInTransaction(
 		key: string,
-		keyData: any,
+		keyData: { [id: string]: SignalDataTypeMap[keyof SignalDataTypeMap] | null } | undefined,
 		transactionCache: SignalDataSet,
 		mutations: SignalDataSet,
 		logger: ILogger
 	) {
+		if (!keyData) return
+		
 		for (const keyId in keyData) {
 			const keyValue = keyData[keyId]
 			if (keyValue === null) {
@@ -335,10 +337,12 @@ export const addTransactionCapability = (
 	}
 
 	// Helper function to handle pre-key operations outside transaction
-	async function handlePreKeyOutsideTransaction(keyType: string, keyData: any, state: SignalKeyStore, logger: ILogger) {
+	async function handlePreKeyOutsideTransaction<T extends keyof SignalDataTypeMap>(keyType: T, keyData: { [id: string]: SignalDataTypeMap[T] | null } | undefined, state: SignalKeyStore, logger: ILogger) {
+		if (!keyData) return
+		
 		for (const keyId in keyData) {
 			if (keyData[keyId] === null) {
-				const existingKeys = await state.get(keyType as any, [keyId])
+				const existingKeys = await state.get(keyType, [keyId])
 				if (!existingKeys[keyId]) {
 					logger.warn(`Attempted to delete non-existent pre-key: ${keyId}`)
 					delete keyData[keyId]
