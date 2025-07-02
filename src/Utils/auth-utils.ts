@@ -211,10 +211,6 @@ export const addTransactionCapability = (
 						logger.trace('entering transaction')
 					}
 
-					// Release the transaction mutex now that we've updated the counter
-					// This allows other transactions to start preparing
-					releaseTxMutex()
-
 					try {
 						result = await work()
 						// commit if this is the outermost transaction
@@ -244,10 +240,8 @@ export const addTransactionCapability = (
 					}
 
 					return result
-				} catch (error) {
-					// If we haven't released the transaction mutex yet, release it
+				} finally {
 					releaseTxMutex()
-					throw error
 				}
 			})
 		}
