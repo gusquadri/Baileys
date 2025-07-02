@@ -291,7 +291,7 @@ export const addTransactionCapability = (
 		get: async (type, ids) => {
 			if (isInTransaction()) {
 				const dict = transactionCache[type]
-				const idsRequiringFetch = dict ? ids.filter(item => typeof dict[item] === 'undefined') : ids
+				const idsRequiringFetch = dict ? ids.filter(item => !(item in dict)) : ids
 				// only fetch if there are any items to fetch
 				if (idsRequiringFetch.length) {
 					dbQueriesInTransaction += 1
@@ -311,13 +311,11 @@ export const addTransactionCapability = (
 					}
 				}
 
-				return ids.reduce((dict, id) => {
-					const value = transactionCache[type]?.[id]
-					if (value) {
-						dict[id] = value
+				return ids.reduce((acc, id) => {
+					if (transactionCache[type] && (id in transactionCache[type])) {
+						acc[id] = transactionCache[type][id]
 					}
-
-					return dict
+					return acc
 				}, {})
 			} else {
 				// Not in transaction, fetch directly with mutex protection
