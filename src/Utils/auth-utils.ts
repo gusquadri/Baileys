@@ -357,38 +357,47 @@ export const addTransactionCapability = (
 		isInTransaction,
 		...(state.clear ? { clear: state.clear } : {}),
 		async transaction(work) {
-			return transactionMutex.runExclusive(async () => {
+			return transactionMutex.acquire().then(async releaseTxMutex => {
 				let result: Awaited<ReturnType<typeof work>>
-
-				transactionsInProgress += 1
-				if (transactionsInProgress === 1) {
-					logger.trace('entering transaction')
-				}
-
 				try {
-					result = await work()
-					// commit if this is the outermost transaction
+					transactionsInProgress += 1
 					if (transactionsInProgress === 1) {
-						const hasMutations = Object.keys(mutations).length > 0
+						logger.trace('entering transaction')
+					}
 
-						if (hasMutations) {
-							logger.trace('committing transaction')
-							await commitWithRetry(mutations, state, getKeyTypeMutex, maxCommitRetries, delayBetweenTriesMs, logger)
-							logger.trace({ dbQueriesInTransaction }, 'transaction completed')
-						} else {
-							logger.trace('no mutations in transaction')
+					// Release the transaction mutex now that we've updated the counter
+					// This allows other transactions to start preparing
+					releaseTxMutex()
+
+					try {
+						result = await work()
+						// commit if this is the outermost transaction
+						if (transactionsInProgress === 1) {
+							const hasMutations = Object.keys(mutations).length > 0
+
+							if (hasMutations) {
+								logger.trace('committing transaction')
+								await commitWithRetry(mutations, state, getKeyTypeMutex, maxCommitRetries, delayBetweenTriesMs, logger)
+								logger.trace({ dbQueriesInTransaction }, 'transaction completed')
+							} else {
+								logger.trace('no mutations in transaction')
+							}
+						}
+					} finally {
+						transactionsInProgress -= 1
+						if (transactionsInProgress === 0) {
+							transactionCache = {}
+							mutations = {}
+							dbQueriesInTransaction = 0
 						}
 					}
-				} finally {
-					transactionsInProgress -= 1
-					if (transactionsInProgress === 0) {
-						transactionCache = {}
-						mutations = {}
-						dbQueriesInTransaction = 0
-					}
-				}
 
-				return result
+					return result
+				} catch (error) {
+					// If we haven't released the transaction mutex yet, release it
+					releaseTxMutex()
+					throw error
+				}
 			})
 		}
 	}
