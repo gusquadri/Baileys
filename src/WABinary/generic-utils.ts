@@ -33,6 +33,24 @@ export const getBinaryNodeChildBuffer = (node: BinaryNode | undefined, childTag:
 	}
 }
 
+export const getBinaryFilteredButtons = (nodeContent: BinaryNode | BinaryNode['content']): boolean => {
+	if (!Array.isArray(nodeContent)) return false
+
+	return nodeContent.some((a: any) =>
+		['native_flow'].includes(a?.content?.[0]?.content?.[0]?.tag) ||
+		['interactive', 'buttons', 'list'].includes(a?.content?.[0]?.tag) ||
+		['hsm', 'biz'].includes(a?.tag)
+	)
+}
+
+export const getBinaryFilteredBizBot = (nodeContent: BinaryNode | BinaryNode['content']): boolean => {
+	if (!Array.isArray(nodeContent)) return false 
+
+	return nodeContent.some((b: any) => 
+		['bot'].includes(b?.tag) && b?.attrs?.biz_bot === '1'
+	) 
+}
+
 export const getBinaryNodeChildString = (node: BinaryNode | undefined, childTag: string) => {
 	const child = getBinaryNodeChild(node, childTag)?.content
 	if (Buffer.isBuffer(child) || child instanceof Uint8Array) {
@@ -120,3 +138,4 @@ export function binaryNodeToString(node: BinaryNode | BinaryNode['content'], i =
 
 	return tag + content
 }
+

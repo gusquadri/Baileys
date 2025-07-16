@@ -23,31 +23,38 @@ import {
 	extractDeviceJids,
 	generateMessageIDV2,
 	generateWAMessage,
+	generateWAMessageFromContent,
 	getStatusCodeForMediaRetry,
 	getUrlFromDirectPath,
 	getWAUploadToServer,
 	normalizeMessageContent,
 	parseAndInjectE2ESessions,
-	unixTimestampSeconds
+	unixTimestampSeconds,
+	delay
 } from '../Utils'
 import { getUrlInfo } from '../Utils/link-preview'
 import {
 	areJidsSameUser,
 	BinaryNode,
 	BinaryNodeAttributes,
+	getBinaryFilteredButtons,
+	getBinaryFilteredBizBot,
 	getBinaryNodeChild,
 	getBinaryNodeChildren,
 	isJidGroup,
+	isJidNewsletter,
 	isJidUser,
 	jidDecode,
 	jidEncode,
 	jidNormalizedUser,
 	JidWithDevice,
-	S_WHATSAPP_NET
+	S_WHATSAPP_NET,
+	STORIES_JID
 } from '../WABinary'
 import { USyncQuery, USyncUser } from '../WAUSync'
 import { makeGroupsSocket } from './groups'
 import { makeNewsletterSocket, NewsletterSocket } from './newsletter'
+import { randomBytes } from 'crypto'
 
 export const makeMessagesSocket = (config: SocketConfig) => {
 	const {
@@ -179,6 +186,46 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		const readType = privacySettings.readreceipts === 'all' ? 'read' : 'read-self'
 		await sendReceipts(keys, readType)
 	}
+
+	/** Fetch image for groups, user, and newsletter **/
+	// const profilePictureUrl = async (jid: string) => {
+	// 	if (isJidNewsletter(jid)) {
+	// 		const node = await sock.newsletterWMexQuery(undefined, 'METADATA' as any, {
+	// 			input: {
+	// 				key: jid, 
+	// 				type: 'JID',
+	// 				view_role: 'GUEST'
+	// 			},
+	// 			fetch_viewer_metadata: true,
+	// 			fetch_full_image: true,
+	// 			fetch_creation_time: true
+	// 		})
+
+	// 		const result = getBinaryNodeChild(node, 'result')?.content?.toString()
+	// 		const metadata = JSON.parse(result || '{}').data?.NEWSLETTER
+	// 		return getUrlFromDirectPath(metadata?.thread_metadata?.picture?.direct_path || '') 
+	// 	} else {               
+	// 		const result = await query({
+	// 			tag: 'iq',
+	// 			attrs: {
+	// 				target: jidNormalizedUser(jid),
+	// 				to: S_WHATSAPP_NET,
+	// 				type: 'get',
+	// 				xmlns: 'w:profile:picture'
+	// 			},
+	// 			content: [{ 
+	// 				tag: 'picture', 
+	// 				attrs: { 
+	// 					type: 'image', 
+	// 					query: 'url' 
+	// 				}
+	// 			}]
+	// 		})
+
+	// 		const child = getBinaryNodeChild(result, 'picture')
+	// 		return child?.attrs?.url || null
+	// 	}
+	// }
 
 	/** Fetch all the devices we've to send a message to */
 	const getUSyncDevices = async (jids: string[], useCache: boolean, ignoreZeroDevices: boolean) => {
@@ -409,9 +456,23 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		}
 
 		await authState.keys.transaction(async () => {
+			let didPushAdditional = false
+			const messages = normalizeMessageContent(message)
+			const buttonType = messages ? getButtonType(messages) : undefined
+			const pollMessage = messages?.pollCreationMessage || messages?.pollCreationMessageV2 || messages?.pollCreationMessageV3
+			const regexGroupOld = /^(\d{1,15})-(\d+)@g\.us$/
+			
 			const mediaType = getMediaType(message)
 			if (mediaType) {
 				extraAttrs['mediatype'] = mediaType
+			}
+			
+			if (messages?.pinInChatMessage || messages?.keepInChatMessage || message.reactionMessage || message.protocolMessage?.editedMessage) {
+				extraAttrs['decrypt-fail'] = 'hide'
+			}
+			
+			if (messages?.interactiveResponseMessage?.nativeFlowResponseMessage) {
+				extraAttrs['native_flow_name'] = messages?.interactiveResponseMessage?.nativeFlowResponseMessage.name
 			}
 
 			if (isNewsletter) {
@@ -438,9 +499,6 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				return
 			}
 
-			if (normalizeMessageContent(message)?.pinInChatMessage) {
-				extraAttrs['decrypt-fail'] = 'hide'
-			}
 
 			if (isGroup || isStatus) {
 				const [groupData, senderKeyMap] = await Promise.all([
@@ -632,8 +690,59 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 				logger.debug({ jid }, 'adding device identity')
 			}
+			
+			if (isGroup && regexGroupOld.test(jid) && !message.reactionMessage) {
+				;(stanza.content as BinaryNode[]).push({
+					tag: 'multicast',
+					attrs: {}
+				})
+			}
 
-			if (additionalNodes && additionalNodes.length > 0) {
+			if (pollMessage || messages?.eventMessage) {
+				;(stanza.content as BinaryNode[]).push({
+					tag: 'meta', 
+					attrs: messages?.eventMessage ? {
+						event_type: 'creation'
+					} : isNewsletter ? {
+						polltype: 'creation', 
+						contenttype: pollMessage?.pollContentType === 2 ? 'image' : 'text'
+					} : {
+						polltype: 'creation'
+					}
+				})
+			}
+			
+			if (!isNewsletter && buttonType && messages) {
+				const buttonsNode = getButtonArgs(messages)
+				const filteredButtons = getBinaryFilteredButtons(additionalNodes ? additionalNodes : [])
+
+				if (filteredButtons) {
+					;(stanza.content as BinaryNode[]).push(...(additionalNodes || []))
+					didPushAdditional = true
+				} else {
+					;(stanza.content as BinaryNode[]).push(buttonsNode)
+				}
+			}
+			
+			if (isJidUser(destinationJid)) {
+				const botNode: BinaryNode = {
+					tag: 'bot', 
+					attrs: {
+						biz_bot: '1'
+					}
+				}
+
+				const filteredBizBot = getBinaryFilteredBizBot(additionalNodes ? additionalNodes : [])
+
+				if (filteredBizBot) {
+					;(stanza.content as BinaryNode[]).push(...(additionalNodes || []))
+					didPushAdditional = true
+				} else {
+					;(stanza.content as BinaryNode[]).push(botNode)
+				}
+			}
+
+			if (!didPushAdditional && additionalNodes && additionalNodes.length > 0) {
 				;(stanza.content as BinaryNode[]).push(...additionalNodes)
 			}
 
@@ -646,30 +755,43 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 	}
 
 	const getMessageType = (message: proto.IMessage) => {
-		if (message.pollCreationMessage || message.pollCreationMessageV2 || message.pollCreationMessageV3) {
+		const normalizedMessage = normalizeMessageContent(message)
+		if (normalizedMessage?.pollCreationMessage || normalizedMessage?.pollCreationMessageV2 || normalizedMessage?.pollCreationMessageV3) {
 			return 'poll'
+		} else if (normalizedMessage?.reactionMessage) {
+			return 'reaction'
+		} else if (normalizedMessage?.eventMessage) {
+			return 'event'
+		} else if (normalizedMessage && getMediaType(normalizedMessage)) {
+			return 'media'
+		} else {
+			return 'text'
 		}
-
-		return 'text'
 	}
 
 	const getMediaType = (message: proto.IMessage) => {
 		if (message.imageMessage) {
 			return 'image'
+		} else if (message.stickerMessage) {
+			return message.stickerMessage.isLottie ? '1p_sticker' : message.stickerMessage.isAvatar ? 'avatar_sticker' : 'sticker'
 		} else if (message.videoMessage) {
 			return message.videoMessage.gifPlayback ? 'gif' : 'video'
 		} else if (message.audioMessage) {
 			return message.audioMessage.ptt ? 'ptt' : 'audio'
+		} else if (message.ptvMessage) {
+			return 'ptv'
 		} else if (message.contactMessage) {
 			return 'vcard'
 		} else if (message.documentMessage) {
 			return 'document'
+		} else if (message.stickerPackMessage) {
+			return 'sticker_pack'
 		} else if (message.contactsArrayMessage) {
 			return 'contact_array'
+		} else if (message.locationMessage) {
+			return 'location'
 		} else if (message.liveLocationMessage) {
 			return 'livelocation'
-		} else if (message.stickerMessage) {
-			return 'sticker'
 		} else if (message.listMessage) {
 			return 'list'
 		} else if (message.listResponseMessage) {
@@ -682,8 +804,98 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			return 'product'
 		} else if (message.interactiveResponseMessage) {
 			return 'native_flow_response'
-		} else if (message.groupInviteMessage) {
+		} else if (/https:\/\/wa\.me\/c\/\d+/.test(message.extendedTextMessage?.text || '')) {
+			return 'cataloglink'
+		} else if (/https:\/\/wa\.me\/p\/\d+\/\d+/.test(message.extendedTextMessage?.text || '')) {
+			return 'productlink'
+		} else if (message.extendedTextMessage?.matchedText || message.groupInviteMessage) {
 			return 'url'
+		}
+	}
+
+	const getButtonType = (message: proto.IMessage) => {
+		if (message.listMessage) {
+			return 'list'
+		} else if (message.buttonsMessage) {
+			return 'buttons'
+		} else if (message.interactiveMessage?.nativeFlowMessage) {
+			return 'native_flow'
+		}
+	}
+
+	const getButtonArgs = (message: proto.IMessage): BinaryNode => {
+		const nativeFlow = message.interactiveMessage?.nativeFlowMessage
+		const firstButtonName = nativeFlow?.buttons?.[0]?.name
+		const nativeFlowSpecials = [
+			'mpm', 'cta_catalog', 'send_location',
+			'call_permission_request', 'wa_payment_transaction_details',
+			'automated_greeting_message_view_catalog'
+		]
+		
+		if (nativeFlow && (firstButtonName === 'review_and_pay' || firstButtonName === 'payment_info')) {
+			return {
+				tag: 'biz', 
+				attrs: {
+					native_flow_name: firstButtonName === 'review_and_pay' ? 'order_details' : firstButtonName
+				}
+			}
+		} else if (nativeFlow && firstButtonName && nativeFlowSpecials.includes(firstButtonName)) {
+			// Only works for WhatsApp Original, not WhatsApp Business
+			return {
+				tag: 'biz',
+				attrs: {},
+				content: [{
+					tag: 'interactive',
+					attrs: {
+						type: 'native_flow',
+						v: '1'
+					},
+					content: [{
+						tag: 'native_flow',
+						attrs: {
+							v: '2', 
+							name: firstButtonName!
+						}
+					}]
+				}]
+			}
+		} else if (nativeFlow || message.buttonsMessage) {
+			// It works for whatsapp original and whatsapp business
+			return {
+				tag: 'biz', 
+				attrs: {}, 
+				content: [{
+					tag: 'interactive', 
+					attrs: {
+						type: 'native_flow', 
+						v: '1'
+					}, 
+					content: [{
+						tag: 'native_flow', 
+						attrs: {
+							v: '9', 
+							name: 'mixed'
+						}
+					}]
+				}]
+			}
+		} else if (message.listMessage) {
+			return {
+				tag: 'biz', 
+				attrs: {}, 
+				content: [{
+					tag: 'list', 
+					attrs: {
+						v: '2', 
+						type: 'product_list'
+					}
+				}]
+			}
+		} else {
+			return {
+				tag: 'biz', 
+				attrs: {}
+			}
 		}
 	}
 
@@ -719,6 +931,224 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 	const waitForMsgMediaUpdate = bindWaitForEvent(ev, 'messages.media-update')
 
+	const sendStatusMentions = async (content: AnyMessageContent, jids: string[] = []) => {
+		const userJid = jidNormalizedUser(authState.creds.me!.id)
+		let allUsers = new Set<string>()
+		allUsers.add(userJid)
+
+		for (const id of jids) {
+			const isGroup = isJidGroup(id)
+			const isPrivate = isJidUser(id)
+
+			if (isGroup) {
+				try {
+					const metadata = (cachedGroupMetadata && await cachedGroupMetadata(id)) || await groupMetadata(id)
+					const participants = metadata.participants.map(p => jidNormalizedUser(p.id))
+					participants.forEach(jid => allUsers.add(jid))
+				} catch (error) {
+					logger.error(`Error getting metadata for group ${id}: ${error}`)
+				}
+			} else if (isPrivate) {
+				allUsers.add(jidNormalizedUser(id))
+			}
+		}
+
+		const uniqueUsers = Array.from(allUsers)
+		const getRandomHexColor = () => "#" + Math.floor(Math.random() * 16777215).toString(16).padStart(6, "0")
+
+		const isMedia = 'image' in content || 'video' in content || 'audio' in content
+		const isAudio = !!(content as any).audio
+
+		const messageContent = { ...content }
+
+		if (isMedia && !isAudio) {
+			if ((messageContent as any).text) {
+				(messageContent as any).caption = (messageContent as any).text
+				delete (messageContent as any).text
+			}
+			
+			delete (messageContent as any).ptt
+			delete (messageContent as any).font
+			delete (messageContent as any).backgroundColor
+			delete (messageContent as any).textColor
+		}
+
+		if (isAudio) {
+			delete (messageContent as any).text
+			delete (messageContent as any).caption
+			delete (messageContent as any).font
+			delete (messageContent as any).textColor
+		}
+
+		const font = !isMedia ? ((content as any).font || Math.floor(Math.random() * 9)) : undefined
+		const textColor = !isMedia ? ((content as any).textColor || getRandomHexColor()) : undefined
+		const backgroundColor = (!isMedia || isAudio) ? ((content as any).backgroundColor || getRandomHexColor()) : undefined
+		const ptt = isAudio ? (typeof (content as any).ptt === 'boolean' ? (content as any).ptt : true) : undefined
+
+		let msg: any
+		let mediaHandle: string | undefined
+		try {
+			msg = await generateWAMessage(STORIES_JID, messageContent, {
+				logger,
+				userJid,
+				getUrlInfo: text => getUrlInfo(text, {
+					thumbnailWidth: linkPreviewImageThumbnailWidth,
+					fetchOpts: { timeout: 3000, ...axiosOptions || {} },
+					logger,
+					uploadImage: generateHighQualityLinkPreview ? waUploadToServer : undefined
+				}),
+				upload: async (encFilePath: string, opts: any) => {
+					const up = await waUploadToServer(encFilePath, { ...opts })
+					mediaHandle = up.mediaUrl
+					return up
+				},
+				mediaCache: config.mediaCache,
+				options: config.options,
+				font,
+				textColor,
+				backgroundColor,
+				ptt
+			} as any)
+		} catch (error) {
+			logger.error(`Error generating message: ${error}`)
+			throw error
+		}
+
+		await relayMessage(STORIES_JID, msg.message!, {
+			messageId: msg.key.id!,
+			statusJidList: uniqueUsers, 
+			additionalNodes: [
+				{
+					tag: 'meta',
+					attrs: {},
+					content: [
+						{
+							tag: 'mentioned_users',
+							attrs: {},
+							content: jids.map(jid => ({
+								tag: 'to',
+								attrs: { jid: jidNormalizedUser(jid) }
+							}))
+						}]
+				}]
+		})
+
+		for (const id of jids) {
+			try {
+				const normalizedId = jidNormalizedUser(id)
+				const isPrivate = isJidUser(normalizedId)
+				const type = isPrivate ? 'statusMentionMessage' : 'groupStatusMentionMessage'
+
+				const protocolMessage = {
+					[type]: {
+						message: {
+							protocolMessage: {
+								key: msg.key,
+								type: 25
+							}
+						}
+					},
+					messageContextInfo: {
+						messageSecret: randomBytes(32)
+					}
+				}
+
+				const statusMsg = await generateWAMessageFromContent(normalizedId, protocolMessage, { userJid })
+
+				await relayMessage(
+					normalizedId,
+					statusMsg.message!,
+					{
+						additionalNodes: [{
+							tag: 'meta',
+							attrs: isPrivate ?
+								{ is_status_mention: 'true' } :
+								{ is_group_status_mention: 'true' }
+						}]
+					}
+				)
+
+				await delay(2000)
+			} catch (error) {
+				logger.error(`Error sending to ${id}: ${error}`)
+			}
+		}
+
+		return msg
+	}
+
+	const sendAlbumMessage = async (jid: string, medias: AnyMessageContent[], options: MiscMessageGenerationOptions = {}) => {
+		const userJid = authState.creds.me!.id
+
+		for (const media of medias) {
+			if (!('image' in media) && !('video' in media))
+				throw new TypeError(`medias[i] must have image or video property`)
+		}
+
+		const time = (options as any).delay || 500
+		delete (options as any).delay
+
+		const album = await generateWAMessageFromContent(jid, {
+			albumMessage: {
+				expectedImageCount: medias.filter(media => 'image' in media).length,
+				expectedVideoCount: medias.filter(media => 'video' in media).length,
+				...options
+			}
+		} as any, { userJid, ...options })
+
+		await relayMessage(jid, album.message!, { messageId: album.key.id! })
+
+		let mediaHandle: string | undefined
+		let msg: any
+
+		for (const i in medias) {
+			const media = medias[i]
+
+			if ('image' in media) {
+				msg = await generateWAMessage(jid, {
+					...media,
+					...options
+				}, {
+					userJid,
+					upload: async (encFilePath: string, opts: any) => {
+						const up = await waUploadToServer(encFilePath, { ...opts, newsletter: isJidNewsletter(jid) })
+						mediaHandle = up.mediaUrl // Fixed: use mediaUrl instead of handle
+						return up
+					},
+					...options
+				})
+			} else if ('video' in media) {
+				msg = await generateWAMessage(jid, {
+					...media,
+					...options
+				}, {
+					userJid,
+					upload: async (encFilePath: string, opts: any) => {
+						const up = await waUploadToServer(encFilePath, { ...opts, newsletter: isJidNewsletter(jid) })
+						mediaHandle = up.mediaUrl // Fixed: use mediaUrl instead of handle
+						return up
+					},
+					...options,
+				})
+			}
+
+			if (msg) {
+				msg.message!.messageContextInfo = {
+					messageSecret: randomBytes(32), 
+					messageAssociation: {
+						associationType: 1,
+						parentMessageKey: album.key
+					}
+				}
+			}
+
+			await relayMessage(jid, msg!.message!, { messageId: msg!.key.id! })
+			await delay(time)
+		}
+
+		return album
+	}
+
 	return {
 		...sock,
 		getPrivacyTokens,
@@ -727,12 +1157,15 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		sendReceipt,
 		sendReceipts,
 		readMessages,
+		//profilePictureUrl,
 		refreshMediaConn,
 		waUploadToServer,
 		fetchPrivacySettings,
 		sendPeerDataOperationMessage,
 		createParticipantNodes,
 		getUSyncDevices,
+		sendStatusMentions,
+		sendAlbumMessage,
 		updateMediaMessage: async (message: proto.IWebMessageInfo) => {
 			const content = assertMediaContent(message.message)
 			const mediaKey = content.mediaKey!
