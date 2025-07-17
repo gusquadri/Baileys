@@ -2,6 +2,72 @@ import NodeCache from '@cacheable/node-cache'
 import { Mutex } from 'async-mutex'
 import { randomBytes } from 'crypto'
 import { DEFAULT_CACHE_TTLS } from '../Defaults'
+
+interface QueueJob<T> {
+    awaitable: () => Promise<T>
+    resolve: (value: T | PromiseLike<T>) => void
+    reject: (reason?: unknown) => void
+}
+
+const _queueAsyncBuckets = new Map<string | number, Array<QueueJob<any>>>()
+const _gcLimit = 10000
+
+async function _asyncQueueExecutor(queue: Array<QueueJob<any>>, cleanup: () => void): Promise<void> {
+    let offt = 0
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+        const limit = Math.min(queue.length, _gcLimit)
+        for (let i = offt; i < limit; i++) {
+            const job = queue[i]
+            try {
+                job.resolve(await job.awaitable())
+            } catch (e) {
+                job.reject(e)
+            }
+        }
+
+        if (limit < queue.length) {
+            if (limit >= _gcLimit) {
+                queue.splice(0, limit)
+                offt = 0
+            } else {
+                offt = limit
+            }
+        } else {
+            break
+        }
+    }
+
+    cleanup()
+}
+
+function queueJob<T>(bucket: string | number, awaitable: () => Promise<T>): Promise<T> {
+    // Skip name assignment since it's readonly in strict mode
+    if (typeof bucket !== 'string') {
+        console.warn('Unhandled bucket type (for naming):', typeof bucket, bucket)
+    }
+
+    let inactive = false
+    if (!_queueAsyncBuckets.has(bucket)) {
+        _queueAsyncBuckets.set(bucket, [])
+        inactive = true
+    }
+
+    const queue = _queueAsyncBuckets.get(bucket)!
+    const job = new Promise<T>((resolve, reject) => {
+        queue.push({
+            awaitable,
+            resolve: resolve as (value: any) => void,
+            reject
+        })
+    })
+
+    if (inactive) {
+        _asyncQueueExecutor(queue, () => _queueAsyncBuckets.delete(bucket))
+    }
+
+    return job
+}
 import type {
 	AuthenticationCreds,
 	CacheStore,
@@ -303,6 +369,13 @@ export const addTransactionCapability = (
 		return mutex
 	}
 
+	// Queue-based sender key operations for proper sequencing
+	function queueSenderKeyOperation<T>(senderKeyName: string, operation: () => Promise<T>): Promise<T> {
+		return queueJob(senderKeyName, async () => {
+			return getSenderKeyMutex(senderKeyName).runExclusive(operation)
+		})
+	}
+
 	// Check if we are currently in a transaction
 	function isInTransaction() {
 		return transactionsInProgress > 0
@@ -317,12 +390,12 @@ export const addTransactionCapability = (
 				if (idsRequiringFetch.length) {
 					dbQueriesInTransaction += 1
 
-					// Use per-sender-key mutex for sender-key operations when possible
+					// Use per-sender-key queue for sender-key operations when possible
 					if (type === 'sender-key') {
 						logger.info({ idsRequiringFetch }, 'processing sender keys in transaction')
-						// For sender keys, process each one with its own mutex to maintain serialization
+						// For sender keys, process each one with queued operations to maintain serialization
 						for (const senderKeyName of idsRequiringFetch) {
-							await getSenderKeyMutex(senderKeyName).runExclusive(async () => {
+							await queueSenderKeyOperation(senderKeyName, async () => {
 								logger.info({ senderKeyName }, 'fetching sender key in transaction')
 								const result = await state.get(type, [senderKeyName])
 								// Update transaction cache
@@ -352,12 +425,12 @@ export const addTransactionCapability = (
 					return dict
 				}, {})
 			} else {
-				// Not in transaction, fetch directly with mutex protection
+				// Not in transaction, fetch directly with queue protection
 				if (type === 'sender-key') {
-					// For sender keys, use individual mutexes to maintain per-key serialization
+					// For sender keys, use individual queues to maintain per-key serialization
 					const results: { [key: string]: SignalDataTypeMap[typeof type] } = {}
 					for (const senderKeyName of ids) {
-						const result = await getSenderKeyMutex(senderKeyName).runExclusive(() => 
+						const result = await queueSenderKeyOperation(senderKeyName, () => 
 							state.get(type, [senderKeyName])
 						)
 						Object.assign(results, result)
@@ -389,9 +462,9 @@ export const addTransactionCapability = (
 				
 				if (hasSenderKeys) {
 					logger.info({ senderKeyNames }, 'processing sender key set operations')
-					// Handle sender key operations with per-key mutexes
+					// Handle sender key operations with per-key queues
 					for (const senderKeyName of senderKeyNames) {
-						await getSenderKeyMutex(senderKeyName).runExclusive(async () => {
+						await queueSenderKeyOperation(senderKeyName, async () => {
 							// Create data subset for this specific sender key
 							const senderKeyData = {
 								'sender-key': {
@@ -487,6 +560,8 @@ export const addTransactionCapability = (
 		}
 	}
 }
+
+export { queueJob }
 
 export const initAuthCreds = (): AuthenticationCreds => {
 	const identityKey = Curve.generateKeyPair()
