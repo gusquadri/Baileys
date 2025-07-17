@@ -127,39 +127,49 @@ async function handlePreKeyOperations(
 		transactionCache[keyType] = transactionCache[keyType] || {}
 		mutations[keyType] = mutations[keyType] || {}
 
-		// Process all operations for this key type
+		// Separate deletions from updates for batch processing
+		const deletionKeys: string[] = []
+		const updateKeys: string[] = []
+
 		for (const keyId in keyData) {
-			const isDeleteOperation = keyData[keyId] === null
+			if (keyData[keyId] === null) {
+				deletionKeys.push(keyId)
+			} else {
+				updateKeys.push(keyId)
+			}
+		}
 
-			if (isDeleteOperation) {
-				let canDelete = false
+		// Process updates first (no validation needed)
+		for (const keyId of updateKeys) {
+			transactionCache[keyType][keyId] = keyData[keyId]
+			mutations[keyType][keyId] = keyData[keyId]
+		}
 
-				if (isInTransaction) {
-					// In transaction, only allow deletion if key exists in cache
-					canDelete = !!transactionCache[keyType][keyId]
-					if (!canDelete) {
+		// Process deletions with validation
+		if (deletionKeys.length > 0) {
+			if (isInTransaction) {
+				// In transaction, only allow deletion if key exists in cache
+				for (const keyId of deletionKeys) {
+					if (transactionCache[keyType][keyId]) {
+						transactionCache[keyType][keyId] = null
+						mutations[keyType][keyId] = null
+					} else {
 						logger.warn(`Skipping deletion of non-existent ${keyType} in transaction: ${keyId}`)
-						continue
 					}
-				} else {
-					// Outside transaction, validate key exists
-					if (state) {
-						const existingKeys = await state.get(keyType as keyof SignalDataTypeMap, [keyId])
-						canDelete = !!existingKeys[keyId]
-						if (!canDelete) {
+				}
+			} else {
+				// Outside transaction, batch validate all deletions
+				if (state) {
+					const existingKeys = await state.get(keyType as keyof SignalDataTypeMap, deletionKeys)
+					for (const keyId of deletionKeys) {
+						if (existingKeys[keyId]) {
+							transactionCache[keyType][keyId] = null
+							mutations[keyType][keyId] = null
+						} else {
 							logger.warn(`Skipping deletion of non-existent ${keyType}: ${keyId}`)
-							continue
 						}
 					}
 				}
-
-				// Apply deletion
-				transactionCache[keyType][keyId] = null
-				mutations[keyType][keyId] = null
-			} else {
-				// Normal update
-				transactionCache[keyType][keyId] = keyData[keyId]
-				mutations[keyType][keyId] = keyData[keyId]
 			}
 		}
 	})
