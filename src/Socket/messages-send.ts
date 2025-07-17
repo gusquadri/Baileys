@@ -413,8 +413,6 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			statusJidList
 		}: MessageRelayOptions
 	) => {
-		console.log('📨 [relayMessage] ENTRY - JID:', jid, 'msgId:', msgId, 'isGroup:', jid.includes('@g.us'), 'hasMedia:', !!(message.imageMessage || message.videoMessage || message.audioMessage || message.documentMessage))
-		
 		const meId = authState.creds.me!.id
 
 		let shouldIncludeDeviceIdentity = false
@@ -553,14 +551,12 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				}
 
 				const bytes = encodeWAMessage(patched)
-				console.log('📨 [relayMessage] About to encrypt group message, bytes length:', bytes?.length, 'group:', destinationJid)
 
 				const { ciphertext, senderKeyDistributionMessage } = await signalRepository.encryptGroupMessage({
 					group: destinationJid,
 					data: bytes,
 					meId
 				})
-				console.log('📨 [relayMessage] Group message encrypted successfully, ciphertext length:', ciphertext?.length)
 
 				const senderKeyJids: string[] = []
 				// ensure a connection is established with every device
@@ -760,10 +756,8 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			}
 
 			logger.debug({ msgId }, `sending message to ${participants.length} devices`)
-			console.log('📨 [relayMessage] About to send stanza with id:', msgId, 'to:', stanza.attrs.to)
 
 			await sendNode(stanza)
-			console.log('📨 [relayMessage] Stanza sent successfully for msgId:', msgId)
 		})
 
 		return msgId

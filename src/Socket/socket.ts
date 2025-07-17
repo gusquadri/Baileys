@@ -128,13 +128,56 @@ export const makeSocket = (config: SocketConfig) => {
 	}
 
 	/** send a binary node */
-	const sendNode = (frame: BinaryNode) => {
+	const sendNode = async (frame: BinaryNode) => {
 		if (logger.level === 'trace') {
 			logger.trace({ xml: binaryNodeToString(frame), msg: 'xml send' })
 		}
 
+		// Log group media messages specifically
+		if (frame.tag === 'message' && frame.attrs?.to?.includes('@g.us')) {
+			const hasMedia = Array.isArray(frame.content) && frame.content.some((node: any) => 
+				node.tag === 'enc' || 
+				(node.content && Array.isArray(node.content) && 
+				 node.content.some((subNode: any) => subNode.tag === 'enc'))
+			)
+			if (hasMedia) {
+				console.log('🚨 [sendNode] Sending group media message:', {
+					msgId: frame.attrs.id,
+					to: frame.attrs.to,
+					type: frame.attrs.type,
+					hasEnc: hasMedia
+				})
+			}
+		}
+
 		const buff = encodeBinaryNode(frame)
-		return sendRawMessage(buff)
+		try {
+			const result = await sendRawMessage(buff)
+			
+			// Log successful group media sends
+			if (frame.tag === 'message' && frame.attrs?.to?.includes('@g.us')) {
+				const hasMedia = Array.isArray(frame.content) && frame.content.some((node: any) => 
+					node.tag === 'enc' || 
+					(node.content && Array.isArray(node.content) && 
+					 node.content.some((subNode: any) => subNode.tag === 'enc'))
+				)
+				if (hasMedia) {
+					console.log('✅ [sendNode] Group media message sent successfully:', frame.attrs.id)
+				}
+			}
+			
+			return result
+		} catch (error) {
+			// Log group media send failures
+			if (frame.tag === 'message' && frame.attrs?.to?.includes('@g.us')) {
+				console.error('❌ [sendNode] Group media message send failed:', {
+					msgId: frame.attrs.id,
+					to: frame.attrs.to,
+					error: error.message
+				})
+			}
+			throw error
+		}
 	}
 
 	/** log & process any unexpected errors */
@@ -304,6 +347,17 @@ export const makeSocket = (config: SocketConfig) => {
 			// if it's a binary node
 			if (!(frame instanceof Uint8Array)) {
 				const msgId = frame.attrs.id
+
+				// Log error responses for group media messages
+				if (frame.tag === 'ack' && frame.attrs.class === 'message' && frame.attrs.to?.includes('@g.us')) {
+					console.log('🔍 [Frame] Group message ack received:', {
+						msgId: msgId,
+						to: frame.attrs.to,
+						type: frame.attrs.type,
+						error: frame.attrs.error,
+						participant: frame.attrs.participant
+					})
+				}
 
 				if (logger.level === 'trace') {
 					logger.trace({ xml: binaryNodeToString(frame), msg: 'recv xml' })

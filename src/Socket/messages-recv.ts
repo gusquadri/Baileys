@@ -1252,6 +1252,15 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	})
 
 	ws.on('CB:receipt', node => {
+		// Log group media message receipts specifically
+		if (node.attrs?.from?.includes('@g.us') && node.attrs?.type) {
+			console.log('📬 [Receipt] Group message receipt:', {
+				from: node.attrs.from,
+				id: node.attrs.id,
+				type: node.attrs.type,
+				participant: node.attrs.participant
+			})
+		}
 		processNode('receipt', node, 'handling receipt', handleReceipt)
 	})
 
@@ -1259,6 +1268,16 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		processNode('notification', node, 'handling notification', handleNotification)
 	})
 	ws.on('CB:ack,class:message', (node: BinaryNode) => {
+		// Log bad acks for group media messages
+		if (node.attrs?.to?.includes('@g.us')) {
+			console.log('⚠️ [BadAck] Group message bad ack:', {
+				to: node.attrs.to,
+				id: node.attrs.id,
+				type: node.attrs.type,
+				class: node.attrs.class,
+				error: node.attrs.error
+			})
+		}
 		handleBadAck(node).catch(error => onUnexpectedError(error, 'handling bad ack'))
 	})
 
