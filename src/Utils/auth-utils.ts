@@ -323,12 +323,12 @@ export const addTransactionCapability = (
 						// For sender keys, process each one with its own mutex to maintain serialization
 						for (const senderKeyName of idsRequiringFetch) {
 							await getSenderKeyMutex(senderKeyName).runExclusive(async () => {
-								logger.trace({ senderKeyName }, 'fetching sender key in transaction')
+								logger.info({ senderKeyName }, 'fetching sender key in transaction')
 								const result = await state.get(type, [senderKeyName])
 								// Update transaction cache
 								transactionCache[type] ||= {}
 								Object.assign(transactionCache[type]!, result)
-								logger.trace({ senderKeyName, hasResult: !!result[senderKeyName] }, 'sender key fetch complete')
+								logger.info({ senderKeyName, hasResult: !!result[senderKeyName] }, 'sender key fetch complete')
 							})
 						}
 					} else {
