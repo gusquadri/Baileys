@@ -49,7 +49,31 @@ export const DEFAULT_CONNECTION_CONFIG: SocketConfig = {
 	auth: undefined as unknown as AuthenticationState,
 	markOnlineOnConnect: true,
 	syncFullHistory: false,
-	patchMessageBeforeSending: msg => msg,
+	patchMessageBeforeSending: (msg) => {
+		// Apply the MD patch for interactive messages (buttons, lists, etc.)
+		if (msg?.buttonsMessage || 
+			msg?.templateMessage ||
+			msg?.listMessage ||
+			msg?.interactiveMessage?.nativeFlowMessage ||
+			msg?.buttonsResponseMessage ||
+			msg?.listResponseMessage ||
+			msg?.templateButtonReplyMessage ||
+			msg?.interactiveResponseMessage
+		) {
+			return {
+				viewOnceMessageV2Extension: {
+					message: {
+						messageContextInfo: {
+							deviceListMetadataVersion: 2,
+							deviceListMetadata: {}
+						},
+						...msg
+					}
+				}
+			}
+		}
+		return msg
+	},
 	shouldSyncHistoryMessage: () => true,
 	shouldIgnoreJid: () => false,
 	linkPreviewImageThumbnailWidth: 192,
