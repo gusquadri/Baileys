@@ -79,8 +79,8 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 
 			const senderNameStr = senderName.toString()
 
-			// Use transaction to ensure atomicity
-			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
+			// Check if already in transaction to avoid nested transactions
+			const executeEncryption = async () => {
 				const { [senderNameStr]: senderKey } = await auth.keys.get('sender-key', [senderNameStr])
 				if (!senderKey) {
 					await storage.storeSenderKey(senderName, new SenderKeyRecord())
@@ -94,7 +94,14 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 					ciphertext,
 					senderKeyDistributionMessage: senderKeyDistributionMessage.serialize()
 				}
-			})
+			}
+
+			// Only start transaction if not already in one
+			if ((auth.keys as SignalKeyStoreWithTransaction).isInTransaction()) {
+				return executeEncryption()
+			} else {
+				return (auth.keys as SignalKeyStoreWithTransaction).transaction(executeEncryption)
+			}
 		},
 		async injectE2ESession({ jid, session }) {
 			const cipher = new libsignal.SessionBuilder(storage, jidToSignalProtocolAddress(jid))
