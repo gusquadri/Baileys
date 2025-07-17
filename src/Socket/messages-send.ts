@@ -533,6 +533,16 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 						participantsList.push(...statusJidList)
 					}
 
+					// Log participants for group media messages
+					if (jid.includes('@g.us') && (message.imageMessage || message.videoMessage || message.audioMessage || message.documentMessage)) {
+						console.log('👥 [relayMessage] Group participants for media message:', {
+							groupJid: jid,
+							participantsCount: participantsList.length,
+							participants: participantsList.slice(0, 5), // Show first 5
+							addressingMode: groupData?.addressingMode
+						})
+					}
+
 					if (!isStatus) {
 						additionalAttributes = {
 							...additionalAttributes,
@@ -542,6 +552,14 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 					const additionalDevices = await getUSyncDevices(participantsList, !!useUserDevicesCache, false)
 					devices.push(...additionalDevices)
+					
+					// Log device count for group media messages
+					if (jid.includes('@g.us') && (message.imageMessage || message.videoMessage || message.audioMessage || message.documentMessage)) {
+						console.log('📱 [relayMessage] Devices for group media message:', {
+							devicesCount: additionalDevices.length,
+							totalDevices: devices.length
+						})
+					}
 				}
 
 				const patched = await patchMessageBeforeSending(message)

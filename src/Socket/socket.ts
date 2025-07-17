@@ -145,7 +145,12 @@ export const makeSocket = (config: SocketConfig) => {
 					msgId: frame.attrs.id,
 					to: frame.attrs.to,
 					type: frame.attrs.type,
-					hasEnc: hasMedia
+					hasEnc: hasMedia,
+					contentStructure: Array.isArray(frame.content) ? frame.content.map(node => ({
+						tag: node.tag,
+						attrs: node.attrs,
+						hasContent: !!node.content
+					})) : 'not-array'
 				})
 			}
 		}
@@ -163,6 +168,11 @@ export const makeSocket = (config: SocketConfig) => {
 				)
 				if (hasMedia) {
 					console.log('✅ [sendNode] Group media message sent successfully:', frame.attrs.id)
+					
+					// Check for receipt after 5 seconds
+					setTimeout(() => {
+						console.log('⏰ [sendNode] Checking if receipt received for group media message:', frame.attrs.id)
+					}, 5000)
 				}
 			}
 			
