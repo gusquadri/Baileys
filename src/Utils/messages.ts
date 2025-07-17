@@ -460,6 +460,16 @@ export const generateWAMessageContent = async (
 		m.messageContextInfo.messageAddOnDurationInSecs = message.type === 1 ? message.time || 86400 : 0
 	} else if ('buttonReply' in message) {
 		switch (message.type) {
+			case 'list':
+				m.listResponseMessage = {
+					title: message.buttonReply.title,
+					description: message.buttonReply.description,
+					singleSelectReply: {
+						selectedRowId: message.buttonReply.rowId
+					},
+					listType: proto.Message.ListResponseMessage.ListType.SINGLE_SELECT
+				}
+				break
 			case 'template':
 				m.templateButtonReplyMessage = {
 					selectedDisplayText: message.buttonReply.displayText,
@@ -472,6 +482,19 @@ export const generateWAMessageContent = async (
 					selectedButtonId: message.buttonReply.id,
 					selectedDisplayText: message.buttonReply.displayText,
 					type: proto.Message.ButtonsResponseMessage.Type.DISPLAY_TEXT
+				}
+				break
+			case 'interactive':
+				m.interactiveResponseMessage = {
+					body: {
+						text: message.buttonReply.displayText,
+						format: proto.Message.InteractiveResponseMessage.Body.Format.EXTENSIONS_1
+					},
+					nativeFlowResponseMessage: {
+						name: message.buttonReply.nativeFlows.name,
+						paramsJson: message.buttonReply.nativeFlows.paramsJson,
+						version: message.buttonReply.nativeFlows.version
+					}
 				}
 				break
 		}
@@ -555,9 +578,9 @@ export const generateWAMessageContent = async (
 				type: WAProto.Message.ProtocolMessage.Type.MESSAGE_EDIT
 			}
 		}
-	} else if ('buttons' in message && !!(message as any).buttons) {
+	} else if ('buttons' in message && !!message.buttons) {
 		const buttonsMessage: any = {
-			buttons: (message as any).buttons.map((b: any) => ({ 
+			buttons: message.buttons.map(b => ({ 
 				...b, 
 				type: proto.Message.ButtonsMessage.Button.Type.RESPONSE 
 			}))
@@ -577,12 +600,12 @@ export const generateWAMessageContent = async (
 			Object.assign(buttonsMessage, m)
 		}
 		
-		if ('footer' in message && !!(message as any).footer) {
-			buttonsMessage.footerText = (message as any).footer
+		if ('footer' in message && !!message.footer) {
+			buttonsMessage.footerText = message.footer
 		}
 		
-		if ('title' in message && !!(message as any).title) {
-			buttonsMessage.text = (message as any).title
+		if ('title' in message && !!message.title) {
+			buttonsMessage.text = message.title
 			buttonsMessage.headerType = proto.Message.ButtonsMessage.HeaderType.TEXT
 		}
 		
@@ -592,6 +615,24 @@ export const generateWAMessageContent = async (
 		}
 		
 		m = { buttonsMessage: WAProto.Message.ButtonsMessage.fromObject(buttonsMessage) }
+	}
+
+	if ('sections' in message && !!message.sections) {
+		const listMessage: any = {
+			title: message.title,
+			buttonText: message.buttonText,
+			footerText: message.footer,
+			description: message.text,
+			sections: message.sections,
+			listType: proto.Message.ListMessage.ListType.SINGLE_SELECT
+		}
+		
+		listMessage.contextInfo = {
+			...((message as any).contextInfo || {}),
+			...((message as any).mentions ? { mentionedJid: (message as any).mentions } : {})
+		}
+		
+		m = { listMessage: WAProto.Message.ListMessage.fromObject(listMessage) }
 	}
 
 	if ('contextInfo' in message && !!message.contextInfo) {

@@ -150,6 +150,38 @@ export type ButtonReplyInfo = {
 	index: number
 }
 
+export type ListButtonReplyInfo = {
+	title: string
+	description?: string
+	rowId: string
+}
+
+export type InteractiveButtonReplyInfo = {
+	displayText: string
+	nativeFlows: {
+		name: string
+		paramsJson: string
+		version: number
+	}
+}
+
+export type ListSection = {
+	title: string
+	rows: {
+		title: string
+		rowId: string
+		description?: string
+	}[]
+}
+
+export type Button = {
+	buttonId: string
+	buttonText: {
+		displayText: string
+	}
+	type: number
+}
+
 export type GroupInviteInfo = {
 	inviteCode: string
 	inviteExpiration: number
@@ -189,6 +221,27 @@ export type AnyRegularMessageContent = (
 			buttonReply: ButtonReplyInfo
 			type: 'template' | 'plain'
 	  }
+	| {
+			buttonReply: ListButtonReplyInfo
+			type: 'list'
+	  }
+	| {
+			buttonReply: InteractiveButtonReplyInfo
+			type: 'interactive'
+	  }
+	| ({
+			text: string
+			title: string
+			buttonText: string
+			footer?: string
+			sections: ListSection[]
+	  } & Mentionable & Contextable)
+	| ({
+			text: string
+			buttons: Button[]
+			footer?: string
+			title?: string
+	  } & Mentionable & Contextable)
 	| {
 			groupInvite: GroupInviteInfo
 	  }
