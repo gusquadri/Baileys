@@ -20,6 +20,7 @@ import {
 	WAMessageContent,
 	WAMessageStatus,
 	WAProto,
+	WAUrlInfo,
 	WATextMessage
 } from '../Types'
 import { isJidGroup, isJidNewsletter, isJidStatusBroadcast, jidNormalizedUser } from '../WABinary'
@@ -360,10 +361,11 @@ export const generateWAMessageContent = async (
 	options: MessageContentGenerationOptions
 ) => {
 	let m: WAMessageContent = {}
-	if ('text' in message) {
-		const extContent = { text: message.text } as WATextMessage
+	if ('text' in message && !('sections' in message) && !('buttons' in message)) {
+		const textMessage = message as { text: string; linkPreview?: WAUrlInfo | null }
+		const extContent = { text: textMessage.text } as WATextMessage
 
-		let urlInfo = message.linkPreview
+		let urlInfo = textMessage.linkPreview
 		if (typeof urlInfo === 'undefined') {
 			urlInfo = await generateLinkPreviewIfRequired(message.text, options.getUrlInfo, options.logger)
 		}
@@ -555,6 +557,8 @@ export const generateWAMessageContent = async (
 		}
 	} else if ('requestPhoneNumber' in message) {
 		m.requestPhoneNumberMessage = {}
+	} else if ('sections' in message || 'buttons' in message) {
+		// These are handled later in the function
 	} else {
 		m = await prepareWAMessageMedia(message, options)
 	}
