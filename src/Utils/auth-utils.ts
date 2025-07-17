@@ -297,6 +297,7 @@ export const addTransactionCapability = (
 		if (!mutex) {
 			mutex = new Mutex()
 			senderKeyMutexes.set(senderKeyName, mutex)
+			logger.trace({ senderKeyName }, 'created new sender key mutex')
 		}
 
 		return mutex
@@ -318,13 +319,16 @@ export const addTransactionCapability = (
 
 					// Use per-sender-key mutex for sender-key operations when possible
 					if (type === 'sender-key') {
+						logger.trace({ idsRequiringFetch }, 'processing sender keys in transaction')
 						// For sender keys, process each one with its own mutex to maintain serialization
 						for (const senderKeyName of idsRequiringFetch) {
 							await getSenderKeyMutex(senderKeyName).runExclusive(async () => {
+								logger.trace({ senderKeyName }, 'fetching sender key in transaction')
 								const result = await state.get(type, [senderKeyName])
 								// Update transaction cache
 								transactionCache[type] ||= {}
 								Object.assign(transactionCache[type]!, result)
+								logger.trace({ senderKeyName, hasResult: !!result[senderKeyName] }, 'sender key fetch complete')
 							})
 						}
 					} else {
@@ -384,6 +388,7 @@ export const addTransactionCapability = (
 				const senderKeyNames = hasSenderKeys ? Object.keys(data['sender-key'] || {}) : []
 				
 				if (hasSenderKeys) {
+					logger.trace({ senderKeyNames }, 'processing sender key set operations')
 					// Handle sender key operations with per-key mutexes
 					for (const senderKeyName of senderKeyNames) {
 						await getSenderKeyMutex(senderKeyName).runExclusive(async () => {
@@ -394,8 +399,10 @@ export const addTransactionCapability = (
 								}
 							}
 							
+							logger.trace({ senderKeyName }, 'storing sender key')
 							// Apply changes to the store
 							await state.set(senderKeyData)
+							logger.trace({ senderKeyName }, 'sender key stored')
 						})
 					}
 					
