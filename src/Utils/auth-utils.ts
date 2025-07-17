@@ -316,15 +316,17 @@ export const addTransactionCapability = (
 				if (idsRequiringFetch.length) {
 					dbQueriesInTransaction += 1
 
-					// Use per-sender-key mutex for sender-key operations
-					if (type === 'sender-key' && idsRequiringFetch.length === 1) {
-						const senderKeyName = idsRequiringFetch[0]
-						await getSenderKeyMutex(senderKeyName).runExclusive(async () => {
-							const result = await state.get(type, idsRequiringFetch)
-							// Update transaction cache
-							transactionCache[type] ||= {}
-							Object.assign(transactionCache[type]!, result)
-						})
+					// Use per-sender-key mutex for sender-key operations when possible
+					if (type === 'sender-key') {
+						// For sender keys, process each one with its own mutex to maintain serialization
+						for (const senderKeyName of idsRequiringFetch) {
+							await getSenderKeyMutex(senderKeyName).runExclusive(async () => {
+								const result = await state.get(type, [senderKeyName])
+								// Update transaction cache
+								transactionCache[type] ||= {}
+								Object.assign(transactionCache[type]!, result)
+							})
+						}
 					} else {
 						// Use runExclusive for cleaner mutex handling
 						await getKeyTypeMutex(type as string).runExclusive(async () => {
@@ -347,9 +349,16 @@ export const addTransactionCapability = (
 				}, {})
 			} else {
 				// Not in transaction, fetch directly with mutex protection
-				if (type === 'sender-key' && ids.length === 1) {
-					const senderKeyName = ids[0]
-					return await getSenderKeyMutex(senderKeyName).runExclusive(() => state.get(type, ids))
+				if (type === 'sender-key') {
+					// For sender keys, use individual mutexes to maintain per-key serialization
+					const results: { [key: string]: SignalDataTypeMap[typeof type] } = {}
+					for (const senderKeyName of ids) {
+						const result = await getSenderKeyMutex(senderKeyName).runExclusive(() => 
+							state.get(type, [senderKeyName])
+						)
+						Object.assign(results, result)
+					}
+					return results
 				} else {
 					return await getKeyTypeMutex(type as string).runExclusive(() => state.get(type, ids))
 				}
@@ -371,26 +380,44 @@ export const addTransactionCapability = (
 				}
 			} else {
 				// Not in transaction, apply directly with mutex protection
-				// Check if we have sender-key operations that need per-key serialization
 				const hasSenderKeys = 'sender-key' in data
 				const senderKeyNames = hasSenderKeys ? Object.keys(data['sender-key'] || {}) : []
-
-				if (hasSenderKeys && senderKeyNames.length === 1) {
-					// Single sender key operation - use per-sender-key mutex
-					const senderKeyName = senderKeyNames[0]
-					await getSenderKeyMutex(senderKeyName).runExclusive(async () => {
-						// Process pre-keys separately
-						for (const keyType in data) {
-							if (keyType === 'pre-key') {
-								await processPreKeyDeletions(data, keyType, state, logger)
+				
+				if (hasSenderKeys) {
+					// Handle sender key operations with per-key mutexes
+					for (const senderKeyName of senderKeyNames) {
+						await getSenderKeyMutex(senderKeyName).runExclusive(async () => {
+							// Create data subset for this specific sender key
+							const senderKeyData = {
+								'sender-key': {
+									[senderKeyName]: data['sender-key']![senderKeyName]
+								}
 							}
-						}
+							
+							// Apply changes to the store
+							await state.set(senderKeyData)
+						})
+					}
+					
+					// Handle any non-sender-key data with regular mutexes
+					const nonSenderKeyData = { ...data }
+					delete nonSenderKeyData['sender-key']
+					
+					if (Object.keys(nonSenderKeyData).length > 0) {
+						await withMutexes(Object.keys(nonSenderKeyData), getKeyTypeMutex, async () => {
+							// Process pre-keys separately
+							for (const keyType in nonSenderKeyData) {
+								if (keyType === 'pre-key') {
+									await processPreKeyDeletions(nonSenderKeyData, keyType, state, logger)
+								}
+							}
 
-						// Apply changes to the store
-						await state.set(data)
-					})
+							// Apply changes to the store
+							await state.set(nonSenderKeyData)
+						})
+					}
 				} else {
-					// Multiple operations or non-sender-key operations - use original logic
+					// No sender keys - use original logic
 					await withMutexes(Object.keys(data), getKeyTypeMutex, async () => {
 						// Process pre-keys separately
 						for (const keyType in data) {
