@@ -587,6 +587,16 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					}
 				}
 
+				// Log sender key distribution for group media messages
+				if (jid.includes('@g.us') && (message.imageMessage || message.videoMessage || message.audioMessage || message.documentMessage)) {
+					console.log('🔑 [relayMessage] Sender key distribution:', {
+						totalDevices: devices.length,
+						senderKeyJidsCount: senderKeyJids.length,
+						senderKeyJids: senderKeyJids.slice(0, 3), // Show first 3
+						senderKeyMapSize: Object.keys(senderKeyMap).length
+					})
+				}
+
 				// if there are some participants with whom the session has not been established
 				// if there are, we re-send the senderkey
 				if (senderKeyJids.length) {
@@ -612,6 +622,32 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					attrs: { v: '2', type: 'skmsg' },
 					content: ciphertext
 				})
+
+				// Create participant nodes for the encrypted group message
+				const allDeviceJids: string[] = []
+				for (const { user, device } of devices) {
+					const deviceJid = jidEncode(user, groupData?.addressingMode === 'lid' ? 'lid' : 's.whatsapp.net', device)
+					allDeviceJids.push(deviceJid)
+				}
+
+				if (allDeviceJids.length > 0) {
+					const groupMsg: proto.IMessage = {
+						deviceSentMessage: {
+							destinationJid,
+							message
+						}
+					}
+
+					const result = await createParticipantNodes(allDeviceJids, groupMsg, extraAttrs)
+					participants.push(...result.nodes)
+					shouldIncludeDeviceIdentity = shouldIncludeDeviceIdentity || result.shouldIncludeDeviceIdentity
+
+					// Log group media message participant creation
+					console.log('✉️ [relayMessage] Created participant nodes for group media:', {
+						allDeviceJidsCount: allDeviceJids.length,
+						participantNodesCreated: result.nodes.length
+					})
+				}
 
 				await authState.keys.set({ 'sender-key-memory': { [jid]: senderKeyMap } })
 			} else {
@@ -661,6 +697,14 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				participants.push(...otherNodes)
 
 				shouldIncludeDeviceIdentity = shouldIncludeDeviceIdentity || s1 || s2
+			}
+
+			// Log participant nodes for group media messages
+			if (isGroup && (message.imageMessage || message.videoMessage || message.audioMessage || message.documentMessage)) {
+				console.log('👤 [relayMessage] Participant nodes created:', {
+					participantsLength: participants.length,
+					category: additionalAttributes?.['category']
+				})
 			}
 
 			if (participants.length) {
