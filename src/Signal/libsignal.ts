@@ -74,21 +74,36 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			})
 		},
 		async encryptGroupMessage({ group, meId, data }) {
+			console.log('🔐 [encryptGroupMessage] Starting encryption for group:', group, 'meId:', meId, 'dataLength:', data?.length)
+			
 			const senderName = jidToSignalSenderKeyName(group, meId)
 			const builder = new GroupSessionBuilder(storage)
 
 			const senderNameStr = senderName.toString()
+			console.log('🔐 [encryptGroupMessage] SenderName:', senderNameStr)
 
 			// Check if already in transaction to avoid nested transactions
 			const executeEncryption = async () => {
+				console.log('🔐 [encryptGroupMessage] Starting executeEncryption, inTransaction:', (auth.keys as SignalKeyStoreWithTransaction).isInTransaction())
+				
 				const { [senderNameStr]: senderKey } = await auth.keys.get('sender-key', [senderNameStr])
+				console.log('🔐 [encryptGroupMessage] Retrieved sender key, exists:', !!senderKey)
+				
 				if (!senderKey) {
+					console.log('🔐 [encryptGroupMessage] Creating new SenderKeyRecord')
 					await storage.storeSenderKey(senderName, new SenderKeyRecord())
 				}
 
+				console.log('🔐 [encryptGroupMessage] Creating sender key distribution message')
 				const senderKeyDistributionMessage = await builder.create(senderName)
+				
+				console.log('🔐 [encryptGroupMessage] Creating GroupCipher session')
 				const session = new GroupCipher(storage, senderName)
+				
+				console.log('🔐 [encryptGroupMessage] Encrypting data')
 				const ciphertext = await session.encrypt(data)
+				
+				console.log('🔐 [encryptGroupMessage] Encryption successful, ciphertext length:', ciphertext?.length)
 
 				return {
 					ciphertext,
@@ -96,11 +111,18 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 				}
 			}
 
-			// Only start transaction if not already in one
-			if ((auth.keys as SignalKeyStoreWithTransaction).isInTransaction()) {
-				return executeEncryption()
-			} else {
-				return (auth.keys as SignalKeyStoreWithTransaction).transaction(executeEncryption)
+			try {
+				// Only start transaction if not already in one
+				if ((auth.keys as SignalKeyStoreWithTransaction).isInTransaction()) {
+					console.log('🔐 [encryptGroupMessage] Already in transaction, executing directly')
+					return await executeEncryption()
+				} else {
+					console.log('🔐 [encryptGroupMessage] Starting new transaction')
+					return await (auth.keys as SignalKeyStoreWithTransaction).transaction(executeEncryption)
+				}
+			} catch (error) {
+				console.error('🔐 [encryptGroupMessage] ERROR:', error)
+				throw error
 			}
 		},
 		async injectE2ESession({ jid, session }) {
