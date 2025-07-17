@@ -430,8 +430,8 @@ export const addTransactionCapability = (
 					// For sender keys, use individual queues to maintain per-key serialization
 					const results: { [key: string]: SignalDataTypeMap[typeof type] } = {}
 					for (const senderKeyName of ids) {
-						const result = await queueSenderKeyOperation(senderKeyName, () => 
-							state.get(type, [senderKeyName])
+						const result = await queueSenderKeyOperation(senderKeyName, async () => 
+							await state.get(type, [senderKeyName])
 						)
 						Object.assign(results, result)
 					}
