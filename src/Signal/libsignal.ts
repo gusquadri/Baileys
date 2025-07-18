@@ -9,14 +9,24 @@ import { SenderKeyRecord } from './Group/sender-key-record'
 import { GroupCipher, GroupSessionBuilder, SenderKeyDistributionMessage } from './Group'
 
 export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository {
-	const storage: SenderKeyStore = signalStorage(auth)
+	const storage: SenderKeyStore & {
+		queueGroupMessage?: (
+			senderKeyName: string,
+			messageBytes: Uint8Array,
+			originalCipher: { decrypt: (messageBytes: Uint8Array) => Promise<Uint8Array> }
+		) => Promise<Uint8Array>
+	} = signalStorage(auth)
 	return {
 		decryptGroupMessage({ group, authorJid, msg }) {
 			const senderName = jidToSignalSenderKeyName(group, authorJid)
 			const cipher = new GroupCipher(storage, senderName)
 
-			return cipher.decrypt(msg)
+			// Use transaction to ensure atomicity
+			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
+				return cipher.decrypt(msg)
+			})
 		},
+
 		async processSenderKeyDistributionMessage({ item, authorJid }) {
 			const builder = new GroupSessionBuilder(storage)
 			if (!item.groupId) {
@@ -119,7 +129,13 @@ const jidToSignalSenderKeyName = (group: string, user: string): SenderKeyName =>
 	return new SenderKeyName(group, jidToSignalProtocolAddress(user))
 }
 
-function signalStorage({ creds, keys }: SignalAuthState): SenderKeyStore & Record<string, any> {
+function signalStorage({ creds, keys }: SignalAuthState): SenderKeyStore & {
+	queueGroupMessage?: (
+		senderKeyName: string,
+		messageBytes: Uint8Array,
+		originalCipher: { decrypt: (messageBytes: Uint8Array) => Promise<Uint8Array> }
+	) => Promise<Uint8Array>
+} & Record<string, unknown> {
 	return {
 		loadSession: async (id: string) => {
 			const { [id]: sess } = await keys.get('session', [id])
@@ -172,6 +188,7 @@ function signalStorage({ creds, keys }: SignalAuthState): SenderKeyStore & Recor
 				privKey: Buffer.from(signedIdentityKey.private),
 				pubKey: generateSignalPubKey(signedIdentityKey.public)
 			}
-		}
+		},
+		queueGroupMessage: 'queueGroupMessage' in keys ? keys.queueGroupMessage : undefined
 	}
 }
