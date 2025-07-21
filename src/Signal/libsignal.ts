@@ -137,11 +137,10 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
 				const { [sessionId]: existingSession } = await auth.keys.get('session', [sessionId])
 
-				// Skip injection if session exists to prevent overwrites
-				// This prevents race conditions with concurrent session operations
+				// Wait briefly if session exists to prevent race conditions
+				// This allows concurrent operations to complete before overwriting
 				if (existingSession) {
-					// Return without throwing to avoid losing the session data
-					return
+					await new Promise(resolve => setTimeout(resolve, 100))
 				}
 
 				await cipher.initOutgoing(session)
