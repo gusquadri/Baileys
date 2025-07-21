@@ -41,18 +41,14 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
 				const { [senderNameStr]: existingSenderKey } = await auth.keys.get('sender-key', [senderNameStr])
 				
-				console.log(`[SENDER_KEY_DEBUG] Processing distribution for ${senderNameStr}, existing: ${!!existingSenderKey}`)
-				
 				// Only create new sender key record if none exists
 				// This prevents race conditions with concurrent key operations
 				if (!existingSenderKey) {
 					const newRecord = new SenderKeyRecord()
 					await storage.storeSenderKey(senderName, newRecord)
-					console.log(`[SENDER_KEY_DEBUG] Created new sender key record for ${senderNameStr}`)
 				}
 
 				await builder.process(senderName, senderMsg)
-				console.log(`[SENDER_KEY_DEBUG] Processed sender key distribution for ${senderNameStr}`)
 			})
 		},
 		async decryptMessage({ jid, type, ciphertext }) {
@@ -60,27 +56,27 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			const session = new libsignal.SessionCipher(storage, addr)
 			const sessionId = addr.toString()
 
-			console.log(`[CHAT_KEY_DEBUG] Decrypting ${type} message from ${jid} (session: ${sessionId})`)
-
 			// Use transaction to ensure atomicity
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
-				// Check if session exists before decryption
 				const { [sessionId]: existingSession } = await auth.keys.get('session', [sessionId])
-				console.log(`[CHAT_KEY_DEBUG] Existing session for ${jid}: ${!!existingSession}`)
+
+				// For regular messages, wait briefly if no session exists
+				// This prevents race conditions with concurrent session operations
+				if (type === 'msg' && !existingSession) {
+					// Wait a short time for potential concurrent session creation
+					await new Promise(resolve => setTimeout(resolve, 100))
+				}
 
 				let result: Buffer
 				switch (type) {
 					case 'pkmsg':
-						console.log(`[CHAT_KEY_DEBUG] Decrypting pre-key message from ${jid}`)
 						result = await session.decryptPreKeyWhisperMessage(ciphertext)
 						break
 					case 'msg':
-						console.log(`[CHAT_KEY_DEBUG] Decrypting whisper message from ${jid}`)
 						result = await session.decryptWhisperMessage(ciphertext)
 						break
 				}
 
-				console.log(`[CHAT_KEY_DEBUG] Successfully decrypted message from ${jid}`)
 				return result
 			})
 		},
@@ -89,18 +85,20 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			const cipher = new libsignal.SessionCipher(storage, addr)
 			const sessionId = addr.toString()
 
-			console.log(`[CHAT_KEY_DEBUG] Encrypting message to ${jid} (session: ${sessionId})`)
-
 			// Use transaction to ensure atomicity
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
-				// Check if session exists before encryption
 				const { [sessionId]: existingSession } = await auth.keys.get('session', [sessionId])
-				console.log(`[CHAT_KEY_DEBUG] Existing session for ${jid}: ${!!existingSession}`)
+
+				// Wait briefly if no session exists
+				// This prevents creating sessions during encryption
+				if (!existingSession) {
+					// Wait a short time for potential concurrent session creation
+					await new Promise(resolve => setTimeout(resolve, 100))
+				}
 
 				const { type: sigType, body } = await cipher.encrypt(data)
 				const type = sigType === 3 ? 'pkmsg' : 'msg'
 				
-				console.log(`[CHAT_KEY_DEBUG] Encrypted as ${type} message to ${jid}`)
 				return { type, ciphertext: Buffer.from(body, 'binary') }
 			})
 		},
@@ -114,21 +112,16 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
 				const { [senderNameStr]: existingSenderKey } = await auth.keys.get('sender-key', [senderNameStr])
 				
-				console.log(`[SENDER_KEY_DEBUG] Encrypting group message for ${senderNameStr}, existing: ${!!existingSenderKey}`)
-				
 				// Only create new sender key record if none exists
 				// This prevents overwriting keys that might be in the process of being set up
 				if (!existingSenderKey) {
 					const newRecord = new SenderKeyRecord()
 					await storage.storeSenderKey(senderName, newRecord)
-					console.log(`[SENDER_KEY_DEBUG] Created new sender key record for encryption ${senderNameStr}`)
 				}
 
 				const senderKeyDistributionMessage = await builder.create(senderName)
 				const session = new GroupCipher(storage, senderName)
 				const ciphertext = await session.encrypt(data)
-
-				console.log(`[SENDER_KEY_DEBUG] Successfully encrypted group message for ${senderNameStr}`)
 
 				return {
 					ciphertext,
@@ -140,15 +133,18 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			const cipher = new libsignal.SessionBuilder(storage, jidToSignalProtocolAddress(jid))
 			const sessionId = jidToSignalProtocolAddress(jid).toString()
 
-			console.log(`[CHAT_KEY_DEBUG] Injecting E2E session for ${jid} (session: ${sessionId})`)
-
 			// Use transaction to ensure atomicity
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
 				const { [sessionId]: existingSession } = await auth.keys.get('session', [sessionId])
-				console.log(`[CHAT_KEY_DEBUG] Existing session before injection for ${jid}: ${!!existingSession}`)
+
+				// Skip injection if session exists to prevent overwrites
+				// This prevents race conditions with concurrent session operations
+				if (existingSession) {
+					// Return without throwing to avoid losing the session data
+					return
+				}
 
 				await cipher.initOutgoing(session)
-				console.log(`[CHAT_KEY_DEBUG] Successfully injected E2E session for ${jid}`)
 			})
 		},
 		jidToSignalProtocolAddress(jid) {
