@@ -263,7 +263,15 @@ export const addTransactionCapability = (
     const keyTypeMutexes = new Map<string, Mutex>()
     
     // Per-sender-key-name mutexes for fine-grained serialization
-    const senderKeyMutexes = new Map<string, Mutex>()
+    const senderKeyMutexes = new NodeCache({
+		stdTTL: 1800, // 30 minutes TTL for sender key mutexes
+		useClones: false,
+		deleteOnExpire: true,
+		maxKeys: 2000 // Limit to prevent excessive memory usage
+	}) as NodeCache & {
+		get(key: string): Mutex | undefined
+		set(key: string, value: Mutex): void
+	}
     
     // Global transaction mutex
     const transactionMutex = new Mutex()
