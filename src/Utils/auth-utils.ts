@@ -348,7 +348,6 @@ export const addTransactionCapability = (
 
 	// Transaction state stack for nested transaction support
 	interface TransactionState {
-		id: number
 		cache: SignalDataSet
 		mutations: SignalDataSet
 		dbQueries: number
@@ -356,7 +355,6 @@ export const addTransactionCapability = (
 	
 	const transactionStack: TransactionState[] = []
 	let transactionsInProgress = 0
-	let transactionCounter = 0
 	
 	// Get current transaction state (top of stack)
 	const getCurrentTransaction = (): TransactionState | null => {
@@ -545,9 +543,6 @@ export const addTransactionCapability = (
 			const senderKeyUpdates: string[] = []
 			const currentTx = getCurrentTransaction()
 
-			logger.error({ dataTypes: Object.keys(data), hasCurrentTx: !!currentTx }, 'SET METHOD CALLED')
-
-			// TEMPORARY: Enable transactions for debugging
 			if (currentTx) {
 				logger.trace({ types: Object.keys(data) }, 'caching in transaction')
 				for (const key in data) {
@@ -563,13 +558,10 @@ export const addTransactionCapability = (
 
 					// Special handling for pre-keys and signed-pre-keys
 					if (key === 'pre-key' || key === 'signed-pre-key') {
-						logger.error({ key }, 'USING PRE-KEY OPERATIONS')
 						await handlePreKeyOperations(data, key, currentTx.cache, currentTx.mutations, logger, true)
 					} else {
 						// Normal handling for other key types
-						logger.error({ key, dataKeys: Object.keys(data[key] || {}) }, 'USING NORMAL KEY OPERATIONS')
 						handleNormalKeyOperations(data, key, currentTx.cache, currentTx.mutations)
-						logger.error({ key, mutationKeys: Object.keys(currentTx.mutations[key] || {}) }, 'AFTER NORMAL KEY OPERATIONS')
 					}
 				}
 				
@@ -587,17 +579,12 @@ export const addTransactionCapability = (
 			const hasSenderKeys = 'sender-key' in data
 			const hasSessionOnly = dataTypes.length === 1 && dataTypes[0] === 'session'
 			
-			logger.trace({ dataTypes, hasSessionOnly, hasSenderKeys }, 'non-transaction storage path')
-			
 			try {
 				// Fast path for session-only operations (critical for assertSessions)
 				if (hasSessionOnly) {
 					logger.trace({ sessionIds: Object.keys(data.session || {}) }, 'session-only storage')
 					return await getKeyTypeMutex('session').runExclusive(async () => {
-						logger.trace('executing session-only storage')
-						const result = await state.set(data)
-						logger.trace('session-only storage completed')
-						return result
+						return await state.set(data)
 					})
 				}
 
@@ -679,64 +666,84 @@ export const addTransactionCapability = (
 		): Promise<Uint8Array> => {
 			return queueMessage(senderKeyName, messageBytes, originalCipher)
 		},
-		transaction: async <T>(work: () => Promise<T>): Promise<T> => {
-			// This function will hold the lock for the entire in-memory operation
-			// to prevent stack corruption from concurrent transactions.
-			const { result, mutationsToCommit } = await transactionMutex.runExclusive(async () => {
-				transactionsInProgress += 1;
-				transactionCounter += 1;
-				const txState: TransactionState = { id: transactionCounter, cache: {}, mutations: {}, dbQueries: 0 };
-				transactionStack.push(txState);
-
-				if (transactionsInProgress === 1) {
-					logger.trace({ tx: txState.id }, 'entering outermost transaction');
-				} else {
-					logger.trace({ tx: txState.id, level: transactionsInProgress }, 'entering nested transaction');
-				}
-
-				let workResult: T;
-				let mutationsToCommit: SignalDataSet | undefined;
+		async transaction<T>(work: () => Promise<T>): Promise<T> {
+			return transactionMutex.acquire().then(async releaseTxMutex => {
+				let result: Awaited<ReturnType<typeof work>>
+				let mutexReleased = false
+				
 				try {
-					workResult = await work();
+					transactionsInProgress += 1
+					
+					// Create new transaction state and push to stack
+					const txState: TransactionState = {
+						cache: {},
+						mutations: {},
+						dbQueries: 0
+					}
+					transactionStack.push(txState)
+					
+					if (transactionsInProgress === 1) {
+						logger.trace('entering outermost transaction')
+					} else {
+						logger.trace({ level: transactionsInProgress }, 'entering nested transaction')
+					}
 
-					// After work is done, merge mutations if it's a nested transaction
-					if (transactionsInProgress > 1) {
-						const completedTx = transactionStack[transactionStack.length - 1];
-						const parentTx = transactionStack[transactionStack.length - 2];
+					// Release the transaction mutex now that we've updated the counter
+					// This allows other transactions to start preparing
+					releaseTxMutex()
+					mutexReleased = true
 
-						if (completedTx === txState && parentTx) {
-							logger.trace({ tx: completedTx.id, parent: parentTx.id }, 'merging nested transaction to parent');
-							for (const key in completedTx.mutations) {
-								parentTx.mutations[key] = parentTx.mutations[key] || {};
-								Object.assign(parentTx.mutations[key]!, completedTx.mutations[key]);
+					try {
+						result = await work()
+						
+						// commit if this is the outermost transaction
+						if (transactionsInProgress === 1) {
+							const hasMutations = Object.keys(txState.mutations).length > 0
+
+							if (hasMutations) {
+								logger.trace('committing outermost transaction')
+								await commitWithRetry(txState.mutations, state, getKeyTypeMutex, maxCommitRetries, delayBetweenTriesMs, logger)
+								logger.trace({ dbQueries: txState.dbQueries }, 'transaction completed')
+							} else {
+								logger.trace('no mutations in outermost transaction')
+							}
+						} else {
+							// For nested transactions, merge mutations into parent
+							const parentTx = transactionStack[transactionStack.length - 2]
+							if (parentTx) {
+								logger.trace({ level: transactionsInProgress }, 'merging nested transaction to parent')
+								// Merge cache and mutations to parent
+								for (const key in txState.cache) {
+									parentTx.cache[key] = parentTx.cache[key] || {}
+									Object.assign(parentTx.cache[key], txState.cache[key])
+								}
+								for (const key in txState.mutations) {
+									parentTx.mutations[key] = parentTx.mutations[key] || {}
+									Object.assign(parentTx.mutations[key], txState.mutations[key])
+								}
+								parentTx.dbQueries += txState.dbQueries
 							}
 						}
+					} finally {
+						transactionsInProgress -= 1
+						transactionStack.pop() // Remove current transaction state
 					}
-				} finally {
-					const finalTx = transactionStack[transactionStack.length - 1];
-					// If we are the outermost transaction, we are responsible for the commit
-					if (transactionsInProgress === 1) {
-						if (Object.keys(finalTx.mutations).length > 0) {
-							mutationsToCommit = finalTx.mutations;
-						}
+
+					return result
+				} catch (error) {
+					// Clean up transaction state on error
+					if (transactionStack.length > 0) {
+						transactionStack.pop()
 					}
 					
-					transactionsInProgress -= 1;
-					transactionStack.pop();
+					// Only release if we haven't already released the mutex
+					if (!mutexReleased) {
+						releaseTxMutex()
+					}
+					throw error
 				}
-
-				return { result: workResult, mutationsToCommit };
-			});
-
-			// === COMMIT PHASE ===
-			// This happens *outside* the transactionMutex, which prevents deadlocks.
-			if (mutationsToCommit) {
-				logger.trace('committing outermost transaction');
-				await commitWithRetry(mutationsToCommit, state, getKeyTypeMutex, maxCommitRetries, delayBetweenTriesMs, logger);
-			}
-
-			return result;
-		},
+			})
+		}
 	}
 
 	return storeImplementation as SignalKeyStoreWithTransaction
