@@ -698,12 +698,14 @@ export const addTransactionCapability = (
 						
 						// commit if this is the outermost transaction
 						if (transactionsInProgress === 1) {
-							const hasMutations = Object.keys(txState.mutations).length > 0
+							// Use current transaction state (may have been merged from nested transactions)
+							const currentTx = getCurrentTransaction()
+							const hasMutations = currentTx ? Object.keys(currentTx.mutations).length > 0 : false
 
-							if (hasMutations) {
+							if (hasMutations && currentTx) {
 								logger.trace('committing outermost transaction')
-								await commitWithRetry(txState.mutations, state, getKeyTypeMutex, maxCommitRetries, delayBetweenTriesMs, logger)
-								logger.trace({ dbQueries: txState.dbQueries }, 'transaction completed')
+								await commitWithRetry(currentTx.mutations, state, getKeyTypeMutex, maxCommitRetries, delayBetweenTriesMs, logger)
+								logger.trace({ dbQueries: currentTx.dbQueries }, 'transaction completed')
 							} else {
 								logger.trace('no mutations in outermost transaction')
 							}
