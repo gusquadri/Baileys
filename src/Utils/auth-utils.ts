@@ -545,8 +545,7 @@ export const addTransactionCapability = (
 
 			logger.error({ dataTypes: Object.keys(data), hasCurrentTx: !!currentTx }, 'SET METHOD CALLED')
 
-			// TEMPORARY: Disable transactions for debugging
-			/* 
+			// TEMPORARY: Enable transactions for debugging
 			if (currentTx) {
 				logger.trace({ types: Object.keys(data) }, 'caching in transaction')
 				for (const key in data) {
@@ -577,7 +576,6 @@ export const addTransactionCapability = (
 				}
 				return
 			}
-			*/
 
 			// Non-transaction path: determine mutex strategy based on data types
 			const dataTypes = Object.keys(data)
@@ -728,7 +726,11 @@ export const addTransactionCapability = (
 							// For nested transactions, merge mutations into parent
 							const parentTx = transactionStack[transactionStack.length - 2]
 							if (parentTx) {
-								logger.trace({ level: transactionsInProgress }, 'merging nested transaction to parent')
+								logger.error({ 
+									level: transactionsInProgress, 
+									txMutations: Object.keys(txState.mutations),
+									txSessionKeys: Object.keys(txState.mutations.session || {})
+								}, 'MERGING NESTED TRANSACTION TO PARENT')
 								// Merge cache and mutations to parent
 								for (const key in txState.cache) {
 									parentTx.cache[key] = parentTx.cache[key] || {}
@@ -739,6 +741,10 @@ export const addTransactionCapability = (
 									Object.assign(parentTx.mutations[key], txState.mutations[key])
 								}
 								parentTx.dbQueries += txState.dbQueries
+								logger.error({ 
+									parentMutations: Object.keys(parentTx.mutations),
+									parentSessionKeys: Object.keys(parentTx.mutations.session || {})
+								}, 'PARENT MUTATIONS AFTER MERGE')
 							}
 						}
 					} finally {
