@@ -477,64 +477,58 @@ export const addTransactionCapability = (
 
 	const storeImplementation = {
 		get: async <T extends keyof SignalDataTypeMap>(type: T, ids: string[]) => {
-			const currentTx = getCurrentTransaction()
+			const currentTx = getCurrentTransaction();
 			if (currentTx) {
-				const dict = currentTx.cache[type]
-				const idsRequiringFetch = dict ? ids.filter(item => typeof dict[item] === 'undefined') : ids
-				// only fetch if there are any items to fetch
-				if (idsRequiringFetch.length) {
-					currentTx.dbQueries += 1
+				const finalResult: { [id: string]: SignalDataTypeMap[T] } = {};
+				const idsToFetch: string[] = [];
 
-					// Use per-sender-key queue for sender-key operations when possible
-					if (type === 'sender-key') {
-						logger.info({ idsRequiringFetch }, 'processing sender keys in transaction')
-						// For sender keys, process each one with queued operations to maintain serialization
-						for (const senderKeyName of idsRequiringFetch) {
-							await queueSenderKeyOperation(senderKeyName, async () => {
-								logger.info({ senderKeyName }, 'fetching sender key in transaction')
-								const result = await state.get(type, [senderKeyName])
-								// Update transaction cache
-								currentTx.cache[type] ||= {}
-								Object.assign(currentTx.cache[type]!, result)
-								logger.info({ senderKeyName, hasResult: !!result[senderKeyName] }, 'sender key fetch complete')
-							})
+				for (const id of ids) {
+					// Check cache first, then check pending mutations
+					const value = currentTx.cache[type]?.[id] ?? currentTx.mutations[type]?.[id];
+
+					if (typeof value !== 'undefined') {
+						// null in mutations means it's marked for deletion, so don't return it
+						if (value !== null) {
+							finalResult[id] = value;
 						}
 					} else {
-						// Use runExclusive for cleaner mutex handling
-						await getKeyTypeMutex(type as string).runExclusive(async () => {
-							const result = await state.get(type, idsRequiringFetch)
-
-							// Update transaction cache
-							currentTx.cache[type] ||= {}
-							Object.assign(currentTx.cache[type]!, result)
-						})
+						idsToFetch.push(id);
 					}
 				}
 
-				return ids.reduce((dict: { [id: string]: SignalDataTypeMap[T] }, id: string) => {
-					const value = currentTx.cache[type]?.[id]
-					if (value) {
-						dict[id] = value
+				// only fetch if there are any items to fetch
+				if (idsToFetch.length) {
+					currentTx.dbQueries += 1;
+					
+					// This part remains mostly the same, but it must not overwrite
+					// items already found in the cache or mutations.
+					const fetched = await state.get(type, idsToFetch);
+					for (const id of idsToFetch) {
+						const item = fetched[id];
+						if (item) {
+							finalResult[id] = item;
+							// also update the transaction cache for future gets
+							currentTx.cache[type] ||= {};
+							Object.assign(currentTx.cache[type]!, { [id]: item });
+						}
 					}
+				}
 
-					return dict
-				}, {})
+				return finalResult;
 			} else {
-				// Not in transaction, fetch directly with queue protection
+				// Non-transactional path remains the same
 				if (type === 'sender-key') {
-					// For sender keys, use individual queues to maintain per-key serialization
-					const results: { [key: string]: SignalDataTypeMap[typeof type] } = {}
+					const results: { [key: string]: SignalDataTypeMap[typeof type] } = {};
 					for (const senderKeyName of ids) {
 						const result = await queueSenderKeyOperation(
 							senderKeyName,
 							async () => await state.get(type, [senderKeyName])
-						)
-						Object.assign(results, result)
+						);
+						Object.assign(results, result);
 					}
-
-					return results
+					return results;
 				} else {
-					return await getKeyTypeMutex(type as string).runExclusive(() => state.get(type, ids))
+					return await getKeyTypeMutex(type as string).runExclusive(() => state.get(type, ids));
 				}
 			}
 		},
