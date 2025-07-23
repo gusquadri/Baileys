@@ -543,6 +543,8 @@ export const addTransactionCapability = (
 			const senderKeyUpdates: string[] = []
 			const currentTx = getCurrentTransaction()
 
+			logger.error({ dataTypes: Object.keys(data), hasCurrentTx: !!currentTx }, 'SET METHOD CALLED')
+
 			if (currentTx) {
 				logger.trace({ types: Object.keys(data) }, 'caching in transaction')
 				for (const key in data) {
