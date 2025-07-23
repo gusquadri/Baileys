@@ -260,9 +260,28 @@ async function commitWithRetry(
 	}
 }
 
+// Global shared state for transaction coordination across ALL instances
+const globalTransactionState = {
+	keyTypeMutexes: new Map<string, Mutex>(),
+	senderKeyMutexes: new NodeCache({
+		stdTTL: 1800, // 30 minutes TTL for sender key mutexes
+		useClones: false,
+		deleteOnExpire: true,
+		maxKeys: 2000 // Limit to prevent excessive memory usage
+	}) as NodeCache & {
+		get(key: string): Mutex | undefined
+		set(key: string, value: Mutex): void
+	},
+	transactionMutex: new Mutex(),
+	dbQueriesInTransaction: 0,
+	transactionCache: {} as SignalDataSet,
+	mutations: {} as SignalDataSet,
+	transactionsInProgress: 0
+}
+
 /**
  * Adds DB like transaction capability to the SignalKeyStore.
- * Uses simple shared state approach like the working previous version.
+ * Uses truly global shared state to coordinate across ALL instances.
  */
 export const addTransactionCapability = (
 	state: SignalKeyStore,
@@ -272,47 +291,25 @@ export const addTransactionCapability = (
 		messageTimeoutMs: 30000
 	}
 ): SignalKeyStoreWithTransaction => {
-	// Mutex for each key type (session, pre-key, etc.)
-	const keyTypeMutexes = new Map<string, Mutex>()
-
-	// Per-sender-key-name mutexes for fine-grained serialization
-	const senderKeyMutexes = new NodeCache({
-		stdTTL: 1800, // 30 minutes TTL for sender key mutexes
-		useClones: false,
-		deleteOnExpire: true,
-		maxKeys: 2000 // Limit to prevent excessive memory usage
-	}) as NodeCache & {
-		get(key: string): Mutex | undefined
-		set(key: string, value: Mutex): void
-	}
-
-	// Global transaction mutex
-	const transactionMutex = new Mutex()
-
-	// Simple transaction state (like working version)
-	let dbQueriesInTransaction = 0
-	let transactionCache: SignalDataSet = {}
-	let mutations: SignalDataSet = {}
-	let transactionsInProgress = 0
 
 	const messageQueue = new Map<string, QueuedGroupMessage[]>()
 
 	// Get or create a mutex for a specific key type
 	function getKeyTypeMutex(type: string): Mutex {
-		let mutex = keyTypeMutexes.get(type)
+		let mutex = globalTransactionState.keyTypeMutexes.get(type)
 		if (!mutex) {
 			mutex = new Mutex()
-			keyTypeMutexes.set(type, mutex)
+			globalTransactionState.keyTypeMutexes.set(type, mutex)
 		}
 
 		return mutex
 	}
 
 	function getSenderKeyMutex(senderKeyName: string): Mutex {
-		let mutex = senderKeyMutexes.get(senderKeyName)
+		let mutex = globalTransactionState.senderKeyMutexes.get(senderKeyName)
 		if (!mutex) {
 			mutex = new Mutex()
-			senderKeyMutexes.set(senderKeyName, mutex)
+			globalTransactionState.senderKeyMutexes.set(senderKeyName, mutex)
 			logger.info({ senderKeyName }, 'created new sender key mutex')
 		}
 
@@ -388,17 +385,17 @@ export const addTransactionCapability = (
 
 	// Check if we are currently in a transaction
 	function isInTransaction() {
-		return transactionsInProgress > 0
+		return globalTransactionState.transactionsInProgress > 0
 	}
 
 	return {
 		get: async (type, ids) => {
 			if (isInTransaction()) {
-				const dict = transactionCache[type]
+				const dict = globalTransactionState.transactionCache[type]
 				const idsRequiringFetch = dict ? ids.filter(item => typeof dict[item] === 'undefined') : ids
 				// only fetch if there are any items to fetch
 				if (idsRequiringFetch.length) {
-					dbQueriesInTransaction += 1
+					globalTransactionState.dbQueriesInTransaction += 1
 
 					// Use per-sender-key queue for sender-key operations when possible
 					if (type === 'sender-key') {
@@ -409,8 +406,8 @@ export const addTransactionCapability = (
 								logger.info({ senderKeyName }, 'fetching sender key in transaction')
 								const result = await state.get(type, [senderKeyName])
 								// Update transaction cache
-								transactionCache[type] ||= {}
-								Object.assign(transactionCache[type]!, result)
+								globalTransactionState.transactionCache[type] ||= {}
+								Object.assign(globalTransactionState.transactionCache[type]!, result)
 								logger.info({ senderKeyName, hasResult: !!result[senderKeyName] }, 'sender key fetch complete')
 							})
 						}
@@ -420,14 +417,14 @@ export const addTransactionCapability = (
 							const result = await state.get(type, idsRequiringFetch)
 
 							// Update transaction cache
-							transactionCache[type] ||= {}
-							Object.assign(transactionCache[type]!, result)
+							globalTransactionState.transactionCache[type] ||= {}
+							Object.assign(globalTransactionState.transactionCache[type]!, result)
 						})
 					}
 				}
 
 				return ids.reduce((dict, id) => {
-					const value = transactionCache[type]?.[id]
+					const value = globalTransactionState.transactionCache[type]?.[id]
 					if (value) {
 						dict[id] = value
 					}
@@ -458,7 +455,7 @@ export const addTransactionCapability = (
 				logger.trace({ types: Object.keys(data) }, 'caching in transaction')
 				const senderKeyUpdates: string[] = []
 				for (const key in data) {
-					transactionCache[key] = transactionCache[key] || {}
+					globalTransactionState.transactionCache[key] = globalTransactionState.transactionCache[key] || {}
 					if (key === 'sender-key') {
 						const senderKeyData = data[key]
 						if (senderKeyData) {
@@ -467,9 +464,9 @@ export const addTransactionCapability = (
 					}
 
 					if (key === 'pre-key' || key === 'signed-pre-key') {
-						await handlePreKeyOperations(data, key, transactionCache, mutations, logger, true)
+						await handlePreKeyOperations(data, key, globalTransactionState.transactionCache, globalTransactionState.mutations, logger, true)
 					} else {
-						handleNormalKeyOperations(data, key, transactionCache, mutations)
+						handleNormalKeyOperations(data, key, globalTransactionState.transactionCache, globalTransactionState.mutations)
 					}
 				}
 			} else {
@@ -548,12 +545,12 @@ export const addTransactionCapability = (
 			return queueMessage(senderKeyName, messageBytes, originalCipher)
 		},
 		async transaction(work) {
-			return transactionMutex.acquire().then(async releaseTxMutex => {
+			return globalTransactionState.transactionMutex.acquire().then(async releaseTxMutex => {
 				let result: Awaited<ReturnType<typeof work>>
 				let mutexReleased = false
 				try {
-					transactionsInProgress += 1
-					if (transactionsInProgress === 1) {
+					globalTransactionState.transactionsInProgress += 1
+					if (globalTransactionState.transactionsInProgress === 1) {
 						logger.trace('entering transaction')
 					}
 
@@ -565,23 +562,23 @@ export const addTransactionCapability = (
 					try {
 						result = await work()
 						// commit if this is the outermost transaction
-						if (transactionsInProgress === 1) {
-							const hasMutations = Object.keys(mutations).length > 0
+						if (globalTransactionState.transactionsInProgress === 1) {
+							const hasMutations = Object.keys(globalTransactionState.mutations).length > 0
 
 							if (hasMutations) {
 								logger.trace('committing transaction')
-								await commitWithRetry(mutations, state, getKeyTypeMutex, maxCommitRetries, delayBetweenTriesMs, logger)
-								logger.trace({ dbQueriesInTransaction }, 'transaction completed')
+								await commitWithRetry(globalTransactionState.mutations, state, getKeyTypeMutex, maxCommitRetries, delayBetweenTriesMs, logger)
+								logger.trace({ dbQueriesInTransaction: globalTransactionState.dbQueriesInTransaction }, 'transaction completed')
 							} else {
 								logger.trace('no mutations in transaction')
 							}
 						}
 					} finally {
-						transactionsInProgress -= 1
-						if (transactionsInProgress === 0) {
-							transactionCache = {}
-							mutations = {}
-							dbQueriesInTransaction = 0
+						globalTransactionState.transactionsInProgress -= 1
+						if (globalTransactionState.transactionsInProgress === 0) {
+							globalTransactionState.transactionCache = {}
+							globalTransactionState.mutations = {}
+							globalTransactionState.dbQueriesInTransaction = 0
 						}
 					}
 
