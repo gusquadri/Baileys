@@ -260,19 +260,16 @@ async function commitWithRetry(
     }
 }
 
-// --- START OF FIX ---
-// These resources are now defined at the module level, making them singletons
+// These resources are defined at the module level, making them singletons
 // shared across all store instances created by addTransactionCapability.
 const transactionContext = new AsyncLocalStorage<TransactionContext>()
 const keyTypeMutexes = new Map<string, Mutex>()
 const senderKeyMutexes = new NodeCache({ stdTTL: 1800, useClones: false, deleteOnExpire: true, maxKeys: 2000 }) as NodeCache & { get(key: string): Mutex | undefined; set(key: string, value: Mutex): void }
 const transactionMutex = new Mutex()
 const messageQueue = new Map<string, QueuedGroupMessage[]>()
-// --- END OF FIX ---
 
 /**
  * Adds DB like transaction capability to the SignalKeyStore.
- * This has been refactored to use AsyncLocalStorage for concurrent-safe transactions.
  */
 export const addTransactionCapability = (
     state: SignalKeyStore,
@@ -351,7 +348,6 @@ export const addTransactionCapability = (
         })
     }
 
-    // These now get their state from the AsyncLocalStorage context
     const getCurrentTransaction = (): TransactionState | null => {
         const store = transactionContext.getStore()
         return store && store.stack.length > 0 ? store.stack[store.stack.length - 1] : null
@@ -496,77 +492,48 @@ export const addTransactionCapability = (
         queueGroupMessage: async (senderKeyName: string, messageBytes: Uint8Array, originalCipher: { decrypt: (messageBytes: Uint8Array) => Promise<Uint8Array> }): Promise<Uint8Array> => {
             return queueMessage(senderKeyName, messageBytes, originalCipher)
         },
-        // This is the main refactored function
+        // --- START OF FIX ---
+        // This logic has been simplified to remove nesting and provide robust serialization.
         async transaction<T>(work: () => Promise<T>): Promise<T> {
-            const store = transactionContext.getStore()
-            if (store) {
-                // Already in a transaction, just execute the logic.
-                // The mutex is already held by the parent.
-                return await this.runTransactionLogic(work)
-            } else {
-                // This is the outermost transaction. It's responsible for acquiring and releasing the lock.
-                const releaseTxMutex = await transactionMutex.acquire()
-                try {
-                    // Start a new context and run the logic within it.
-                    return await transactionContext.run({ stack: [], progress: 0 }, () => {
-                        return this.runTransactionLogic(work)
-                    })
-                } finally {
-                    // Release the lock ONLY after the entire transaction chain (including commit) is done.
-                    releaseTxMutex()
-                }
-            }
-        },
-        // Extracted the core transaction logic to be reusable
-        async runTransactionLogic<T>(work: () => Promise<T>): Promise<T> {
-            const context = transactionContext.getStore()! // We are guaranteed to be in a context here
+            // Use the singleton mutex to serialize all transactions.
+            // This ensures that session initializations do not conflict.
+            return transactionMutex.runExclusive(async () => {
+                // Each transaction runs in its own clean AsyncLocalStorage context.
+                return transactionContext.run({ stack: [], progress: 0 }, async () => {
+                    const context = transactionContext.getStore()!
 
-            context.progress += 1
-            const txState: TransactionState = { cache: {}, mutations: {}, dbQueries: 0 }
-            context.stack.push(txState)
+                    context.progress = 1
+                    const txState: TransactionState = { cache: {}, mutations: {}, dbQueries: 0 }
+                    context.stack.push(txState)
 
-            if (context.progress === 1) {
-                logger.trace('entering outermost transaction')
-            } else {
-                logger.trace({ level: context.progress }, 'entering nested transaction')
-            }
+                    logger.trace('entering serialized transaction')
 
-            try {
-                const result = await work()
+                    try {
+                        const result = await work()
 
-                // The commit logic only runs when the outermost transaction is finishing.
-                if (context.progress === 1) {
-                    const hasMutations = Object.keys(txState.mutations).length > 0
-                    if (hasMutations) {
-                        logger.trace('committing outermost transaction')
-                        await commitWithRetry(txState.mutations, state, getKeyTypeMutex, maxCommitRetries, delayBetweenTriesMs, logger)
-                        logger.trace({ dbQueries: txState.dbQueries }, 'transaction completed')
-                    } else {
-                        logger.trace('no mutations in outermost transaction')
-                    }
-                } else {
-                    // For nested transactions, merge mutations into the parent.
-                    const parentTx = context.stack[context.stack.length - 2]
-                    if (parentTx) {
-                        logger.trace({ level: context.progress }, 'merging nested transaction to parent')
-                        for (const key in txState.cache) {
-                            parentTx.cache[key] = parentTx.cache[key] || {}
-                            Object.assign(parentTx.cache[key], txState.cache[key])
+                        // Commit at the end of the work, before releasing the mutex.
+                        const hasMutations = Object.keys(txState.mutations).length > 0
+                        if (hasMutations) {
+                            logger.trace('committing transaction')
+                            await commitWithRetry(txState.mutations, state, getKeyTypeMutex, maxCommitRetries, delayBetweenTriesMs, logger)
+                            logger.trace({ dbQueries: txState.dbQueries }, 'transaction completed')
+                        } else {
+                            logger.trace('no mutations in transaction')
                         }
-                        for (const key in txState.mutations) {
-                            parentTx.mutations[key] = parentTx.mutations[key] || {}
-                            Object.assign(parentTx.mutations[key], txState.mutations[key])
-                        }
-                        parentTx.dbQueries += txState.dbQueries
+                        return result
+                    } finally {
+                        // Clean up the context
+                        context.progress = 0
+                        context.stack.pop()
                     }
-                }
-                return result
-            } finally {
-                context.progress -= 1
-                context.stack.pop()
-            }
+                });
+            });
         }
+        // --- END OF FIX ---
     }
+
+    // @ts-ignore
+    storeImplementation.runTransactionLogic = undefined
 
     return storeImplementation as SignalKeyStoreWithTransaction
 }
