@@ -579,12 +579,17 @@ export const addTransactionCapability = (
 			const hasSenderKeys = 'sender-key' in data
 			const hasSessionOnly = dataTypes.length === 1 && dataTypes[0] === 'session'
 			
+			logger.trace({ dataTypes, hasSessionOnly, hasSenderKeys }, 'non-transaction storage path')
+			
 			try {
 				// Fast path for session-only operations (critical for assertSessions)
 				if (hasSessionOnly) {
 					logger.trace({ sessionIds: Object.keys(data.session || {}) }, 'session-only storage')
 					return await getKeyTypeMutex('session').runExclusive(async () => {
-						return await state.set(data)
+						logger.trace('executing session-only storage')
+						const result = await state.set(data)
+						logger.trace('session-only storage completed')
+						return result
 					})
 				}
 
