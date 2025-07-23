@@ -681,6 +681,7 @@ export const addTransactionCapability = (
 			return transactionMutex.acquire().then(async releaseTxMutex => {
 				let result: Awaited<ReturnType<typeof work>>
 				let mutexReleased = false
+				let transactionCommitted = false
 				
 				try {
 					transactionsInProgress += 1
@@ -722,8 +723,10 @@ export const addTransactionCapability = (
 								logger.error({ mutations: Object.keys(currentTx.mutations), sessionKeys: Object.keys(currentTx.mutations.session || {}) }, 'COMMITTING TRANSACTION')
 								await commitWithRetry(currentTx.mutations, state, getKeyTypeMutex, maxCommitRetries, delayBetweenTriesMs, logger)
 								logger.error({ dbQueries: currentTx.dbQueries }, 'TRANSACTION COMMITTED')
+								transactionCommitted = true
 							} else {
 								logger.error('NO MUTATIONS TO COMMIT')
+								transactionCommitted = true // No mutations to commit, so consider it "committed"
 							}
 						} else {
 							// For nested transactions, merge mutations into parent
@@ -753,7 +756,20 @@ export const addTransactionCapability = (
 						}
 					} finally {
 						transactionsInProgress -= 1
-						transactionStack.pop() // Remove current transaction state
+						const poppedTx = transactionStack.pop() // Remove current transaction state
+						
+						// Safety net: If this is the outermost transaction and it has uncommitted mutations,
+						// commit them now to prevent data loss. This handles error cases where the normal
+						// commit logic didn't run.
+						if (poppedTx && Object.keys(poppedTx.mutations).length > 0 && transactionsInProgress === 0 && !transactionCommitted) {
+							logger.warn({ mutations: Object.keys(poppedTx.mutations), sessionKeys: Object.keys(poppedTx.mutations.session || {}) }, 'committing uncommitted mutations in finally block')
+							try {
+								await commitWithRetry(poppedTx.mutations, state, getKeyTypeMutex, maxCommitRetries, delayBetweenTriesMs, logger)
+								logger.trace('finally block commit completed')
+							} catch (error) {
+								logger.error({ error: error.message }, 'finally block commit failed')
+							}
+						}
 					}
 
 					return result

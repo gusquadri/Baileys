@@ -104,8 +104,10 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 		async injectE2ESession({ jid, session }) {
 			const cipher = new libsignal.SessionBuilder(storage, jidToSignalProtocolAddress(jid))
 
-			// Session injection doesn't need individual transactions - the underlying storage will handle batching
-			await cipher.initOutgoing(session)
+			// Use transaction to ensure atomicity
+			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
+				await cipher.initOutgoing(session)
+			})
 		},
 		jidToSignalProtocolAddress(jid) {
 			return jidToSignalProtocolAddress(jid).toString()
@@ -125,13 +127,17 @@ const jidToSignalSenderKeyName = (group: string, user: string): SenderKeyName =>
 function signalStorage({ creds, keys }: SignalAuthState): SenderKeyStoreWithQueue & Record<string, unknown> {
 	return {
 		loadSession: async (id: string) => {
+			logger.error({ sessionId: id }, 'LOADING SESSION')
 			const { [id]: sess } = await keys.get('session', [id])
+			logger.error({ sessionId: id, found: !!sess }, 'SESSION FOUND')
 			if (sess) {
 				return libsignal.SessionRecord.deserialize(sess)
 			}
 		},
 		storeSession: async (id: string, session: libsignal.SessionRecord) => {
+			logger.error({ sessionId: id, inTransaction: (keys as any).isInTransaction?.() }, 'STORING SESSION')
 			await keys.set({ session: { [id]: session.serialize() } })
+			logger.error({ sessionId: id }, 'SESSION STORED')
 		},
 		isTrustedIdentity: () => {
 			return true
