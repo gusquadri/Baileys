@@ -348,6 +348,7 @@ export const addTransactionCapability = (
 
 	// Transaction state stack for nested transaction support
 	interface TransactionState {
+		id: number
 		cache: SignalDataSet
 		mutations: SignalDataSet
 		dbQueries: number
@@ -355,6 +356,7 @@ export const addTransactionCapability = (
 	
 	const transactionStack: TransactionState[] = []
 	let transactionsInProgress = 0
+	let transactionCounter = 0
 	
 	// Get current transaction state (top of stack)
 	const getCurrentTransaction = (): TransactionState | null => {
@@ -477,58 +479,64 @@ export const addTransactionCapability = (
 
 	const storeImplementation = {
 		get: async <T extends keyof SignalDataTypeMap>(type: T, ids: string[]) => {
-			const currentTx = getCurrentTransaction();
+			const currentTx = getCurrentTransaction()
 			if (currentTx) {
-				const finalResult: { [id: string]: SignalDataTypeMap[T] } = {};
-				const idsToFetch: string[] = [];
+				const dict = currentTx.cache[type]
+				const idsRequiringFetch = dict ? ids.filter(item => typeof dict[item] === 'undefined') : ids
+				// only fetch if there are any items to fetch
+				if (idsRequiringFetch.length) {
+					currentTx.dbQueries += 1
 
-				for (const id of ids) {
-					// Check cache first, then check pending mutations
-					const value = currentTx.cache[type]?.[id] ?? currentTx.mutations[type]?.[id];
-
-					if (typeof value !== 'undefined') {
-						// null in mutations means it's marked for deletion, so don't return it
-						if (value !== null) {
-							finalResult[id] = value;
+					// Use per-sender-key queue for sender-key operations when possible
+					if (type === 'sender-key') {
+						logger.info({ idsRequiringFetch }, 'processing sender keys in transaction')
+						// For sender keys, process each one with queued operations to maintain serialization
+						for (const senderKeyName of idsRequiringFetch) {
+							await queueSenderKeyOperation(senderKeyName, async () => {
+								logger.info({ senderKeyName }, 'fetching sender key in transaction')
+								const result = await state.get(type, [senderKeyName])
+								// Update transaction cache
+								currentTx.cache[type] ||= {}
+								Object.assign(currentTx.cache[type]!, result)
+								logger.info({ senderKeyName, hasResult: !!result[senderKeyName] }, 'sender key fetch complete')
+							})
 						}
 					} else {
-						idsToFetch.push(id);
+						// Use runExclusive for cleaner mutex handling
+						await getKeyTypeMutex(type as string).runExclusive(async () => {
+							const result = await state.get(type, idsRequiringFetch)
+
+							// Update transaction cache
+							currentTx.cache[type] ||= {}
+							Object.assign(currentTx.cache[type]!, result)
+						})
 					}
 				}
 
-				// only fetch if there are any items to fetch
-				if (idsToFetch.length) {
-					currentTx.dbQueries += 1;
-					
-					// This part remains mostly the same, but it must not overwrite
-					// items already found in the cache or mutations.
-					const fetched = await state.get(type, idsToFetch);
-					for (const id of idsToFetch) {
-						const item = fetched[id];
-						if (item) {
-							finalResult[id] = item;
-							// also update the transaction cache for future gets
-							currentTx.cache[type] ||= {};
-							Object.assign(currentTx.cache[type]!, { [id]: item });
-						}
+				return ids.reduce((dict: { [id: string]: SignalDataTypeMap[T] }, id: string) => {
+					const value = currentTx.cache[type]?.[id]
+					if (value) {
+						dict[id] = value
 					}
-				}
 
-				return finalResult;
+					return dict
+				}, {})
 			} else {
-				// Non-transactional path remains the same
+				// Not in transaction, fetch directly with queue protection
 				if (type === 'sender-key') {
-					const results: { [key: string]: SignalDataTypeMap[typeof type] } = {};
+					// For sender keys, use individual queues to maintain per-key serialization
+					const results: { [key: string]: SignalDataTypeMap[typeof type] } = {}
 					for (const senderKeyName of ids) {
 						const result = await queueSenderKeyOperation(
 							senderKeyName,
 							async () => await state.get(type, [senderKeyName])
-						);
-						Object.assign(results, result);
+						)
+						Object.assign(results, result)
 					}
-					return results;
+
+					return results
 				} else {
-					return await getKeyTypeMutex(type as string).runExclusive(() => state.get(type, ids));
+					return await getKeyTypeMutex(type as string).runExclusive(() => state.get(type, ids))
 				}
 			}
 		},
@@ -671,116 +679,63 @@ export const addTransactionCapability = (
 		): Promise<Uint8Array> => {
 			return queueMessage(senderKeyName, messageBytes, originalCipher)
 		},
-		async transaction<T>(work: () => Promise<T>): Promise<T> {
-			return transactionMutex.acquire().then(async releaseTxMutex => {
-				let result: Awaited<ReturnType<typeof work>>
-				let mutexReleased = false
-				let transactionCommitted = false
-				
-				try {
-					transactionsInProgress += 1
-					
-					// Create new transaction state and push to stack
-					const txState: TransactionState = {
-						cache: {},
-						mutations: {},
-						dbQueries: 0
-					}
-					transactionStack.push(txState)
-					
-					if (transactionsInProgress === 1) {
-						logger.trace('entering outermost transaction')
-					} else {
-						logger.trace({ level: transactionsInProgress }, 'entering nested transaction')
-					}
+		transaction: async <T>(work: () => Promise<T>): Promise<T> => {
+			let txState: TransactionState;
+			// Use the mutex only for the initial state setup, keeping the lock time minimal.
+			await transactionMutex.runExclusive(() => {
+				transactionsInProgress += 1;
+				transactionCounter += 1;
+// Change it to this
+				txState = { id: transactionCounter, cache: {}, mutations: {}, dbQueries: 0 };				transactionStack.push(txState);
 
-					// Release the transaction mutex now that we've updated the counter
-					// This allows other transactions to start preparing
-					releaseTxMutex()
-					mutexReleased = true
-
-					try {
-						result = await work()
-						
-						logger.error({ transactionsInProgress }, 'WORK COMPLETED')
-						
-						// commit if this is the outermost transaction
-						if (transactionsInProgress === 1) {
-							logger.error('CHECKING OUTERMOST TRANSACTION')
-							// Use current transaction state (may have been merged from nested transactions)
-							const currentTx = getCurrentTransaction()
-							const hasMutations = currentTx ? Object.keys(currentTx.mutations).length > 0 : false
-
-							logger.error({ hasMutations, currentTx: !!currentTx }, 'TRANSACTION STATE CHECK')
-
-							if (hasMutations && currentTx) {
-								logger.error({ mutations: Object.keys(currentTx.mutations), sessionKeys: Object.keys(currentTx.mutations.session || {}) }, 'COMMITTING TRANSACTION')
-								await commitWithRetry(currentTx.mutations, state, getKeyTypeMutex, maxCommitRetries, delayBetweenTriesMs, logger)
-								logger.error({ dbQueries: currentTx.dbQueries }, 'TRANSACTION COMMITTED')
-								transactionCommitted = true
-							} else {
-								logger.error('NO MUTATIONS TO COMMIT')
-								transactionCommitted = true // No mutations to commit, so consider it "committed"
-							}
-						} else {
-							// For nested transactions, merge mutations into parent
-							const completedTx = transactionStack[transactionStack.length - 1] // Get current transaction before popping
-							const parentTx = transactionStack[transactionStack.length - 2]
-							if (parentTx && completedTx) {
-								logger.error({ 
-									level: transactionsInProgress, 
-									txMutations: Object.keys(completedTx.mutations),
-									txSessionKeys: Object.keys(completedTx.mutations.session || {})
-								}, 'MERGING NESTED TRANSACTION TO PARENT')
-								// Merge cache and mutations to parent
-								for (const key in completedTx.cache) {
-									parentTx.cache[key] = parentTx.cache[key] || {}
-									Object.assign(parentTx.cache[key], completedTx.cache[key])
-								}
-								for (const key in completedTx.mutations) {
-									parentTx.mutations[key] = parentTx.mutations[key] || {}
-									Object.assign(parentTx.mutations[key], completedTx.mutations[key])
-								}
-								parentTx.dbQueries += completedTx.dbQueries
-								logger.error({ 
-									parentMutations: Object.keys(parentTx.mutations),
-									parentSessionKeys: Object.keys(parentTx.mutations.session || {})
-								}, 'PARENT MUTATIONS AFTER MERGE')
-							}
-						}
-					} finally {
-						transactionsInProgress -= 1
-						const poppedTx = transactionStack.pop() // Remove current transaction state
-						
-						// Safety net: If this is the outermost transaction and it has uncommitted mutations,
-						// commit them now to prevent data loss. This handles error cases where the normal
-						// commit logic didn't run.
-						if (poppedTx && Object.keys(poppedTx.mutations).length > 0 && transactionsInProgress === 0 && !transactionCommitted) {
-							logger.warn({ mutations: Object.keys(poppedTx.mutations), sessionKeys: Object.keys(poppedTx.mutations.session || {}) }, 'committing uncommitted mutations in finally block')
-							try {
-								await commitWithRetry(poppedTx.mutations, state, getKeyTypeMutex, maxCommitRetries, delayBetweenTriesMs, logger)
-								logger.trace('finally block commit completed')
-							} catch (error) {
-								logger.error({ error: error.message }, 'finally block commit failed')
-							}
-						}
-					}
-
-					return result
-				} catch (error) {
-					// Clean up transaction state on error
-					if (transactionStack.length > 0) {
-						transactionStack.pop()
-					}
-					
-					// Only release if we haven't already released the mutex
-					if (!mutexReleased) {
-						releaseTxMutex()
-					}
-					throw error
+				if (transactionsInProgress === 1) {
+					logger.trace({ tx: txState.id }, 'entering outermost transaction');
+				} else {
+					logger.trace({ tx: txState.id, level: transactionsInProgress }, 'entering nested transaction');
 				}
-			})
-		}
+			});
+
+			let result: T;
+			try {
+				result = await work();
+
+				// After work is done, merge mutations if it's a nested transaction
+				if (transactionsInProgress > 1) {
+					const completedTx = transactionStack[transactionStack.length - 1];
+					const parentTx = transactionStack[transactionStack.length - 2];
+
+					if (completedTx === txState! && parentTx) {
+						logger.trace({ tx: completedTx.id, parent: parentTx.id }, 'merging nested transaction to parent');
+						// Only merge mutations; the cache is temporary and transaction-specific
+						for (const key in completedTx.mutations) {
+							parentTx.mutations[key] = parentTx.mutations[key] || {};
+							Object.assign(parentTx.mutations[key]!, completedTx.mutations[key]);
+						}
+					}
+				}
+			} finally {
+				// This block runs whether the `try` succeeded or failed
+				const finalTx = transactionStack[transactionStack.length - 1];
+				if (finalTx !== txState!) {
+					// This should never happen, but it's a safeguard against stack corruption
+					logger.error({ tx: txState!.id, stackTop: finalTx?.id }, 'FATAL: Transaction stack corrupted');
+				}
+
+				// Commit only if this is the outermost transaction
+				if (transactionsInProgress === 1) {
+					if (Object.keys(finalTx.mutations).length > 0) {
+						logger.trace({ tx: finalTx.id }, 'committing outermost transaction');
+						await commitWithRetry(finalTx.mutations, state, getKeyTypeMutex, maxCommitRetries, delayBetweenTriesMs, logger);
+					}
+				}
+				
+				// Clean up the stack and counter
+				transactionsInProgress -= 1;
+				transactionStack.pop();
+			}
+
+			return result;
+		},
 	}
 
 	return storeImplementation as SignalKeyStoreWithTransaction
