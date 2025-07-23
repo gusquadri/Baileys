@@ -260,6 +260,16 @@ async function commitWithRetry(
     }
 }
 
+// --- START OF FIX ---
+// These resources are now defined at the module level, making them singletons
+// shared across all store instances created by addTransactionCapability.
+const transactionContext = new AsyncLocalStorage<TransactionContext>()
+const keyTypeMutexes = new Map<string, Mutex>()
+const senderKeyMutexes = new NodeCache({ stdTTL: 1800, useClones: false, deleteOnExpire: true, maxKeys: 2000 }) as NodeCache & { get(key: string): Mutex | undefined; set(key: string, value: Mutex): void }
+const transactionMutex = new Mutex()
+const messageQueue = new Map<string, QueuedGroupMessage[]>()
+// --- END OF FIX ---
+
 /**
  * Adds DB like transaction capability to the SignalKeyStore.
  * This has been refactored to use AsyncLocalStorage for concurrent-safe transactions.
@@ -272,16 +282,7 @@ export const addTransactionCapability = (
         messageTimeoutMs: 30000
     }
 ): SignalKeyStoreWithTransaction => {
-    // Single AsyncLocalStorage to hold the context for each transaction chain.
-    const transactionContext = new AsyncLocalStorage<TransactionContext>()
-
-    // These resources are shared but are managed by mutexes, so they are safe.
-    const keyTypeMutexes = new Map<string, Mutex>()
-    const senderKeyMutexes = new NodeCache({ stdTTL: 1800, useClones: false, deleteOnExpire: true, maxKeys: 2000 }) as NodeCache & { get(key: string): Mutex | undefined; set(key: string, value: Mutex): void }
-    const transactionMutex = new Mutex()
-    const messageQueue = new Map<string, QueuedGroupMessage[]>()
-
-    // Helper functions for mutexes and message queueing remain the same.
+    // Helper functions now use the module-scoped resources defined above
     function getKeyTypeMutex(type: string): Mutex {
         let mutex = keyTypeMutexes.get(type)
         if (!mutex) {
