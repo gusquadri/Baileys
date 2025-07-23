@@ -205,8 +205,16 @@ async function withMutexes<T>(
 	getKeyTypeMutex: (type: string) => Mutex,
 	fn: () => Promise<T>
 ): Promise<T> {
-	if (keyTypes.length === 0) return fn()
-	if (keyTypes.length === 1) return getKeyTypeMutex(keyTypes[0]).runExclusive(fn)
+	if (keyTypes.length === 0) {
+		return fn()
+	}
+
+	if (keyTypes.length === 1) {
+		return getKeyTypeMutex(keyTypes[0]).runExclusive(fn)
+	}
+
+	// For multiple mutexes, sort by key type to prevent deadlocks
+	// Then acquire all mutexes in order using Promise.all for better efficiency
 	const sortedKeyTypes = [...keyTypes].sort()
 	const mutexes = sortedKeyTypes.map(getKeyTypeMutex)
 	const releases: (() => void)[] = []
@@ -359,7 +367,10 @@ export const addTransactionCapability = (
 	async function processQueuedMessages(senderKeyName: string): Promise<void> {
 		return getSenderKeyMutex(senderKeyName).runExclusive(async () => {
 			const queue = messageQueue.get(senderKeyName)
-			if (!queue || queue.length === 0) return
+			if (!queue || queue.length === 0) {
+				return
+			}
+
 			logger.debug({ senderKeyName, queueSize: queue.length }, 'processing queued messages')
 			for (const queuedMessage of queue) {
 				try {
@@ -461,7 +472,6 @@ export const addTransactionCapability = (
 						handleNormalKeyOperations(data, key, transactionCache, mutations)
 					}
 				}
-
 			} else {
 				// Not in transaction, apply directly with mutex protection
 				const hasSenderKeys = 'sender-key' in data
@@ -485,7 +495,6 @@ export const addTransactionCapability = (
 							logger.trace({ senderKeyName }, 'sender key stored')
 						})
 					}
-
 
 					// Handle any non-sender-key data with regular mutexes
 					const nonSenderKeyData = { ...data }
