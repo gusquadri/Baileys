@@ -546,7 +546,8 @@ export const addTransactionCapability = (
 			logger.error({ dataTypes: Object.keys(data), hasCurrentTx: !!currentTx }, 'SET METHOD CALLED')
 
 			// TEMPORARY: Disable transactions for debugging
-			if (currentTx && false) {
+			/* 
+			if (currentTx) {
 				logger.trace({ types: Object.keys(data) }, 'caching in transaction')
 				for (const key in data) {
 					currentTx.cache[key] = currentTx.cache[key] || {}
@@ -576,6 +577,7 @@ export const addTransactionCapability = (
 				}
 				return
 			}
+			*/
 
 			// Non-transaction path: determine mutex strategy based on data types
 			const dataTypes = Object.keys(data)
