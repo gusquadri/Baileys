@@ -740,7 +740,19 @@ export const addTransactionCapability = (
 						}
 					} finally {
 						transactionsInProgress -= 1
-						transactionStack.pop() // Remove current transaction state
+						const completedTx = transactionStack.pop() // Remove current transaction state
+						
+						// If this transaction had mutations and wasn't committed by the outermost transaction
+						// commit it now to prevent data loss
+						if (completedTx && Object.keys(completedTx.mutations).length > 0 && transactionsInProgress === 0) {
+							logger.error({ mutations: Object.keys(completedTx.mutations), sessionKeys: Object.keys(completedTx.mutations.session || {}) }, 'FINAL COMMIT IN FINALLY')
+							try {
+								await commitWithRetry(completedTx.mutations, state, getKeyTypeMutex, maxCommitRetries, delayBetweenTriesMs, logger)
+								logger.error('FINALLY COMMIT COMPLETED')
+							} catch (error) {
+								logger.error({ error: error.message }, 'FINALLY COMMIT FAILED')
+							}
+						}
 					}
 
 					return result
