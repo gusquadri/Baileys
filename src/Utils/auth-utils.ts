@@ -546,7 +546,7 @@ export const addTransactionCapability = (
 			logger.error({ dataTypes: Object.keys(data), hasCurrentTx: !!currentTx }, 'SET METHOD CALLED')
 
 			// TEMPORARY: Disable transactions for debugging
-			if (false && currentTx) {
+			if (currentTx && false) {
 				logger.trace({ types: Object.keys(data) }, 'caching in transaction')
 				for (const key in data) {
 					currentTx.cache[key] = currentTx.cache[key] || {}
