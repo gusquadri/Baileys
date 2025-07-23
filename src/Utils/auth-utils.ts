@@ -497,30 +497,29 @@ export const addTransactionCapability = (
         },
         // This is the main refactored function
         async transaction<T>(work: () => Promise<T>): Promise<T> {
-            // Get the current async context, or start a new one if it doesn't exist
             const store = transactionContext.getStore()
             if (store) {
-                // We are already inside a transaction context, just run the work
+                // Already in a transaction, just execute the logic.
+                // The mutex is already held by the parent.
                 return await this.runTransactionLogic(work)
             } else {
-                // Not in a context, so create a new one for this async operation chain
-                return await transactionContext.run({ stack: [], progress: 0 }, () => {
-                    return this.runTransactionLogic(work)
-                })
+                // This is the outermost transaction. It's responsible for acquiring and releasing the lock.
+                const releaseTxMutex = await transactionMutex.acquire()
+                try {
+                    // Start a new context and run the logic within it.
+                    return await transactionContext.run({ stack: [], progress: 0 }, () => {
+                        return this.runTransactionLogic(work)
+                    })
+                } finally {
+                    // Release the lock ONLY after the entire transaction chain (including commit) is done.
+                    releaseTxMutex()
+                }
             }
         },
         // Extracted the core transaction logic to be reusable
         async runTransactionLogic<T>(work: () => Promise<T>): Promise<T> {
             const context = transactionContext.getStore()! // We are guaranteed to be in a context here
-            let releaseTxMutex: () => void
-            try {
-                releaseTxMutex = await transactionMutex.acquire()
-            } catch (error) {
-                logger.error('Failed to acquire transaction mutex', error)
-                throw error
-            }
 
-            let result: Awaited<ReturnType<typeof work>>
             context.progress += 1
             const txState: TransactionState = { cache: {}, mutations: {}, dbQueries: 0 }
             context.stack.push(txState)
@@ -531,11 +530,10 @@ export const addTransactionCapability = (
                 logger.trace({ level: context.progress }, 'entering nested transaction')
             }
 
-            // Release mutex early
-            releaseTxMutex()
-
             try {
-                result = await work()
+                const result = await work()
+
+                // The commit logic only runs when the outermost transaction is finishing.
                 if (context.progress === 1) {
                     const hasMutations = Object.keys(txState.mutations).length > 0
                     if (hasMutations) {
@@ -546,6 +544,7 @@ export const addTransactionCapability = (
                         logger.trace('no mutations in outermost transaction')
                     }
                 } else {
+                    // For nested transactions, merge mutations into the parent.
                     const parentTx = context.stack[context.stack.length - 2]
                     if (parentTx) {
                         logger.trace({ level: context.progress }, 'merging nested transaction to parent')
@@ -560,12 +559,11 @@ export const addTransactionCapability = (
                         parentTx.dbQueries += txState.dbQueries
                     }
                 }
+                return result
             } finally {
                 context.progress -= 1
                 context.stack.pop()
             }
-
-            return result
         }
     }
 
