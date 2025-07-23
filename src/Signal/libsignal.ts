@@ -127,17 +127,17 @@ const jidToSignalSenderKeyName = (group: string, user: string): SenderKeyName =>
 function signalStorage({ creds, keys }: SignalAuthState): SenderKeyStoreWithQueue & Record<string, unknown> {
 	return {
 		loadSession: async (id: string) => {
-			logger.error('LOADING SESSION:', id)
+			logger.error({ sessionId: id }, 'LOADING SESSION')
 			const { [id]: sess } = await keys.get('session', [id])
-			logger.error('SESSION FOUND:', id, !!sess)
+			logger.error({ sessionId: id, found: !!sess }, 'SESSION FOUND')
 			if (sess) {
 				return libsignal.SessionRecord.deserialize(sess)
 			}
 		},
 		storeSession: async (id: string, session: libsignal.SessionRecord) => {
-			logger.error('STORING SESSION:', id, 'inTransaction:', (keys as any).isInTransaction?.())
+			logger.error({ sessionId: id, inTransaction: (keys as any).isInTransaction?.() }, 'STORING SESSION')
 			await keys.set({ session: { [id]: session.serialize() } })
-			logger.error('SESSION STORED:', id)
+			logger.error({ sessionId: id }, 'SESSION STORED')
 		},
 		isTrustedIdentity: () => {
 			return true
