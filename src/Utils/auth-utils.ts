@@ -462,11 +462,6 @@ export const addTransactionCapability = (
 					}
 				}
 
-				for (const senderKeyName of senderKeyUpdates) {
-					processQueuedMessages(senderKeyName).catch(error => {
-						logger.warn({ senderKeyName, error: error.message }, 'failed to process queued messages in transaction')
-					})
-				}
 			} else {
 				// Not in transaction, apply directly with mutex protection
 				const hasSenderKeys = 'sender-key' in data
@@ -490,6 +485,7 @@ export const addTransactionCapability = (
 							logger.trace({ senderKeyName }, 'sender key stored')
 						})
 					}
+
 
 					// Handle any non-sender-key data with regular mutexes
 					const nonSenderKeyData = { ...data }
@@ -522,6 +518,15 @@ export const addTransactionCapability = (
 						await state.set(data)
 					})
 				}
+			}
+
+			// Process queued messages for any sender keys that were updated
+			const allSenderKeys = data['sender-key'] ? Object.keys(data['sender-key']) : []
+			for (const senderKeyName of allSenderKeys) {
+				// Process queue asynchronously to avoid blocking
+				processQueuedMessages(senderKeyName).catch(error => {
+					logger.warn({ senderKeyName, error: error.message }, 'failed to process queued messages')
+				})
 			}
 		},
 		isInTransaction,
