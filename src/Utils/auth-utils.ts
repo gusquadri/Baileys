@@ -727,23 +727,24 @@ export const addTransactionCapability = (
 							}
 						} else {
 							// For nested transactions, merge mutations into parent
+							const completedTx = transactionStack[transactionStack.length - 1] // Get current transaction before popping
 							const parentTx = transactionStack[transactionStack.length - 2]
-							if (parentTx) {
+							if (parentTx && completedTx) {
 								logger.error({ 
 									level: transactionsInProgress, 
-									txMutations: Object.keys(txState.mutations),
-									txSessionKeys: Object.keys(txState.mutations.session || {})
+									txMutations: Object.keys(completedTx.mutations),
+									txSessionKeys: Object.keys(completedTx.mutations.session || {})
 								}, 'MERGING NESTED TRANSACTION TO PARENT')
 								// Merge cache and mutations to parent
-								for (const key in txState.cache) {
+								for (const key in completedTx.cache) {
 									parentTx.cache[key] = parentTx.cache[key] || {}
-									Object.assign(parentTx.cache[key], txState.cache[key])
+									Object.assign(parentTx.cache[key], completedTx.cache[key])
 								}
-								for (const key in txState.mutations) {
+								for (const key in completedTx.mutations) {
 									parentTx.mutations[key] = parentTx.mutations[key] || {}
-									Object.assign(parentTx.mutations[key], txState.mutations[key])
+									Object.assign(parentTx.mutations[key], completedTx.mutations[key])
 								}
-								parentTx.dbQueries += txState.dbQueries
+								parentTx.dbQueries += completedTx.dbQueries
 								logger.error({ 
 									parentMutations: Object.keys(parentTx.mutations),
 									parentSessionKeys: Object.keys(parentTx.mutations.session || {})
@@ -752,14 +753,14 @@ export const addTransactionCapability = (
 						}
 					} finally {
 						transactionsInProgress -= 1
-						const completedTx = transactionStack.pop() // Remove current transaction state
+						const poppedTx = transactionStack.pop() // Remove current transaction state
 						
 						// If this transaction had mutations and wasn't committed by the outermost transaction
 						// commit it now to prevent data loss
-						if (completedTx && Object.keys(completedTx.mutations).length > 0 && transactionsInProgress === 0) {
-							logger.error({ mutations: Object.keys(completedTx.mutations), sessionKeys: Object.keys(completedTx.mutations.session || {}) }, 'FINAL COMMIT IN FINALLY')
+						if (poppedTx && Object.keys(poppedTx.mutations).length > 0 && transactionsInProgress === 0) {
+							logger.error({ mutations: Object.keys(poppedTx.mutations), sessionKeys: Object.keys(poppedTx.mutations.session || {}) }, 'FINAL COMMIT IN FINALLY')
 							try {
-								await commitWithRetry(completedTx.mutations, state, getKeyTypeMutex, maxCommitRetries, delayBetweenTriesMs, logger)
+								await commitWithRetry(poppedTx.mutations, state, getKeyTypeMutex, maxCommitRetries, delayBetweenTriesMs, logger)
 								logger.error('FINALLY COMMIT COMPLETED')
 							} catch (error) {
 								logger.error({ error: error.message }, 'FINALLY COMMIT FAILED')
