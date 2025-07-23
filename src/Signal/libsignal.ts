@@ -102,11 +102,14 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			})
 		},
 		async injectE2ESession({ jid, session }) {
+			logger.error({ jid }, 'INJECTING E2E SESSION')
 			const cipher = new libsignal.SessionBuilder(storage, jidToSignalProtocolAddress(jid))
 
 			// Use transaction to ensure atomicity
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
+				logger.error({ jid }, 'CALLING INIT OUTGOING')
 				await cipher.initOutgoing(session)
+				logger.error({ jid }, 'INIT OUTGOING COMPLETED')
 			})
 		},
 		jidToSignalProtocolAddress(jid) {
