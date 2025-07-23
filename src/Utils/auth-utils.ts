@@ -260,9 +260,15 @@ async function commitWithRetry(
     }
 }
 
+// Global shared resources for transaction coordination across all instances
+const globalTransactionContext = new AsyncLocalStorage<TransactionContext>()
+const globalKeyTypeMutexes = new Map<string, Mutex>()
+const globalSenderKeyMutexes = new NodeCache({ stdTTL: 1800, useClones: false, deleteOnExpire: true, maxKeys: 2000 }) as NodeCache & { get(key: string): Mutex | undefined; set(key: string, value: Mutex): void }
+const globalTransactionMutex = new Mutex()
+
 /**
  * Adds DB like transaction capability to the SignalKeyStore.
- * This function is a factory that creates isolated transaction managers.
+ * This function uses global shared state to coordinate transactions across instances.
  */
 export const addTransactionCapability = (
     state: SignalKeyStore,
@@ -272,31 +278,23 @@ export const addTransactionCapability = (
         messageTimeoutMs: 30000
     }
 ): SignalKeyStoreWithTransaction => {
-    // --- START OF FIX ---
-    // All of these resources are now scoped inside the factory function.
-    // A new, isolated set is created for each call to addTransactionCapability.
-    const transactionContext = new AsyncLocalStorage<TransactionContext>()
-    const keyTypeMutexes = new Map<string, Mutex>()
-    const senderKeyMutexes = new NodeCache({ stdTTL: 1800, useClones: false, deleteOnExpire: true, maxKeys: 2000 }) as NodeCache & { get(key: string): Mutex | undefined; set(key: string, value: Mutex): void }
-    const transactionMutex = new Mutex()
     const messageQueue = new Map<string, QueuedGroupMessage[]>()
-    // --- END OF FIX ---
 
-    // Helper functions now use the isolated resources defined above
+    // Helper functions now use the global shared resources
     function getKeyTypeMutex(type: string): Mutex {
-        let mutex = keyTypeMutexes.get(type)
+        let mutex = globalKeyTypeMutexes.get(type)
         if (!mutex) {
             mutex = new Mutex()
-            keyTypeMutexes.set(type, mutex)
+            globalKeyTypeMutexes.set(type, mutex)
         }
         return mutex
     }
 
     function getSenderKeyMutex(senderKeyName: string): Mutex {
-        let mutex = senderKeyMutexes.get(senderKeyName)
+        let mutex = globalSenderKeyMutexes.get(senderKeyName)
         if (!mutex) {
             mutex = new Mutex()
-            senderKeyMutexes.set(senderKeyName, mutex)
+            globalSenderKeyMutexes.set(senderKeyName, mutex)
             logger.info({ senderKeyName }, 'created new sender key mutex')
         }
         return mutex
@@ -352,17 +350,17 @@ export const addTransactionCapability = (
     }
 
     const getCurrentTransaction = (): TransactionState | null => {
-        const store = transactionContext.getStore()
+        const store = globalTransactionContext.getStore()
         return store && store.stack.length > 0 ? store.stack[store.stack.length - 1] : null
     }
 
     const isInTransaction = () => {
-        const store = transactionContext.getStore()
+        const store = globalTransactionContext.getStore()
         return !!store && store.progress > 0
     }
 
     async function runTransactionLogic<T>(work: () => Promise<T>): Promise<T> {
-        const context = transactionContext.getStore()!
+        const context = globalTransactionContext.getStore()!
         context.progress += 1
         const txState: TransactionState = { cache: {}, mutations: {}, dbQueries: 0 }
         context.stack.push(txState)
@@ -541,13 +539,13 @@ export const addTransactionCapability = (
             return queueMessage(senderKeyName, messageBytes, originalCipher)
         },
         async transaction<T>(work: () => Promise<T>): Promise<T> {
-            const store = transactionContext.getStore();
+            const store = globalTransactionContext.getStore();
             if (store) {
                 return runTransactionLogic(work);
             }
     
-            return transactionMutex.runExclusive(() => {
-                return transactionContext.run({ stack: [], progress: 0 }, () => {
+            return globalTransactionMutex.runExclusive(() => {
+                return globalTransactionContext.run({ stack: [], progress: 0 }, () => {
                     return runTransactionLogic(work);
                 });
             });
