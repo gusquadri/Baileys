@@ -169,7 +169,7 @@ function signalStorage({ creds, keys }: SignalAuthState): SenderKeyStoreWithQueu
 				return libsignal.SessionRecord.deserialize(sess)
 			}
 		},
-		storeSession: async (id: string, session: libsignal.SessionRecord) => {
+		storeSession: async (id: string, session: any) => {
 			await keys.set({ session: { [id]: session.serialize() } })
 		},
 		isTrustedIdentity: () => {
