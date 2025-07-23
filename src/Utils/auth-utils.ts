@@ -710,9 +710,9 @@ export const addTransactionCapability = (
 							const hasMutations = currentTx ? Object.keys(currentTx.mutations).length > 0 : false
 
 							if (hasMutations && currentTx) {
-								logger.trace('committing outermost transaction')
+								logger.error({ mutations: Object.keys(currentTx.mutations), sessionKeys: Object.keys(currentTx.mutations.session || {}) }, 'COMMITTING TRANSACTION')
 								await commitWithRetry(currentTx.mutations, state, getKeyTypeMutex, maxCommitRetries, delayBetweenTriesMs, logger)
-								logger.trace({ dbQueries: currentTx.dbQueries }, 'transaction completed')
+								logger.error({ dbQueries: currentTx.dbQueries }, 'TRANSACTION COMMITTED')
 							} else {
 								logger.trace('no mutations in outermost transaction')
 							}
