@@ -703,18 +703,23 @@ export const addTransactionCapability = (
 					try {
 						result = await work()
 						
+						logger.error({ transactionsInProgress }, 'WORK COMPLETED')
+						
 						// commit if this is the outermost transaction
 						if (transactionsInProgress === 1) {
+							logger.error('CHECKING OUTERMOST TRANSACTION')
 							// Use current transaction state (may have been merged from nested transactions)
 							const currentTx = getCurrentTransaction()
 							const hasMutations = currentTx ? Object.keys(currentTx.mutations).length > 0 : false
+
+							logger.error({ hasMutations, currentTx: !!currentTx }, 'TRANSACTION STATE CHECK')
 
 							if (hasMutations && currentTx) {
 								logger.error({ mutations: Object.keys(currentTx.mutations), sessionKeys: Object.keys(currentTx.mutations.session || {}) }, 'COMMITTING TRANSACTION')
 								await commitWithRetry(currentTx.mutations, state, getKeyTypeMutex, maxCommitRetries, delayBetweenTriesMs, logger)
 								logger.error({ dbQueries: currentTx.dbQueries }, 'TRANSACTION COMMITTED')
 							} else {
-								logger.trace('no mutations in outermost transaction')
+								logger.error('NO MUTATIONS TO COMMIT')
 							}
 						} else {
 							// For nested transactions, merge mutations into parent
