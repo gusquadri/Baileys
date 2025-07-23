@@ -2,6 +2,7 @@ import * as libsignal from 'libsignal'
 import { SignalAuthState, SignalKeyStoreWithTransaction } from '../Types'
 import { SignalRepository } from '../Types/Signal'
 import { generateSignalPubKey } from '../Utils'
+import logger from '../Utils/logger'
 import { jidDecode } from '../WABinary'
 import type { SenderKeyStoreWithQueue } from './Group/group_cipher'
 import { SenderKeyName } from './Group/sender-key-name'
@@ -39,13 +40,9 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			const senderNameStr = senderName.toString()
 
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
-				const { [senderNameStr]: existingSenderKey } = await auth.keys.get('sender-key', [senderNameStr])
-				
-				// Only create new sender key record if none exists
-				// This prevents race conditions with concurrent key operations
-				if (!existingSenderKey) {
-					const newRecord = new SenderKeyRecord()
-					await storage.storeSenderKey(senderName, newRecord)
+				const { [senderNameStr]: senderKey } = await auth.keys.get('sender-key', [senderNameStr])
+				if (!senderKey) {
+					await storage.storeSenderKey(senderName, new SenderKeyRecord())
 				}
 
 				await builder.process(senderName, senderMsg)
@@ -54,19 +51,9 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 		async decryptMessage({ jid, type, ciphertext }) {
 			const addr = jidToSignalProtocolAddress(jid)
 			const session = new libsignal.SessionCipher(storage, addr)
-			const sessionId = addr.toString()
 
-			// Use transaction to ensure atomicity
+			// Use transaction to ensure atomicityAdd commentMore actions
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
-				const { [sessionId]: existingSession } = await auth.keys.get('session', [sessionId])
-
-				// For regular messages, wait briefly if no session exists
-				// This prevents race conditions with concurrent session operations
-				if (type === 'msg' && !existingSession) {
-					// Wait a short time for potential concurrent session creation
-					await new Promise(resolve => setTimeout(resolve, 100))
-				}
-
 				let result: Buffer
 				switch (type) {
 					case 'pkmsg':
@@ -83,22 +70,11 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 		async encryptMessage({ jid, data }) {
 			const addr = jidToSignalProtocolAddress(jid)
 			const cipher = new libsignal.SessionCipher(storage, addr)
-			const sessionId = addr.toString()
 
-			// Use transaction to ensure atomicity
+			// Use transaction to ensure atomicityAdd commentMore actions
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
-				const { [sessionId]: existingSession } = await auth.keys.get('session', [sessionId])
-
-				// Wait briefly if no session exists
-				// This prevents creating sessions during encryption
-				if (!existingSession) {
-					// Wait a short time for potential concurrent session creation
-					await new Promise(resolve => setTimeout(resolve, 100))
-				}
-
 				const { type: sigType, body } = await cipher.encrypt(data)
 				const type = sigType === 3 ? 'pkmsg' : 'msg'
-				
 				return { type, ciphertext: Buffer.from(body, 'binary') }
 			})
 		},
@@ -110,13 +86,9 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 
 			// Use transaction to ensure atomicity
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
-				const { [senderNameStr]: existingSenderKey } = await auth.keys.get('sender-key', [senderNameStr])
-				
-				// Only create new sender key record if none exists
-				// This prevents overwriting keys that might be in the process of being set up
-				if (!existingSenderKey) {
-					const newRecord = new SenderKeyRecord()
-					await storage.storeSenderKey(senderName, newRecord)
+				const { [senderNameStr]: senderKey } = await auth.keys.get('sender-key', [senderNameStr])
+				if (!senderKey) {
+					await storage.storeSenderKey(senderName, new SenderKeyRecord())
 				}
 
 				const senderKeyDistributionMessage = await builder.create(senderName)
@@ -131,18 +103,9 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 		},
 		async injectE2ESession({ jid, session }) {
 			const cipher = new libsignal.SessionBuilder(storage, jidToSignalProtocolAddress(jid))
-			const sessionId = jidToSignalProtocolAddress(jid).toString()
 
 			// Use transaction to ensure atomicity
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
-				const { [sessionId]: existingSession } = await auth.keys.get('session', [sessionId])
-
-				// Wait briefly if session exists to prevent race conditions
-				// This allows concurrent operations to complete before overwriting
-				if (existingSession) {
-					await new Promise(resolve => setTimeout(resolve, 100))
-				}
-
 				await cipher.initOutgoing(session)
 			})
 		},
@@ -164,13 +127,17 @@ const jidToSignalSenderKeyName = (group: string, user: string): SenderKeyName =>
 function signalStorage({ creds, keys }: SignalAuthState): SenderKeyStoreWithQueue & Record<string, unknown> {
 	return {
 		loadSession: async (id: string) => {
+			logger.error('LOADING SESSION:', id)
 			const { [id]: sess } = await keys.get('session', [id])
+			logger.error('SESSION FOUND:', id, !!sess)
 			if (sess) {
 				return libsignal.SessionRecord.deserialize(sess)
 			}
 		},
-		storeSession: async (id: string, session: any) => {
+		storeSession: async (id: string, session: libsignal.SessionRecord) => {
+			logger.error('STORING SESSION:', id, 'inTransaction:', (keys as any).isInTransaction?.())
 			await keys.set({ session: { [id]: session.serialize() } })
+			logger.error('SESSION STORED:', id)
 		},
 		isTrustedIdentity: () => {
 			return true
@@ -204,8 +171,8 @@ function signalStorage({ creds, keys }: SignalAuthState): SenderKeyStoreWithQueu
 		},
 		storeSenderKey: async (senderKeyName: SenderKeyName, key: SenderKeyRecord) => {
 			const keyId = senderKeyName.toString()
-			const serialized = JSON.stringify(key.serialize())
-			await keys.set({ 'sender-key': { [keyId]: Buffer.from(serialized, 'utf-8') } })
+			// Store the buffer from serialize() directly
+			await keys.set({ 'sender-key': { [keyId]: Buffer.from(JSON.stringify(key.serialize())) } })
 		},
 		getOurRegistrationId: () => creds.registrationId,
 		getOurIdentity: () => {
