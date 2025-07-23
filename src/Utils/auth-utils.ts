@@ -509,6 +509,7 @@ export const addTransactionCapability = (
         async transaction(work) {
             return transactionMutex.acquire().then(async releaseTxMutex => {
                 let result: Awaited<ReturnType<typeof work>>
+                let mutexReleased = false
                 try {
                     transactionsInProgress += 1
                     if (transactionsInProgress === 1) {
@@ -518,6 +519,7 @@ export const addTransactionCapability = (
                     // Release the transaction mutex now that we've updated the counter
                     // This allows other transactions to start preparing
                     releaseTxMutex()
+                    mutexReleased = true
 
                     try {
                         result = await work()
@@ -545,7 +547,9 @@ export const addTransactionCapability = (
                     return result
                 } catch (error) {
                     // If we haven't released the transaction mutex yet, release it
-                    releaseTxMutex()
+                    if (!mutexReleased) {
+                        releaseTxMutex()
+                    }
                     throw error
                 }
             })
