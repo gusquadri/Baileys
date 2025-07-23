@@ -680,58 +680,59 @@ export const addTransactionCapability = (
 			return queueMessage(senderKeyName, messageBytes, originalCipher)
 		},
 		transaction: async <T>(work: () => Promise<T>): Promise<T> => {
-			let txState: TransactionState;
-			// Use the mutex only for the initial state setup, keeping the lock time minimal.
-			await transactionMutex.runExclusive(() => {
+			// This function will hold the lock for the entire in-memory operation
+			// to prevent stack corruption from concurrent transactions.
+			const { result, mutationsToCommit } = await transactionMutex.runExclusive(async () => {
 				transactionsInProgress += 1;
 				transactionCounter += 1;
-// Change it to this
-				txState = { id: transactionCounter, cache: {}, mutations: {}, dbQueries: 0 };				transactionStack.push(txState);
+				const txState: TransactionState = { id: transactionCounter, cache: {}, mutations: {}, dbQueries: 0 };
+				transactionStack.push(txState);
 
 				if (transactionsInProgress === 1) {
 					logger.trace({ tx: txState.id }, 'entering outermost transaction');
 				} else {
 					logger.trace({ tx: txState.id, level: transactionsInProgress }, 'entering nested transaction');
 				}
-			});
 
-			let result: T;
-			try {
-				result = await work();
+				let workResult: T;
+				let mutationsToCommit: SignalDataSet | undefined;
+				try {
+					workResult = await work();
 
-				// After work is done, merge mutations if it's a nested transaction
-				if (transactionsInProgress > 1) {
-					const completedTx = transactionStack[transactionStack.length - 1];
-					const parentTx = transactionStack[transactionStack.length - 2];
+					// After work is done, merge mutations if it's a nested transaction
+					if (transactionsInProgress > 1) {
+						const completedTx = transactionStack[transactionStack.length - 1];
+						const parentTx = transactionStack[transactionStack.length - 2];
 
-					if (completedTx === txState! && parentTx) {
-						logger.trace({ tx: completedTx.id, parent: parentTx.id }, 'merging nested transaction to parent');
-						// Only merge mutations; the cache is temporary and transaction-specific
-						for (const key in completedTx.mutations) {
-							parentTx.mutations[key] = parentTx.mutations[key] || {};
-							Object.assign(parentTx.mutations[key]!, completedTx.mutations[key]);
+						if (completedTx === txState && parentTx) {
+							logger.trace({ tx: completedTx.id, parent: parentTx.id }, 'merging nested transaction to parent');
+							for (const key in completedTx.mutations) {
+								parentTx.mutations[key] = parentTx.mutations[key] || {};
+								Object.assign(parentTx.mutations[key]!, completedTx.mutations[key]);
+							}
 						}
 					}
-				}
-			} finally {
-				// This block runs whether the `try` succeeded or failed
-				const finalTx = transactionStack[transactionStack.length - 1];
-				if (finalTx !== txState!) {
-					// This should never happen, but it's a safeguard against stack corruption
-					logger.error({ tx: txState!.id, stackTop: finalTx?.id }, 'FATAL: Transaction stack corrupted');
+				} finally {
+					const finalTx = transactionStack[transactionStack.length - 1];
+					// If we are the outermost transaction, we are responsible for the commit
+					if (transactionsInProgress === 1) {
+						if (Object.keys(finalTx.mutations).length > 0) {
+							mutationsToCommit = finalTx.mutations;
+						}
+					}
+					
+					transactionsInProgress -= 1;
+					transactionStack.pop();
 				}
 
-				// Commit only if this is the outermost transaction
-				if (transactionsInProgress === 1) {
-					if (Object.keys(finalTx.mutations).length > 0) {
-						logger.trace({ tx: finalTx.id }, 'committing outermost transaction');
-						await commitWithRetry(finalTx.mutations, state, getKeyTypeMutex, maxCommitRetries, delayBetweenTriesMs, logger);
-					}
-				}
-				
-				// Clean up the stack and counter
-				transactionsInProgress -= 1;
-				transactionStack.pop();
+				return { result: workResult, mutationsToCommit };
+			});
+
+			// === COMMIT PHASE ===
+			// This happens *outside* the transactionMutex, which prevents deadlocks.
+			if (mutationsToCommit) {
+				logger.trace('committing outermost transaction');
+				await commitWithRetry(mutationsToCommit, state, getKeyTypeMutex, maxCommitRetries, delayBetweenTriesMs, logger);
 			}
 
 			return result;
