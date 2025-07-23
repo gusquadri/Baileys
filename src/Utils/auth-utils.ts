@@ -561,10 +561,13 @@ export const addTransactionCapability = (
 
 					// Special handling for pre-keys and signed-pre-keys
 					if (key === 'pre-key' || key === 'signed-pre-key') {
+						logger.error({ key }, 'USING PRE-KEY OPERATIONS')
 						await handlePreKeyOperations(data, key, currentTx.cache, currentTx.mutations, logger, true)
 					} else {
 						// Normal handling for other key types
+						logger.error({ key, dataKeys: Object.keys(data[key] || {}) }, 'USING NORMAL KEY OPERATIONS')
 						handleNormalKeyOperations(data, key, currentTx.cache, currentTx.mutations)
+						logger.error({ key, mutationKeys: Object.keys(currentTx.mutations[key] || {}) }, 'AFTER NORMAL KEY OPERATIONS')
 					}
 				}
 				
