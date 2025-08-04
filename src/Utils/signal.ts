@@ -109,20 +109,45 @@ export const parseAndInjectE2ESessions = async (node: BinaryNode, repository: Si
 	for (const nodesChunk of chunks) {
 		await Promise.all(
 			nodesChunk.map(async (node: BinaryNode) => {
-				const signedKey = getBinaryNodeChild(node, 'skey')!
-				const key = getBinaryNodeChild(node, 'key')!
-				const identity = getBinaryNodeChildBuffer(node, 'identity')!
+				const signedKey = getBinaryNodeChild(node, 'skey')
+				const key = getBinaryNodeChild(node, 'key')
+				const identity = getBinaryNodeChildBuffer(node, 'identity')
 				const jid = node.attrs.jid!
 				const registrationId = getBinaryNodeChildUInt(node, 'registration', 4)
 
+				const signedPreKey = signedKey ? extractKey(signedKey) : undefined
+				const preKey = key ? extractKey(key) : undefined
+
+				// Only skip if we're missing critical keys
+				// Note: preKey is optional in WhatsApp's protocol
+				// registrationId can be 0, which is valid
+				if (!signedPreKey || !identity || registrationId === undefined || registrationId === null) {
+					console.debug(`Skipping session injection for ${jid}: missing critical keys`, {
+						hasSignedPreKey: !!signedPreKey,
+						hasIdentity: !!identity,
+						hasPreKey: !!preKey,
+						registrationId
+					})
+					return
+				}
+
+				// Create session object - preKey is optional
+				const sessionData: any = {
+					registrationId: registrationId,
+					identityKey: generateSignalPubKey(identity),
+					signedPreKey: signedPreKey
+				}
+
+				// Add preKey only if it exists
+				if (preKey) {
+					sessionData.preKey = preKey
+				} else {
+					console.debug(`Session for ${jid} has no preKey - using signedPreKey only`)
+				}
+
 				await repository.injectE2ESession({
 					jid,
-					session: {
-						registrationId: registrationId!,
-						identityKey: generateSignalPubKey(identity),
-						signedPreKey: extractKey(signedKey)!,
-						preKey: extractKey(key)!
-					}
+					session: sessionData
 				})
 			})
 		)

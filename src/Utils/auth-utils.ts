@@ -28,7 +28,7 @@ export function makeCacheableSignalKeyStore(
 ): SignalKeyStore {
 	const cache =
 		_cache ||
-		new NodeCache({
+		new NodeCache<SignalDataTypeMap[keyof SignalDataTypeMap]>({
 			stdTTL: DEFAULT_CACHE_TTLS.SIGNAL_STORE, // 5 minutes
 			useClones: false,
 			deleteOnExpire: true
