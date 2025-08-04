@@ -524,7 +524,8 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				// ensure a connection is established with every device
 				for (const { user, device } of devices) {
 					const jid = jidEncode(user, groupData?.addressingMode === 'lid' ? 'lid' : 's.whatsapp.net', device)
-					if (!senderKeyMap[jid] || !!participant) {
+					const hasKey = !!senderKeyMap[jid]
+					if (!hasKey || !!participant) {
 						senderKeyJids.push(jid)
 						// store that this person has had the sender keys sent to them
 						senderKeyMap[jid] = true
@@ -658,7 +659,37 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				logger.debug({ jid }, 'adding device identity')
 			}
 
-			if (additionalNodes && additionalNodes.length > 0) {
+			if (!isNewsletter && buttonType && messages) {
+				const buttonsNode = getButtonArgs(messages)
+				const filteredButtons = getBinaryFilteredButtons(additionalNodes ? additionalNodes : [])
+
+				if (filteredButtons) {
+					;(stanza.content as BinaryNode[]).push(...(additionalNodes || []))
+					didPushAdditional = true
+				} else {
+					;(stanza.content as BinaryNode[]).push(buttonsNode)
+				}
+			}
+
+			if (isJidUser(destinationJid)) {
+				const botNode: BinaryNode = {
+					tag: 'bot',
+					attrs: {
+						biz_bot: '1'
+					}
+				}
+
+				const filteredBizBot = getBinaryFilteredBizBot(additionalNodes ? additionalNodes : [])
+
+				if (filteredBizBot) {
+					;(stanza.content as BinaryNode[]).push(...(additionalNodes || []))
+					didPushAdditional = true
+				} else {
+					;(stanza.content as BinaryNode[]).push(botNode)
+				}
+			}
+
+			if (!didPushAdditional && additionalNodes && additionalNodes.length > 0) {
 				;(stanza.content as BinaryNode[]).push(...additionalNodes)
 			}
 
@@ -681,20 +712,30 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 	const getMediaType = (message: proto.IMessage) => {
 		if (message.imageMessage) {
 			return 'image'
+		} else if (message.stickerMessage) {
+			return message.stickerMessage.isLottie
+				? '1p_sticker'
+				: message.stickerMessage.isAvatar
+					? 'avatar_sticker'
+					: 'sticker'
 		} else if (message.videoMessage) {
 			return message.videoMessage.gifPlayback ? 'gif' : 'video'
 		} else if (message.audioMessage) {
 			return message.audioMessage.ptt ? 'ptt' : 'audio'
+		} else if (message.ptvMessage) {
+			return 'ptv'
 		} else if (message.contactMessage) {
 			return 'vcard'
 		} else if (message.documentMessage) {
 			return 'document'
+		} else if (message.stickerPackMessage) {
+			return 'sticker_pack'
 		} else if (message.contactsArrayMessage) {
 			return 'contact_array'
+		} else if (message.locationMessage) {
+			return 'location'
 		} else if (message.liveLocationMessage) {
 			return 'livelocation'
-		} else if (message.stickerMessage) {
-			return 'sticker'
 		} else if (message.listMessage) {
 			return 'list'
 		} else if (message.listResponseMessage) {
