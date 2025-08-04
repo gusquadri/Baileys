@@ -1,5 +1,5 @@
 /* @ts-ignore */
-import { decrypt, encrypt } from 'libsignal/src/crypto'
+import { decrypt, encrypt } from 'libsignal'
 import { SenderKeyMessage } from './sender-key-message'
 import { SenderKeyName } from './sender-key-name'
 import { SenderKeyRecord } from './sender-key-record'
