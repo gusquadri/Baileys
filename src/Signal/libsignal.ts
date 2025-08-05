@@ -206,77 +206,19 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			})
 		},
 		async encryptMessage({ jid, data }) {
-			// Check if we have a LID for this phone number (auto-use LID for privacy)
-			let encryptionJid = jid
+			// SIMPLIFIED: Just use the JID provided by the caller
+			// No automatic LID conversion - if they want LID privacy, they should send to LID
+			const encryptionJid = jid
 			
-			// Skip LID lookup for our own devices (performance optimization)
+			// Skip extra processing for our own devices (performance optimization)
 			const authCreds = (auth as any).creds || auth
 			const ownPhoneNumber = authCreds.me?.id?.split('@')[0]?.split(':')[0]
 			const targetUser = jidDecode(jid)?.user
 			
-			// PRIMARY DEVICE OPTIMIZATION: Strip device ID to encrypt to primary device only
-			const decoded = jidDecode(jid)
-			if (decoded && decoded.device && ownPhoneNumber !== targetUser) {
-				// Convert multi-device JID to primary device (device 0)
-				const primaryJid = jidEncode(decoded.user, decoded.server as any)
-				console.log(`📱 Primary device optimization: ${jid} → ${primaryJid}`)
-				jid = primaryJid
-				encryptionJid = primaryJid
-			}
-			
-			if (LIDMappingStore.isPN(jid) && ownPhoneNumber !== targetUser) {
-				// Use base JID (without device) for LID mapping lookup
-				const baseJid = jidEncode(decoded!.user, 's.whatsapp.net')
-				
-				// FAST PATH: Check cache first before expensive lookup
-				const cachedLID = lidMapping.getFromCache(baseJid)
-				if (cachedLID) {
-					console.log(`⚡ Cache hit - using cached LID: ${baseJid} → ${cachedLID}`)
-					// Use device 0 for primary LID (matches Redis storage format)
-					const primaryLidJid = jidEncode(jidDecode(cachedLID)!.user, 'lid', 0)
-					
-					// CRITICAL: Verify LID session exists before using it
-					const lidAddr = jidToSignalProtocolAddress(primaryLidJid)
-					console.log(`🔍 Checking LID session: ${primaryLidJid} → ${lidAddr.toString()}`)
-					console.log(`🔍 Debug JID generation: user=${jidDecode(cachedLID)?.user}, device=0, result=${primaryLidJid}`)
-					const lidSession = await storage.loadSession(lidAddr.toString())
-					
-					if (lidSession && lidSession.haveOpenSession()) {
-						console.log(`✅ LID session verified: ${primaryLidJid}`)
-						// DO NOT migrate session - just use the LID for encryption
-						// Migration can cause ratchet desync and lost messages
-						encryptionJid = primaryLidJid
-					} else {
-						console.log(`⚠️ LID session missing: ${primaryLidJid}, falling back to PN`)
-						// Fall back to original PN - session should exist
-						encryptionJid = jid
-					}
-				} else {
-					console.log(`🔍 Cache miss - performing LID lookup for: ${baseJid}`)
-					const lidForPN = await lidMapping.getLIDForPN(baseJid)
-					if (lidForPN) {
-						// Always use primary LID device (device 0 to match Redis storage)
-						const lidDecoded = jidDecode(lidForPN)
-						const primaryLidJid = jidEncode(lidDecoded!.user, 'lid', 0)
-						
-						// CRITICAL: Verify LID session exists before using it
-						const lidAddr = jidToSignalProtocolAddress(primaryLidJid)
-						const lidSession = await storage.loadSession(lidAddr.toString())
-						
-						if (lidSession && lidSession.haveOpenSession()) {
-							console.log(`✅ LID session verified: ${primaryLidJid}`)
-							// DO NOT migrate session - just use the LID for encryption
-							// Migration can cause ratchet desync and lost messages
-							encryptionJid = primaryLidJid
-						} else {
-							console.log(`⚠️ LID session missing: ${primaryLidJid}, falling back to PN`)
-							// Fall back to original PN - session should exist  
-							encryptionJid = jid
-						}
-					}
-				}
-			} else if (ownPhoneNumber === targetUser) {
-				console.log(`⚡ Fast path: Encrypting to own device (${jid}), using direct session`)
+			if (ownPhoneNumber === targetUser) {
+				console.log(`⚡ Fast path: Encrypting to own device (${jid})`)
+			} else {
+				console.log(`📤 Encrypting message to: ${jid}`)
 			}
 			
 			const addr = jidToSignalProtocolAddress(encryptionJid)
