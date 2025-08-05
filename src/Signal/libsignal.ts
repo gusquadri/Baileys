@@ -142,8 +142,16 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 }
 
 const jidToSignalProtocolAddress = (jid: string) => {
-	const { user, device } = jidDecode(jid)!
-	return new libsignal.ProtocolAddress(user, device || 0)
+	const decoded = jidDecode(jid)!
+	const { user, device, server } = decoded
+	
+	// Handle LID addresses by appending _1
+	let signalUser = user
+	if (server === 'lid') {
+		signalUser = `${user}_1`
+	}
+	
+	return new libsignal.ProtocolAddress(signalUser, device || 0)
 }
 
 const jidToSignalSenderKeyName = (group: string, user: string): SenderKeyName => {
