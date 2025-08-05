@@ -149,6 +149,10 @@ export class LIDMappingStore {
         
         // Use transaction for consistent reads during concurrent writes
         return await this.keys.transaction(async () => {
+            // Check cache first (without fetch to see what's actually cached)
+            const cachedResult = this.cache.get(pnNormalized)
+            console.log(`💾 Cache check for "${pnNormalized}": ${cachedResult || 'NOT IN CACHE'}`)
+            
             // LRU cache handles everything - fetch from storage if needed
             const lid = await this.cache.fetch(pnNormalized)
             const result = lid ? jidEncode(lid, 'lid') : null
@@ -176,6 +180,27 @@ export class LIDMappingStore {
             const pn = await this.cache.fetch(`lid-${lidNormalized}`)
             return pn ? jidEncode(pn, 's.whatsapp.net') : null
         })
+    }
+
+    /**
+     * Fast cache-only lookup (no Redis fetch) - for performance optimization
+     * @param pn Phone number JID
+     * @returns Cached LID or null if not in cache
+     */
+    getFromCache(pn: string): string | null {
+        if (!isJidUser(pn)) {
+            return null
+        }
+        
+        const pnNormalized = jidNormalizedUser(pn)
+        const cachedLid = this.cache.get(pnNormalized)
+        
+        if (cachedLid) {
+            console.log(`⚡ Fast cache hit: ${pnNormalized} → ${cachedLid}`)
+            return jidEncode(cachedLid, 'lid')
+        }
+        
+        return null
     }
 
     /**

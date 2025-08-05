@@ -221,19 +221,28 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			if (LIDMappingStore.isPN(jid) && ownPhoneNumber !== targetUser) {
 				// Use base JID (without device) for LID mapping lookup
 				const baseJid = jidEncode(decoded!.user, 's.whatsapp.net')
-				console.log(`🔍 Encryption LID lookup for external contact: ${baseJid}`)
 				
-				const lidForPN = await lidMapping.getLIDForPN(baseJid)
-				if (lidForPN) {
-					// Always use primary LID device (no device ID)
-					const lidDecoded = jidDecode(lidForPN)
-					const primaryLidJid = jidEncode(lidDecoded!.user, 'lid')
-					
-					console.log(`✅ Using primary LID for encryption: ${jid} → ${primaryLidJid}`)
-					
-					// Migrate session from PN to LID if needed
+				// FAST PATH: Check cache first before expensive lookup
+				const cachedLID = lidMapping.getFromCache(baseJid)
+				if (cachedLID) {
+					console.log(`⚡ Cache hit - using cached LID: ${baseJid} → ${cachedLID}`)
+					const primaryLidJid = jidEncode(jidDecode(cachedLID)!.user, 'lid')
 					await migrateSession(jid, primaryLidJid)
 					encryptionJid = primaryLidJid
+				} else {
+					console.log(`🔍 Cache miss - performing LID lookup for: ${baseJid}`)
+					const lidForPN = await lidMapping.getLIDForPN(baseJid)
+					if (lidForPN) {
+						// Always use primary LID device (no device ID)
+						const lidDecoded = jidDecode(lidForPN)
+						const primaryLidJid = jidEncode(lidDecoded!.user, 'lid')
+						
+						console.log(`✅ Using primary LID for encryption: ${jid} → ${primaryLidJid}`)
+						
+						// Migrate session from PN to LID if needed
+						await migrateSession(jid, primaryLidJid)
+						encryptionJid = primaryLidJid
+					}
 				}
 			} else if (ownPhoneNumber === targetUser) {
 				console.log(`⚡ Fast path: Encrypting to own device (${jid}), using direct session`)
