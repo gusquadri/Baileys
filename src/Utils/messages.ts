@@ -731,7 +731,12 @@ export const generateWAMessageFromContent = (
 		key: {
 			remoteJid: jid,
 			fromMe: true,
-			id: options?.messageId || generateMessageIDV2()
+			id: options?.messageId || generateMessageIDV2(),
+			// Add senderPn and senderLid for lid messages
+			...(jid.includes('@lid') && userJid ? {
+				senderLid: jid,
+				senderPn: userJid
+			} : {})
 		},
 		message: message,
 		messageTimestamp: timestamp,
