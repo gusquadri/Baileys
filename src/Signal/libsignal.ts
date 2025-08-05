@@ -238,7 +238,8 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 					
 					if (lidSession && lidSession.haveOpenSession()) {
 						console.log(`✅ LID session verified: ${primaryLidJid}`)
-						await migrateSession(jid, primaryLidJid)
+						// DO NOT migrate session - just use the LID for encryption
+						// Migration can cause ratchet desync and lost messages
 						encryptionJid = primaryLidJid
 					} else {
 						console.log(`⚠️ LID session missing: ${primaryLidJid}, falling back to PN`)
@@ -259,7 +260,8 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 						
 						if (lidSession && lidSession.haveOpenSession()) {
 							console.log(`✅ LID session verified: ${primaryLidJid}`)
-							await migrateSession(jid, primaryLidJid)
+							// DO NOT migrate session - just use the LID for encryption
+							// Migration can cause ratchet desync and lost messages
 							encryptionJid = primaryLidJid
 						} else {
 							console.log(`⚠️ LID session missing: ${primaryLidJid}, falling back to PN`)
