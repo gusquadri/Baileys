@@ -59,7 +59,19 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			return jid
 		}
 		
-		// If it's a phone number, check for LID mapping
+		// Check if this is our own device - skip LID mapping for performance
+		// Note: auth.creds here is SignalCreds, but we need to get the full AuthenticationCreds
+		// For now, we'll check if the auth object has the me property through type assertion
+		const authCreds = (auth as any).creds || auth
+		const ownPhoneNumber = authCreds.me?.id?.split('@')[0]?.split(':')[0]
+		const incomingUser = jidDecode(jid)?.user
+		
+		if (ownPhoneNumber && incomingUser === ownPhoneNumber) {
+			console.log(`⚡ Fast path: Own device detected (${jid}), skipping LID lookup`)
+			return jid // Return original JID - no LID mapping needed for own devices
+		}
+		
+		// If it's a phone number (and not our own), check for LID mapping
 		if (LIDMappingStore.isPN(jid)) {
 			// Extract device ID from original JID to preserve it
 			const decoded = jidDecode(jid)
@@ -67,6 +79,8 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			
 			// Use base JID (without device) for LID mapping lookup
 			const baseJid = jidEncode(decoded!.user, 's.whatsapp.net')
+			console.log(`🔍 LID mapping lookup for external contact: ${baseJid}`)
+			
 			const lidForPN = await lidMapping.getLIDForPN(baseJid)
 			if (lidForPN) {
 				// Reconstruct LID with same device ID
@@ -78,6 +92,8 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 					lidWithDevice = jidEncode(lidDecoded.user, 'lid', device)
 				}
 				
+				console.log(`✅ Found LID mapping: ${baseJid} → ${lidWithDevice}`)
+				
 				const lidAddr = jidToSignalProtocolAddress(lidWithDevice)
 				const lidSession = await storage.loadSession(lidAddr.toString())
 				if (lidSession && lidSession.haveOpenSession()) {
@@ -85,6 +101,8 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 					await migrateSession(lidWithDevice, jid)
 					return lidWithDevice // Use LID for this decryption
 				}
+			} else {
+				console.log(`❌ No LID mapping found for: ${baseJid}`)
 			}
 		}
 		
@@ -184,13 +202,21 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 		async encryptMessage({ jid, data }) {
 			// Check if we have a LID for this phone number (auto-use LID for privacy)
 			let encryptionJid = jid
-			if (LIDMappingStore.isPN(jid)) {
+			
+			// Skip LID lookup for our own devices (performance optimization)
+			const authCreds = (auth as any).creds || auth
+			const ownPhoneNumber = authCreds.me?.id?.split('@')[0]?.split(':')[0]
+			const targetUser = jidDecode(jid)?.user
+			
+			if (LIDMappingStore.isPN(jid) && ownPhoneNumber !== targetUser) {
 				// Extract device ID to preserve it
 				const decoded = jidDecode(jid)
 				const device = decoded?.device
 				
 				// Use base JID (without device) for LID mapping lookup
 				const baseJid = jidEncode(decoded!.user, 's.whatsapp.net')
+				console.log(`🔍 Encryption LID lookup for external contact: ${baseJid}`)
+				
 				const lidForPN = await lidMapping.getLIDForPN(baseJid)
 				if (lidForPN) {
 					// Reconstruct LID with same device ID
@@ -202,10 +228,14 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 						lidWithDevice = jidEncode(lidDecoded.user, 'lid', device)
 					}
 					
+					console.log(`✅ Using LID for encryption: ${jid} → ${lidWithDevice}`)
+					
 					// Migrate session from PN to LID if needed
 					await migrateSession(jid, lidWithDevice)
 					encryptionJid = lidWithDevice
 				}
+			} else if (ownPhoneNumber === targetUser) {
+				console.log(`⚡ Fast path: Encrypting to own device (${jid}), using direct session`)
 			}
 			
 			const addr = jidToSignalProtocolAddress(encryptionJid)
