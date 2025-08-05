@@ -208,31 +208,32 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			const ownPhoneNumber = authCreds.me?.id?.split('@')[0]?.split(':')[0]
 			const targetUser = jidDecode(jid)?.user
 			
+			// PRIMARY DEVICE OPTIMIZATION: Strip device ID to encrypt to primary device only
+			const decoded = jidDecode(jid)
+			if (decoded && decoded.device && ownPhoneNumber !== targetUser) {
+				// Convert multi-device JID to primary device (device 0)
+				const primaryJid = jidEncode(decoded.user, decoded.server as any)
+				console.log(`📱 Primary device optimization: ${jid} → ${primaryJid}`)
+				jid = primaryJid
+				encryptionJid = primaryJid
+			}
+			
 			if (LIDMappingStore.isPN(jid) && ownPhoneNumber !== targetUser) {
-				// Extract device ID to preserve it
-				const decoded = jidDecode(jid)
-				const device = decoded?.device
-				
 				// Use base JID (without device) for LID mapping lookup
 				const baseJid = jidEncode(decoded!.user, 's.whatsapp.net')
 				console.log(`🔍 Encryption LID lookup for external contact: ${baseJid}`)
 				
 				const lidForPN = await lidMapping.getLIDForPN(baseJid)
 				if (lidForPN) {
-					// Reconstruct LID with same device ID
+					// Always use primary LID device (no device ID)
 					const lidDecoded = jidDecode(lidForPN)
-					let lidWithDevice = lidForPN
+					const primaryLidJid = jidEncode(lidDecoded!.user, 'lid')
 					
-					// If original JID had a device ID, apply it to LID
-					if (device && lidDecoded) {
-						lidWithDevice = jidEncode(lidDecoded.user, 'lid', device)
-					}
-					
-					console.log(`✅ Using LID for encryption: ${jid} → ${lidWithDevice}`)
+					console.log(`✅ Using primary LID for encryption: ${jid} → ${primaryLidJid}`)
 					
 					// Migrate session from PN to LID if needed
-					await migrateSession(jid, lidWithDevice)
-					encryptionJid = lidWithDevice
+					await migrateSession(jid, primaryLidJid)
+					encryptionJid = primaryLidJid
 				}
 			} else if (ownPhoneNumber === targetUser) {
 				console.log(`⚡ Fast path: Encrypting to own device (${jid}), using direct session`)
