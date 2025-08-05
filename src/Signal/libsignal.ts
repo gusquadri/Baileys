@@ -231,6 +231,7 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 					
 					// CRITICAL: Verify LID session exists before using it
 					const lidAddr = jidToSignalProtocolAddress(primaryLidJid)
+					console.log(`🔍 Checking LID session: ${primaryLidJid} → ${lidAddr.toString()}`)
 					const lidSession = await storage.loadSession(lidAddr.toString())
 					
 					if (lidSession && lidSession.haveOpenSession()) {
@@ -372,7 +373,9 @@ function signalStorage({ creds, keys }: SignalAuthState): StorageType & SenderKe
 	return {
 		loadSession: async (id: string) => {
 			try {
+				console.log(`🔍 Loading session: ${id}`)
 				const { [id]: sess } = await keys.get('session', [id])
+				console.log(`📦 Session result for ${id}: ${sess ? 'FOUND' : 'NOT FOUND'}`)
 				if (sess) {
 					return libsignal.SessionRecord.deserialize(sess)
 				}
