@@ -824,8 +824,16 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 						const errorMessage = msg?.messageStubParameters?.[0] || ''
 						const isPreKeyError = errorMessage.includes('PreKey')
+						const isNoSessionError = errorMessage.includes('No session')
+						const encType = encNode?.attrs?.type || 'unknown'
 
-						console.debug(`[handleMessage] Attempting retry request for failed decryption`)
+						console.debug(`[handleMessage] Decrypt failed - type: ${encType}, error: ${errorMessage}`)
+
+						// Skip retry for certain message types (like whatsmeow)
+						if (encType === 'msmsg') {
+							logger.debug('Skipping retry for msmsg type')
+							return sendMessageAck(node)
+						}
 
 						// Handle both pre-key and normal retries in single mutex
 						retryMutex.mutex(async () => {

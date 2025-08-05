@@ -30,16 +30,21 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 		}
 		
 		try {
+			// Check if destination already has a session - if yes, no migration needed
+			const toSession = await storage.loadSession(toAddrStr)
+			if (toSession && toSession.haveOpenSession()) {
+				console.log(`Session already exists at ${toJid}, skipping migration`)
+				return
+			}
+			
 			// Load session from source address
 			const fromSession = await storage.loadSession(fromAddrStr)
 			if (fromSession && fromSession.haveOpenSession()) {
-				// Check if destination already has a session
-				const toSession = await storage.loadSession(toAddrStr)
-				if (!toSession || !toSession.haveOpenSession()) {
-					// Copy session to destination address
-					await storage.storeSession(toAddrStr, fromSession)
-					console.log(`Migrated session from ${fromJid} to ${toJid}`)
-				}
+				// Copy session to destination address
+				// NOTE: This is different from whatsmeow which likely just remaps storage keys
+				// But necessary for our implementation since we can't directly remap Redis keys
+				await storage.storeSession(toAddrStr, fromSession)
+				console.log(`Migrated session from ${fromJid} to ${toJid}`)
 			}
 		} catch (error) {
 			console.error(`Failed to migrate session from ${fromJid} to ${toJid}:`, error)
@@ -279,9 +284,33 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 
 			// Use transaction to ensure atomicity
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
-				const { type: sigType, body } = await cipher.encrypt(data)
-				const type = sigType === 3 ? 'pkmsg' : 'msg'
-				return { type, ciphertext: Buffer.from(body as any, 'binary') }
+				try {
+					const { type: sigType, body } = await cipher.encrypt(data)
+					const type = sigType === 3 ? 'pkmsg' : 'msg'
+					return { type, ciphertext: Buffer.from(body as any, 'binary') }
+				} catch (error: any) {
+					// Handle assertion failures and corrupted sessions
+					if (error.message?.includes('Assertion failed') || error.message?.includes('serialize')) {
+						console.error(`⚠️ Session corruption detected for ${encryptionJid}, clearing session`)
+						
+						// Clear the corrupted session
+						const addrStr = addr.toString()
+						await storage.storeSession(addrStr, null)
+						
+						// Clear cache to force fresh session establishment
+						if (LIDMappingStore.isLID(encryptionJid)) {
+							lidMapping.invalidateContact(encryptionJid)
+						} else if (LIDMappingStore.isPN(encryptionJid)) {
+							lidMapping.invalidateContact(encryptionJid)
+						}
+						
+						// Throw a more descriptive error
+						throw new Error(`Session corrupted for ${encryptionJid}. Please retry - a new session will be established.`)
+					}
+					
+					// Re-throw other errors
+					throw error
+				}
 			})
 		},
 		async encryptGroupMessage({ group, meId, data }) {
