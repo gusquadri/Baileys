@@ -3,7 +3,7 @@ import * as libsignal from 'libsignal'
 import type { SignalAuthState, SignalKeyStoreWithTransaction } from '../Types'
 import type { SignalRepository } from '../Types/Signal'
 import { generateSignalPubKey } from '../Utils'
-import { jidDecode } from '../WABinary'
+import { jidDecode, jidEncode } from '../WABinary'
 import { LIDMappingStore } from '../Utils/lid-mapping'
 import type { SenderKeyStore } from './Group/group_cipher'
 import { SenderKeyName } from './Group/sender-key-name'
@@ -61,28 +61,54 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 		
 		// If it's a phone number, check for LID mapping
 		if (LIDMappingStore.isPN(jid)) {
+			// Extract device ID from original JID to preserve it
+			const decoded = jidDecode(jid)
+			const device = decoded?.device
+			
 			const lidForPN = await lidMapping.getLIDForPN(jid)
 			if (lidForPN) {
-				const lidAddr = jidToSignalProtocolAddress(lidForPN)
+				// Reconstruct LID with same device ID
+				const lidDecoded = jidDecode(lidForPN)
+				let lidWithDevice = lidForPN
+				
+				// If original JID had a device ID, apply it to LID
+				if (device && lidDecoded) {
+					lidWithDevice = jidEncode(lidDecoded.user, 'lid', device)
+				}
+				
+				const lidAddr = jidToSignalProtocolAddress(lidWithDevice)
 				const lidSession = await storage.loadSession(lidAddr.toString())
 				if (lidSession && lidSession.haveOpenSession()) {
 					// Migrate session from LID to PN for future use
-					await migrateSession(lidForPN, jid)
-					return lidForPN // Use LID for this decryption
+					await migrateSession(lidWithDevice, jid)
+					return lidWithDevice // Use LID for this decryption
 				}
 			}
 		}
 		
 		// If it's a LID, check for PN mapping
 		if (LIDMappingStore.isLID(jid)) {
+			// Extract device ID from original JID to preserve it
+			const decoded = jidDecode(jid)
+			const device = decoded?.device
+			
 			const pnForLID = await lidMapping.getPNForLID(jid)
 			if (pnForLID) {
-				const pnAddr = jidToSignalProtocolAddress(pnForLID)
+				// Reconstruct PN with same device ID
+				const pnDecoded = jidDecode(pnForLID)
+				let pnWithDevice = pnForLID
+				
+				// If original JID had a device ID, apply it to PN
+				if (device && pnDecoded) {
+					pnWithDevice = jidEncode(pnDecoded.user, 's.whatsapp.net', device)
+				}
+				
+				const pnAddr = jidToSignalProtocolAddress(pnWithDevice)
 				const pnSession = await storage.loadSession(pnAddr.toString())
 				if (pnSession && pnSession.haveOpenSession()) {
 					// Migrate session from PN to LID for future use
-					await migrateSession(pnForLID, jid)
-					return pnForLID // Use PN for this decryption
+					await migrateSession(pnWithDevice, jid)
+					return pnWithDevice // Use PN for this decryption
 				}
 			}
 		}
@@ -155,11 +181,24 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			// Check if we have a LID for this phone number (auto-use LID for privacy)
 			let encryptionJid = jid
 			if (LIDMappingStore.isPN(jid)) {
+				// Extract device ID to preserve it
+				const decoded = jidDecode(jid)
+				const device = decoded?.device
+				
 				const lidForPN = await lidMapping.getLIDForPN(jid)
 				if (lidForPN) {
+					// Reconstruct LID with same device ID
+					const lidDecoded = jidDecode(lidForPN)
+					let lidWithDevice = lidForPN
+					
+					// If original JID had a device ID, apply it to LID
+					if (device && lidDecoded) {
+						lidWithDevice = jidEncode(lidDecoded.user, 'lid', device)
+					}
+					
 					// Migrate session from PN to LID if needed
-					await migrateSession(jid, lidForPN)
-					encryptionJid = lidForPN
+					await migrateSession(jid, lidWithDevice)
+					encryptionJid = lidWithDevice
 				}
 			}
 			
