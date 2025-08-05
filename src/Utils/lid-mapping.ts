@@ -44,24 +44,25 @@ export class LIDMappingStore {
                 try {
                     // Use transaction to prevent race conditions during fetch
                     return await this.keys.transaction(async () => {
-                        const { [key]: value } = await this.keys.get('lid-mapping', [key])
+                        // Simple direct key lookup - Redis keys match our storage format
+                        const sessionKey = key.startsWith('lid-') 
+                            ? key.replace('lid-', '').replace('@lid', '').replace(':', '.') + '_1'
+                            : key.replace('@s.whatsapp.net', '').replace(':', '.')
                         
-                        // If found, also cache the reverse mapping atomically
+                        console.log(`🔍 fetchMethod: cache key="${key}" → Redis key="${sessionKey}"`)
+                        
+                        const { [sessionKey]: value } = await this.keys.get('lid-mapping', [sessionKey])
+                        
+                        console.log(`📦 Redis fetch result: ${value || 'NOT FOUND'}`)
+                        
+                        // If found, convert back to JID format for cache
                         if (value && typeof value === 'string') {
-                            // Determine if this is a PN->LID or LID->PN lookup
-                            if (key.startsWith('lid-')) {
-                                // This was a LID->PN lookup, cache PN->LID too
-                                const pn = value
-                                const lid = key.replace('lid-', '')
-                                this.cache.set(pn, lid, { noDisposeOnSet: true })
-                            } else {
-                                // This was a PN->LID lookup, cache LID->PN too
-                                const lid = value
-                                const pn = key
-                                this.cache.set(`lid-${lid}`, pn, { noDisposeOnSet: true })
-                            }
+                            const fullValue = key.startsWith('lid-')
+                                ? value.replace('.', ':') + '@s.whatsapp.net'  // LID->PN lookup
+                                : value.replace('_1', '').replace('.', ':') + '@lid'  // PN->LID lookup
                             
-                            return value
+                            console.log(`✅ fetchMethod returning: ${fullValue}`)
+                            return fullValue
                         }
                         
                         return undefined
@@ -98,23 +99,37 @@ export class LIDMappingStore {
         const lidNormalized = jidNormalizedUser(lid)
         const pnNormalized = jidNormalizedUser(pn)
 
+        // Convert to session-style format matching your Redis pattern
+        // PN: "554391318447@s.whatsapp.net" → "554391318447"
+        // LID: "102765716062358@lid" → "102765716062358_1"
+        const pnKey = pnNormalized.replace('@s.whatsapp.net', '').replace(':', '.')
+        const lidKey = lidNormalized.replace('@lid', '').replace(':', '.') + '_1'
+
         // Use transaction to ensure atomicity (like other Signal operations)
         try {
+            console.log(`📝 Storing LID-PN mapping:`)
+            console.log(`  PN: ${pn} → ${pnNormalized} → Redis key: ${pnKey}`)
+            console.log(`  LID: ${lid} → ${lidNormalized} → Redis key: ${lidKey}`)
+            
             await this.keys.transaction(async () => {
-                // Store in persistent storage atomically
+                // Store bidirectional mapping using session-style keys
                 await this.keys.set({
                     'lid-mapping': {
-                        [pnNormalized]: lidNormalized,
-                        [`lid-${lidNormalized}`]: pnNormalized
+                        [pnKey]: lidKey,        // "554391318447.63" → "102765716062358_1.63"
+                        [lidKey]: pnKey         // "102765716062358_1.63" → "554391318447.63"
                     }
                 })
                 
-                // Update cache atomically after successful storage
+                console.log(`✅ Stored in Redis: ${pnKey} ↔ ${lidKey}`)
+                
+                // Update cache atomically after successful storage (use original normalized format)
                 this.cache.set(pnNormalized, lidNormalized)
                 this.cache.set(`lid-${lidNormalized}`, pnNormalized)
+                
+                console.log(`✅ Updated cache: ${pnNormalized} ↔ ${lidNormalized}`)
             })
         } catch (error) {
-            console.error('Failed to store LID-PN mapping:', error)
+            console.error('❌ Failed to store LID-PN mapping:', error)
         }
     }
 
@@ -130,11 +145,16 @@ export class LIDMappingStore {
         
         const pnNormalized = jidNormalizedUser(pn)
         
+        console.log(`🔍 Looking up LID for PN: ${pn} → ${pnNormalized}`)
+        
         // Use transaction for consistent reads during concurrent writes
         return await this.keys.transaction(async () => {
             // LRU cache handles everything - fetch from storage if needed
             const lid = await this.cache.fetch(pnNormalized)
-            return lid ? jidEncode(lid, 'lid') : null
+            const result = lid ? jidEncode(lid, 'lid') : null
+            
+            console.log(`${result ? '✅' : '❌'} LID lookup result: ${result || 'NOT FOUND'}`)
+            return result
         })
     }
 
@@ -194,6 +214,35 @@ export class LIDMappingStore {
         this.cache.clear()
     }
     
+    /**
+     * Debug helper - check if mapping exists in storage
+     */
+    async debugMapping(identifier: string): Promise<void> {
+        console.log(`🔍 Debug mapping for: ${identifier}`)
+        
+        try {
+            // Check cache first
+            const cacheKey = identifier.includes('@') ? identifier : `${identifier}@s.whatsapp.net`
+            const cacheResult = this.cache.get(cacheKey)
+            console.log(`Cache result: ${cacheResult || 'NOT FOUND'}`)
+            
+            // Check Redis directly 
+            const sessionKey = identifier.replace('@s.whatsapp.net', '').replace(':', '.')
+            const { [sessionKey]: redisResult } = await this.keys.get('lid-mapping', [sessionKey])
+            console.log(`Redis result for key '${sessionKey}': ${redisResult || 'NOT FOUND'}`)
+            
+            // Try reverse lookup if it's a LID
+            if (identifier.includes('_1')) {
+                const lidKey = sessionKey
+                const { [lidKey]: reverseLookup } = await this.keys.get('lid-mapping', [lidKey])
+                console.log(`Reverse Redis result for key '${lidKey}': ${reverseLookup || 'NOT FOUND'}`)
+            }
+            
+        } catch (error) {
+            console.error(`Debug mapping failed:`, error)
+        }
+    }
+
     /**
      * Pre-warm cache with frequently used mappings
      * Can be called on startup for better performance
