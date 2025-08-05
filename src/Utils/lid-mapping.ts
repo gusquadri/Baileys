@@ -2,7 +2,6 @@ import { LRUCache } from 'lru-cache'
 import type { SignalKeyStoreWithTransaction } from '../Types'
 import { DEFAULT_CACHE_TTLS } from '../Defaults'
 import { 
-    jidDecode, 
     jidNormalizedUser, 
     isLidUser, 
     isJidUser,
@@ -43,27 +42,30 @@ export class LIDMappingStore {
             // Auto-fetch from persistent storage when cache misses
             fetchMethod: async (key: string): Promise<string | undefined> => {
                 try {
-                    const { [key]: value } = await this.keys.get('lid-mapping', [key])
-                    
-                    // If found, also cache the reverse mapping
-                    if (value && typeof value === 'string') {
-                        // Determine if this is a PN->LID or LID->PN lookup
-                        if (key.startsWith('lid-')) {
-                            // This was a LID->PN lookup, cache PN->LID too
-                            const pn = value
-                            const lid = key.replace('lid-', '')
-                            this.cache.set(pn, lid, { noDisposeOnSet: true })
-                        } else {
-                            // This was a PN->LID lookup, cache LID->PN too
-                            const lid = value
-                            const pn = key
-                            this.cache.set(`lid-${lid}`, pn, { noDisposeOnSet: true })
+                    // Use transaction to prevent race conditions during fetch
+                    return await this.keys.transaction(async () => {
+                        const { [key]: value } = await this.keys.get('lid-mapping', [key])
+                        
+                        // If found, also cache the reverse mapping atomically
+                        if (value && typeof value === 'string') {
+                            // Determine if this is a PN->LID or LID->PN lookup
+                            if (key.startsWith('lid-')) {
+                                // This was a LID->PN lookup, cache PN->LID too
+                                const pn = value
+                                const lid = key.replace('lid-', '')
+                                this.cache.set(pn, lid, { noDisposeOnSet: true })
+                            } else {
+                                // This was a PN->LID lookup, cache LID->PN too
+                                const lid = value
+                                const pn = key
+                                this.cache.set(`lid-${lid}`, pn, { noDisposeOnSet: true })
+                            }
+                            
+                            return value
                         }
                         
-                        return value
-                    }
-                    
-                    return undefined
+                        return undefined
+                    })
                 } catch (error) {
                     console.error(`Failed to fetch LID mapping for ${key}:`, error)
                     return undefined
@@ -71,7 +73,7 @@ export class LIDMappingStore {
             },
             
             // Monitoring and debugging
-            dispose: (value, key, reason) => {
+            dispose: (_value, key, reason) => {
                 if (reason === 'evict' || reason === 'set') {
                     console.debug(`LID mapping evicted: ${key} (reason: ${reason})`)
                 }
@@ -96,19 +98,21 @@ export class LIDMappingStore {
         const lidNormalized = jidNormalizedUser(lid)
         const pnNormalized = jidNormalizedUser(pn)
 
-        // Store in persistent storage
+        // Use transaction to ensure atomicity (like other Signal operations)
         try {
-            await this.keys.set({
-                'lid-mapping': {
-                    [pnNormalized]: lidNormalized,
-                    [`lid-${lidNormalized}`]: pnNormalized
-                }
+            await this.keys.transaction(async () => {
+                // Store in persistent storage atomically
+                await this.keys.set({
+                    'lid-mapping': {
+                        [pnNormalized]: lidNormalized,
+                        [`lid-${lidNormalized}`]: pnNormalized
+                    }
+                })
+                
+                // Update cache atomically after successful storage
+                this.cache.set(pnNormalized, lidNormalized)
+                this.cache.set(`lid-${lidNormalized}`, pnNormalized)
             })
-            
-            // Update cache (both directions)
-            // The cache will auto-expire based on TTL
-            this.cache.set(pnNormalized, lidNormalized)
-            this.cache.set(`lid-${lidNormalized}`, pnNormalized)
         } catch (error) {
             console.error('Failed to store LID-PN mapping:', error)
         }
@@ -126,9 +130,12 @@ export class LIDMappingStore {
         
         const pnNormalized = jidNormalizedUser(pn)
         
-        // LRU cache handles everything - fetch from storage if needed
-        const lid = await this.cache.fetch(pnNormalized)
-        return lid ? jidEncode(lid, 'lid') : null
+        // Use transaction for consistent reads during concurrent writes
+        return await this.keys.transaction(async () => {
+            // LRU cache handles everything - fetch from storage if needed
+            const lid = await this.cache.fetch(pnNormalized)
+            return lid ? jidEncode(lid, 'lid') : null
+        })
     }
 
     /**
@@ -143,9 +150,12 @@ export class LIDMappingStore {
         
         const lidNormalized = jidNormalizedUser(lid)
         
-        // LRU cache handles everything - fetch from storage if needed
-        const pn = await this.cache.fetch(`lid-${lidNormalized}`)
-        return pn ? jidEncode(pn, 's.whatsapp.net') : null
+        // Use transaction for consistent reads during concurrent writes
+        return await this.keys.transaction(async () => {
+            // LRU cache handles everything - fetch from storage if needed
+            const pn = await this.cache.fetch(`lid-${lidNormalized}`)
+            return pn ? jidEncode(pn, 's.whatsapp.net') : null
+        })
     }
 
     /**

@@ -65,7 +65,9 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			const decoded = jidDecode(jid)
 			const device = decoded?.device
 			
-			const lidForPN = await lidMapping.getLIDForPN(jid)
+			// Use base JID (without device) for LID mapping lookup
+			const baseJid = jidEncode(decoded!.user, 's.whatsapp.net')
+			const lidForPN = await lidMapping.getLIDForPN(baseJid)
 			if (lidForPN) {
 				// Reconstruct LID with same device ID
 				const lidDecoded = jidDecode(lidForPN)
@@ -92,7 +94,9 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			const decoded = jidDecode(jid)
 			const device = decoded?.device
 			
-			const pnForLID = await lidMapping.getPNForLID(jid)
+			// Use base JID (without device) for PN mapping lookup
+			const baseJid = jidEncode(decoded!.user, 'lid')
+			const pnForLID = await lidMapping.getPNForLID(baseJid)
 			if (pnForLID) {
 				// Reconstruct PN with same device ID
 				const pnDecoded = jidDecode(pnForLID)
@@ -185,7 +189,9 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 				const decoded = jidDecode(jid)
 				const device = decoded?.device
 				
-				const lidForPN = await lidMapping.getLIDForPN(jid)
+				// Use base JID (without device) for LID mapping lookup
+				const baseJid = jidEncode(decoded!.user, 's.whatsapp.net')
+				const lidForPN = await lidMapping.getLIDForPN(baseJid)
 				if (lidForPN) {
 					// Reconstruct LID with same device ID
 					const lidDecoded = jidDecode(lidForPN)
