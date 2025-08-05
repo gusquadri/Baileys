@@ -727,22 +727,11 @@ export const generateWAMessageFromContent = (
 
 	message = WAProto.Message.fromObject(message)
 
-	// Debug logging for lid messages
-	const isLidMessage = jid.includes('@lid')
-	if (isLidMessage) {
-		console.log(`>>>>>>>>> Creating lid message for jid: ${jid}, userJid: ${userJid}`)
-	}
-
 	const messageJSON = {
 		key: {
 			remoteJid: jid,
 			fromMe: true,
-			id: options?.messageId || generateMessageIDV2(),
-			// Add senderPn and senderLid for lid messages
-			...(isLidMessage && userJid ? {
-				senderLid: jid,
-				senderPn: userJid
-			} : {})
+			id: options?.messageId || generateMessageIDV2()
 		},
 		message: message,
 		messageTimestamp: timestamp,
