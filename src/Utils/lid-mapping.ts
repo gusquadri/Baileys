@@ -197,7 +197,8 @@ export class LIDMappingStore {
         
         if (cachedLid) {
             console.log(`⚡ Fast cache hit: ${pnNormalized} → ${cachedLid}`)
-            return jidEncode(cachedLid, 'lid')
+            // Cache already stores full LID format, don't add @lid again
+            return cachedLid.includes('@lid') ? cachedLid : jidEncode(cachedLid, 'lid')
         }
         
         return null
