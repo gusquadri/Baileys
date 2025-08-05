@@ -168,7 +168,8 @@ export class LIDMappingStore {
             
             // LRU cache handles everything - fetch from storage if needed
             const lid = await this.cache.fetch(pnNormalized)
-            const result = lid ? jidEncode(lid, 'lid') : null
+            // fetchMethod already returns properly formatted JID, no need to encode again
+            const result = lid || null
             
             console.log(`${result ? '✅' : '❌'} LID lookup result: ${result || 'NOT FOUND'}`)
             return result
@@ -191,7 +192,8 @@ export class LIDMappingStore {
         return await this.keys.transaction(async () => {
             // LRU cache handles everything - fetch from storage if needed
             const pn = await this.cache.fetch(`lid-${lidNormalized}`)
-            return pn ? jidEncode(pn, 's.whatsapp.net') : null
+            // fetchMethod already returns properly formatted JID, no need to encode again
+            return pn || null
         })
     }
 
