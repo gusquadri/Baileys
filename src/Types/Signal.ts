@@ -1,4 +1,5 @@
 import { proto } from '../../WAProto/index.js'
+import type { LIDMappingStore } from '../Utils/lid-mapping'
 
 type DecryptGroupSignalOpts = {
 	group: string
@@ -63,4 +64,6 @@ export type SignalRepository = {
 	}>
 	injectE2ESession(opts: E2ESessionOpts): Promise<void>
 	jidToSignalProtocolAddress(jid: string): string
+	storeLIDPNMapping(lid: string, pn: string): Promise<void>
+	getLIDMappingStore(): LIDMappingStore
 }

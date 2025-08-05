@@ -188,6 +188,13 @@ export const decryptMessageNode = (
 							case 'msg':
 								// Use senderLid if available, otherwise fall back to sender/author
 								const user = fullMessage.key.senderLid || (isJidUser(sender) ? sender : author)
+								
+								// Store LID-PN mapping if we discover both identities
+								if (fullMessage.key.senderLid && fullMessage.key.participant) {
+									// We have both LID and PN - store the mapping
+									await repository.storeLIDPNMapping(fullMessage.key.senderLid, fullMessage.key.participant)
+								}
+								
 								msgBuffer = await repository.decryptMessage({
 									jid: user,
 									type: e2eType,

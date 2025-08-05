@@ -4,6 +4,7 @@ import type { SignalAuthState, SignalKeyStoreWithTransaction } from '../Types'
 import type { SignalRepository } from '../Types/Signal'
 import { generateSignalPubKey } from '../Utils'
 import { jidDecode } from '../WABinary'
+import { LIDMappingStore } from '../Utils/lid-mapping'
 import type { SenderKeyStore } from './Group/group_cipher'
 import { SenderKeyName } from './Group/sender-key-name'
 import { SenderKeyRecord } from './Group/sender-key-record'
@@ -12,6 +13,84 @@ import type { StorageType } from 'libsignal'
 
 export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository {
 	const storage : StorageType & SenderKeyStore = signalStorage(auth)
+	const lidMapping = new LIDMappingStore(auth.keys as SignalKeyStoreWithTransaction)
+	
+	/**
+	 * Migrate session from one address to another (for LID/PN compatibility)
+	 */
+	const migrateSession = async (fromJid: string, toJid: string): Promise<void> => {
+		const fromAddr = jidToSignalProtocolAddress(fromJid)
+		const toAddr = jidToSignalProtocolAddress(toJid)
+		
+		const fromAddrStr = fromAddr.toString()
+		const toAddrStr = toAddr.toString()
+		
+		if (fromAddrStr === toAddrStr) {
+			return // No migration needed
+		}
+		
+		try {
+			// Load session from source address
+			const fromSession = await storage.loadSession(fromAddrStr)
+			if (fromSession && fromSession.haveOpenSession()) {
+				// Check if destination already has a session
+				const toSession = await storage.loadSession(toAddrStr)
+				if (!toSession || !toSession.haveOpenSession()) {
+					// Copy session to destination address
+					await storage.storeSession(toAddrStr, fromSession)
+					console.log(`Migrated session from ${fromJid} to ${toJid}`)
+				}
+			}
+		} catch (error) {
+			console.error(`Failed to migrate session from ${fromJid} to ${toJid}:`, error)
+		}
+	}
+
+	/**
+	 * Find and migrate LID sessions for decryption
+	 */
+	const findSessionForDecryption = async (jid: string): Promise<string> => {
+		const addr = jidToSignalProtocolAddress(jid)
+		const addrStr = addr.toString()
+		
+		// First try the provided JID
+		const existingSession = await storage.loadSession(addrStr)
+		if (existingSession && existingSession.haveOpenSession()) {
+			return jid
+		}
+		
+		// If it's a phone number, check for LID mapping
+		if (LIDMappingStore.isPN(jid)) {
+			const lidForPN = await lidMapping.getLIDForPN(jid)
+			if (lidForPN) {
+				const lidAddr = jidToSignalProtocolAddress(lidForPN)
+				const lidSession = await storage.loadSession(lidAddr.toString())
+				if (lidSession && lidSession.haveOpenSession()) {
+					// Migrate session from LID to PN for future use
+					await migrateSession(lidForPN, jid)
+					return lidForPN // Use LID for this decryption
+				}
+			}
+		}
+		
+		// If it's a LID, check for PN mapping
+		if (LIDMappingStore.isLID(jid)) {
+			const pnForLID = await lidMapping.getPNForLID(jid)
+			if (pnForLID) {
+				const pnAddr = jidToSignalProtocolAddress(pnForLID)
+				const pnSession = await storage.loadSession(pnAddr.toString())
+				if (pnSession && pnSession.haveOpenSession()) {
+					// Migrate session from PN to LID for future use
+					await migrateSession(pnForLID, jid)
+					return pnForLID // Use PN for this decryption
+				}
+			}
+		}
+		
+		// No session found, return original JID
+		return jid
+	}
+
 	return {
 		decryptGroupMessage({ group, authorJid, msg }) {
 			const senderName = jidToSignalSenderKeyName(group, authorJid)
@@ -50,10 +129,12 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			})
 		},
 		async decryptMessage({ jid, type, ciphertext }) {
-			const addr = jidToSignalProtocolAddress(jid)
+			// Find the correct JID/session for decryption (handles LID/PN migration)
+			const decryptionJid = await findSessionForDecryption(jid)
+			const addr = jidToSignalProtocolAddress(decryptionJid)
 			const session = new libsignal.SessionCipher(storage, addr)
 
-			// Use transaction to ensure atomicityAdd commentMore actions
+			// Use transaction to ensure atomicity
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
 				let result: Buffer
 				switch (type) {
@@ -71,10 +152,21 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			})
 		},
 		async encryptMessage({ jid, data }) {
-			const addr = jidToSignalProtocolAddress(jid)
+			// Check if we have a LID for this phone number (auto-use LID for privacy)
+			let encryptionJid = jid
+			if (LIDMappingStore.isPN(jid)) {
+				const lidForPN = await lidMapping.getLIDForPN(jid)
+				if (lidForPN) {
+					// Migrate session from PN to LID if needed
+					await migrateSession(jid, lidForPN)
+					encryptionJid = lidForPN
+				}
+			}
+			
+			const addr = jidToSignalProtocolAddress(encryptionJid)
 			const cipher = new libsignal.SessionCipher(storage, addr)
 
-			// Use transaction to ensure atomicityAdd commentMore actions
+			// Use transaction to ensure atomicity
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
 				const { type: sigType, body } = await cipher.encrypt(data)
 				const type = sigType === 3 ? 'pkmsg' : 'msg'
@@ -137,6 +229,18 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 		},
 		jidToSignalProtocolAddress(jid) {
 			return jidToSignalProtocolAddress(jid).toString()
+		},
+		/**
+		 * Store LID-PN mapping (for compatibility with whatsmeow pattern)
+		 */
+		async storeLIDPNMapping(lid: string, pn: string) {
+			await lidMapping.storeLIDPNMapping(lid, pn)
+		},
+		/**
+		 * Get LID mapping store instance
+		 */
+		getLIDMappingStore() {
+			return lidMapping
 		}
 	}
 }
