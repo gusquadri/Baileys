@@ -226,22 +226,43 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 				const cachedLID = lidMapping.getFromCache(baseJid)
 				if (cachedLID) {
 					console.log(`⚡ Cache hit - using cached LID: ${baseJid} → ${cachedLID}`)
-					const primaryLidJid = jidEncode(jidDecode(cachedLID)!.user, 'lid')
-					await migrateSession(jid, primaryLidJid)
-					encryptionJid = primaryLidJid
+					// Use device 0 for primary LID (matches Redis storage format)
+					const primaryLidJid = jidEncode(jidDecode(cachedLID)!.user, 'lid', 0)
+					
+					// CRITICAL: Verify LID session exists before using it
+					const lidAddr = jidToSignalProtocolAddress(primaryLidJid)
+					const lidSession = await storage.loadSession(lidAddr.toString())
+					
+					if (lidSession && lidSession.haveOpenSession()) {
+						console.log(`✅ LID session verified: ${primaryLidJid}`)
+						await migrateSession(jid, primaryLidJid)
+						encryptionJid = primaryLidJid
+					} else {
+						console.log(`⚠️ LID session missing: ${primaryLidJid}, falling back to PN`)
+						// Fall back to original PN - session should exist
+						encryptionJid = jid
+					}
 				} else {
 					console.log(`🔍 Cache miss - performing LID lookup for: ${baseJid}`)
 					const lidForPN = await lidMapping.getLIDForPN(baseJid)
 					if (lidForPN) {
-						// Always use primary LID device (no device ID)
+						// Always use primary LID device (device 0 to match Redis storage)
 						const lidDecoded = jidDecode(lidForPN)
-						const primaryLidJid = jidEncode(lidDecoded!.user, 'lid')
+						const primaryLidJid = jidEncode(lidDecoded!.user, 'lid', 0)
 						
-						console.log(`✅ Using primary LID for encryption: ${jid} → ${primaryLidJid}`)
+						// CRITICAL: Verify LID session exists before using it
+						const lidAddr = jidToSignalProtocolAddress(primaryLidJid)
+						const lidSession = await storage.loadSession(lidAddr.toString())
 						
-						// Migrate session from PN to LID if needed
-						await migrateSession(jid, primaryLidJid)
-						encryptionJid = primaryLidJid
+						if (lidSession && lidSession.haveOpenSession()) {
+							console.log(`✅ LID session verified: ${primaryLidJid}`)
+							await migrateSession(jid, primaryLidJid)
+							encryptionJid = primaryLidJid
+						} else {
+							console.log(`⚠️ LID session missing: ${primaryLidJid}, falling back to PN`)
+							// Fall back to original PN - session should exist  
+							encryptionJid = jid
+						}
 					}
 				}
 			} else if (ownPhoneNumber === targetUser) {
