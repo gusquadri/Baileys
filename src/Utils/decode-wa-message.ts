@@ -178,6 +178,23 @@ export const decryptMessageNode = (
 						const e2eType = tag === 'plaintext' ? 'plaintext' : attrs.type
 						switch (e2eType) {
 							case 'skmsg':
+								console.log(`🔍 Group message decryption - checking for LID-PN mapping:`)
+								console.log(`  senderLid: ${fullMessage.key.senderLid || 'NOT PRESENT'}`)
+								console.log(`  participant: ${fullMessage.key.participant || 'NOT PRESENT'}`)
+								console.log(`  sender: ${sender}`)
+								console.log(`  author: ${author}`)
+								
+								// Store LID-PN mapping for group messages too
+								if (fullMessage.key.senderLid && author) {
+									console.log(`📝 Storing LID-PN mapping from group message`)
+									await repository.storeLIDPNMapping(fullMessage.key.senderLid, author)
+								} else if (fullMessage.key.senderLid && fullMessage.key.participant) {
+									console.log(`📝 Storing LID-PN mapping from group message (participant)`)
+									await repository.storeLIDPNMapping(fullMessage.key.senderLid, fullMessage.key.participant)
+								} else {
+									console.log(`⚠️ Group message - not storing mapping (missing data)`)
+								}
+								
 								msgBuffer = await repository.decryptGroupMessage({
 									group: sender,
 									authorJid: author,
@@ -190,9 +207,25 @@ export const decryptMessageNode = (
 								const user = fullMessage.key.senderLid || (isJidUser(sender) ? sender : author)
 								
 								// Store LID-PN mapping if we discover both identities
+								console.log(`🔍 Individual message decryption - checking for LID-PN mapping:`)
+								console.log(`  senderLid: ${fullMessage.key.senderLid || 'NOT PRESENT'}`)
+								console.log(`  participant: ${fullMessage.key.participant || 'NOT PRESENT'}`)
+								console.log(`  sender: ${sender}`)
+								console.log(`  author: ${author}`)
+								
+								// Try multiple combinations to find LID-PN pairs
 								if (fullMessage.key.senderLid && fullMessage.key.participant) {
-									// We have both LID and PN - store the mapping
+									console.log(`📝 Storing LID-PN mapping from individual message (participant)`)
 									await repository.storeLIDPNMapping(fullMessage.key.senderLid, fullMessage.key.participant)
+								} else if (fullMessage.key.senderLid && author) {
+									console.log(`📝 Storing LID-PN mapping from individual message (author)`)
+									await repository.storeLIDPNMapping(fullMessage.key.senderLid, author)
+								} else if (fullMessage.key.senderLid && sender) {
+									console.log(`📝 Storing LID-PN mapping from individual message (sender)`)
+									await repository.storeLIDPNMapping(fullMessage.key.senderLid, sender)
+								} else {
+									console.log(`⚠️ Individual message - not storing mapping (missing data)`)
+									console.log(`  Available: senderLid=${!!fullMessage.key.senderLid}, participant=${!!fullMessage.key.participant}, author=${!!author}, sender=${!!sender}`)
 								}
 								
 								msgBuffer = await repository.decryptMessage({
