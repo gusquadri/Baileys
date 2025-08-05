@@ -86,13 +86,22 @@ export class LIDMappingStore {
     }
 
     /**
-     * Store a LID-PN mapping (bidirectional)
-     * @param lid LID JID (e.g., "248274980196484@lid")
-     * @param pn Phone number JID (e.g., "554391318447@s.whatsapp.net")
+     * Store a LID-PN mapping (bidirectional) with automatic type detection
+     * @param first Either LID or PN JID (e.g., "248274980196484@lid" or "554391318447@s.whatsapp.net")
+     * @param second Either PN or LID JID (e.g., "554391318447@s.whatsapp.net" or "248274980196484@lid")
      */
-    async storeLIDPNMapping(lid: string, pn: string): Promise<void> {
-        // Validate inputs using Baileys utilities
-        if (!isLidUser(lid) || !isJidUser(pn)) {
+    async storeLIDPNMapping(first: string, second: string): Promise<void> {
+        // Smart server type detection like whatsmeow's StoreLIDPNMapping
+        let lid: string, pn: string
+        
+        if (isLidUser(first) && isJidUser(second)) {
+            lid = first
+            pn = second
+        } else if (isJidUser(first) && isLidUser(second)) {
+            lid = second
+            pn = first
+        } else {
+            console.log(`⚠️ Invalid LID-PN mapping parameters: first=${first} (isLID=${isLidUser(first)}, isPN=${isJidUser(first)}), second=${second} (isLID=${isLidUser(second)}, isPN=${isJidUser(second)})`)
             return
         }
 
@@ -112,6 +121,10 @@ export class LIDMappingStore {
             console.log(`  LID: ${lid} → ${lidNormalized} → Redis key: ${lidKey}`)
             
             await this.keys.transaction(async () => {
+                // CRITICAL: Invalidate any existing cache entries first
+                // This prevents conflicts when relationships change or when sessions are updated
+                this.invalidateMapping(lid, pn)
+                
                 // Store bidirectional mapping using session-style keys
                 await this.keys.set({
                     'lid-mapping': {
@@ -197,8 +210,7 @@ export class LIDMappingStore {
         
         if (cachedLid) {
             console.log(`⚡ Fast cache hit: ${pnNormalized} → ${cachedLid}`)
-            // Cache already stores full LID format, don't add @lid again
-            return cachedLid.includes('@lid') ? cachedLid : jidEncode(cachedLid, 'lid')
+            return jidEncode(cachedLid, 'lid')
         }
         
         return null
@@ -238,6 +250,40 @@ export class LIDMappingStore {
      */
     clear() {
         this.cache.clear()
+    }
+    
+    /**
+     * Invalidate cache for a specific contact (when session updates)
+     */
+    invalidateContact(pn: string) {
+        if (!isJidUser(pn)) return
+        
+        const pnNormalized = jidNormalizedUser(pn)
+        const cachedLid = this.cache.get(pnNormalized)
+        
+        // Remove both directions from cache
+        this.cache.delete(pnNormalized)
+        if (cachedLid) {
+            this.cache.delete(`lid-${cachedLid}`)
+        }
+        
+        console.log(`🗑️ Invalidated cache for: ${pnNormalized}`)
+    }
+    
+    /**
+     * Invalidate cache for both LID and PN when both are known (more efficient)
+     */
+    invalidateMapping(lid: string, pn: string) {
+        if (!isLidUser(lid) || !isJidUser(pn)) return
+        
+        const lidNormalized = jidNormalizedUser(lid)
+        const pnNormalized = jidNormalizedUser(pn)
+        
+        // Remove both directions from cache
+        this.cache.delete(pnNormalized)
+        this.cache.delete(`lid-${lidNormalized}`)
+        
+        console.log(`🗑️ Invalidated bidirectional cache: ${pnNormalized} ↔ ${lidNormalized}`)
     }
     
     /**

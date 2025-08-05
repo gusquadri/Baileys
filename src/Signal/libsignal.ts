@@ -12,8 +12,8 @@ import { GroupCipher, GroupSessionBuilder, SenderKeyDistributionMessage } from '
 import type { StorageType } from 'libsignal'
 
 export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository {
-	const storage : StorageType & SenderKeyStore = signalStorage(auth)
 	const lidMapping = new LIDMappingStore(auth.keys as SignalKeyStoreWithTransaction)
+	const storage : StorageType & SenderKeyStore = signalStorage(auth, lidMapping)
 	
 	/**
 	 * Migrate session from one address to another (for LID/PN compatibility)
@@ -56,6 +56,7 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 		// First try the provided JID
 		const existingSession = await storage.loadSession(addrStr)
 		if (existingSession && existingSession.haveOpenSession()) {
+			console.log(`✅ Session found and active for ${jid}`)
 			return jid
 		}
 		
@@ -232,6 +233,7 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 					// CRITICAL: Verify LID session exists before using it
 					const lidAddr = jidToSignalProtocolAddress(primaryLidJid)
 					console.log(`🔍 Checking LID session: ${primaryLidJid} → ${lidAddr.toString()}`)
+					console.log(`🔍 Debug JID generation: user=${jidDecode(cachedLID)?.user}, device=0, result=${primaryLidJid}`)
 					const lidSession = await storage.loadSession(lidAddr.toString())
 					
 					if (lidSession && lidSession.haveOpenSession()) {
@@ -332,6 +334,8 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			// Use transaction to ensure atomicity
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
 				await cipher.initOutgoing(transformedSession)
+				// Note: No LID cache invalidation needed here - E2E sessions are about encryption keys,
+				// not identity mappings. LID-PN relationships are independent of encryption sessions.
 			})
 		},
 		jidToSignalProtocolAddress(jid) {
@@ -369,7 +373,7 @@ const jidToSignalSenderKeyName = (group: string, user: string): SenderKeyName =>
 	return new SenderKeyName(group, jidToSignalProtocolAddress(user))
 }
 
-function signalStorage({ creds, keys }: SignalAuthState): StorageType & SenderKeyStore & Record<string, any> {
+function signalStorage({ creds, keys }: SignalAuthState, lidMappingStore: LIDMappingStore): StorageType & SenderKeyStore & Record<string, any> {
 	return {
 		loadSession: async (id: string) => {
 			try {
@@ -388,6 +392,34 @@ function signalStorage({ creds, keys }: SignalAuthState): StorageType & SenderKe
 		// TODO: Replace with libsignal.SessionRecord when type exports are added to libsignal
 		storeSession: async (id: string, session: any) => {
 			await keys.set({ session: { [id]: session.serialize() } })
+			
+			// CRITICAL: Invalidate LID mapping cache when session is updated
+			// This prevents using outdated cached sessions after new keys are received
+			try {
+				console.log(`🗑️ Session stored: ${id} - invalidating LID cache`)
+				
+				// Extract JID from session ID and invalidate only the relevant contact
+				const sessionParts = id.split('.')
+				if (sessionParts.length >= 1 && sessionParts[0]) {
+					const baseId = sessionParts[0]
+					
+					// Convert session ID back to JID and invalidate
+					if (baseId.includes('_1')) {
+						// LID session format: "102765716062358_1" → "102765716062358@lid"
+						const lidUser = baseId.replace('_1', '')
+						const lidJid = `${lidUser}@lid`
+						lidMappingStore.invalidateContact(lidJid)
+						console.log(`🗑️ Invalidated LID cache for: ${lidJid}`)
+					} else {
+						// Regular PN session format: "554391318447" → "554391318447@s.whatsapp.net"  
+						const pnJid = `${baseId}@s.whatsapp.net`
+						lidMappingStore.invalidateContact(pnJid)
+						console.log(`🗑️ Invalidated PN cache for: ${pnJid}`)
+					}
+				}
+			} catch (error) {
+				console.warn('Failed to invalidate LID mapping cache:', error)
+			}
 		},
 		isTrustedIdentity: async (_address: string, _identityKey: Buffer) => {
 			return true
