@@ -121,12 +121,16 @@ export type SocketConfig = {
 
 	/** options for axios */
 	options: AxiosRequestConfig<{}>
-	/**
-	 * fetch a message from your store
-	 * implement this so that messages failed to send
-	 * (solves the "this message can take a while" issue) can be retried
-	 * */
-	getMessage: (key: proto.IMessageKey) => Promise<proto.IMessage | undefined>
+	
+	/** Built-in message cache configuration - handles both recent message retrieval and retry support */
+	messageCacheConfig?: {
+		/** Maximum number of messages to cache (default: 256, following WhatsmeOW) */
+		maxSize?: number
+		/** TTL for cached messages in milliseconds (default: 24 hours) */
+		ttlMs?: number
+		/** Whether to enable cache statistics logging (default: true) */
+		enableStats?: boolean
+	}
 
 	/** cached group metadata, use to prevent redundant requests to WA & speed up msg sending */
 	cachedGroupMetadata: (jid: string) => Promise<GroupMetadata | undefined>

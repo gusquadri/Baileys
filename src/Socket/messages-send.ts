@@ -3,6 +3,7 @@ import { Boom } from '@hapi/boom'
 import { proto } from '../../WAProto/index.js'
 import { randomBytes } from 'crypto'
 import { DEFAULT_CACHE_TTLS, WA_DEFAULT_EPHEMERAL } from '../Defaults'
+import { MessageCache, createMessageCacheKey, type MessageCacheConfig } from '../Utils/message-cache'
 import type {
 	AnyMessageContent,
 	MediaConnInfo,
@@ -64,7 +65,8 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		generateHighQualityLinkPreview,
 		options: axiosOptions,
 		patchMessageBeforeSending,
-		cachedGroupMetadata
+		cachedGroupMetadata,
+		messageCacheConfig
 	} = config
 	const sock: NewsletterSocket = makeNewsletterSocket(makeGroupsSocket(config))
 	const {
@@ -79,6 +81,18 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		groupMetadata,
 		groupToggleEphemeral
 	} = sock
+
+	// Initialize built-in message cache (replaces external getMessage)
+	const messageCache = new MessageCache(logger, messageCacheConfig)
+
+	// Cleanup cache on socket destruction
+	const originalDestroy = (sock as any).destroy
+	if (originalDestroy) {
+		(sock as any).destroy = () => {
+			messageCache.destroy()
+			return originalDestroy.call(sock)
+		}
+	}
 
 	const userDevicesCache =
 		config.userDevicesCache ||
@@ -1141,6 +1155,10 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		getUSyncDevices,
 		sendStatusMentions,
 		sendAlbumMessage,
+		// Built-in getMessage implementation (replaces external getMessage)
+		getMessage: messageCache.getMessage.bind(messageCache),
+		// Message cache for monitoring and stats
+		messageCache,
 		updateMediaMessage: async (message: proto.IWebMessageInfo) => {
 			const content = assertMediaContent(message.message)
 			const mediaKey = content.mediaKey!
@@ -1266,6 +1284,11 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					statusJidList: options.statusJidList,
 					additionalNodes
 				})
+				
+				const cacheKey = createMessageCacheKey(fullMsg.key)
+				messageCache.set(cacheKey, fullMsg.message!)
+				logger.trace({ key: cacheKey, msgId: fullMsg.key.id }, 'Message cached before sending')
+
 				if (config.emitOwnEvents) {
 					process.nextTick(() => {
 						processingMutex.mutex(() => upsertMessage(fullMsg, 'append'))

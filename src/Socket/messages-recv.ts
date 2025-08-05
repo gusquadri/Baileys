@@ -58,7 +58,7 @@ import { extractGroupMetadata } from './groups'
 import { makeMessagesSocket } from './messages-send'
 
 export const makeMessagesRecvSocket = (config: SocketConfig) => {
-	const { logger, retryRequestDelayMs, maxMsgRetryCount, getMessage, shouldIgnoreJid } = config
+	const { logger, retryRequestDelayMs, maxMsgRetryCount, shouldIgnoreJid } = config
 	const sock = makeMessagesSocket(config)
 	const {
 		ev,
@@ -75,7 +75,8 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		relayMessage,
 		sendReceipt,
 		uploadPreKeys,
-		sendPeerDataOperationMessage
+		sendPeerDataOperationMessage,
+		getMessage
 	} = sock
 
 	/** this mutex ensures that each retryRequest will wait for the previous one to finish */
