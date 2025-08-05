@@ -186,7 +186,8 @@ export const decryptMessageNode = (
 								break
 							case 'pkmsg':
 							case 'msg':
-								const user = isJidUser(sender) ? sender : author
+								// Use senderLid if available, otherwise fall back to sender/author
+								const user = fullMessage.key.senderLid || (isJidUser(sender) ? sender : author)
 								msgBuffer = await repository.decryptMessage({
 									jid: user,
 									type: e2eType,
