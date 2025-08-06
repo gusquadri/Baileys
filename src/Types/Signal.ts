@@ -68,4 +68,5 @@ export type SignalRepository = {
 	storeLIDPNMapping(lid: string, pn: string): Promise<void>
 	getLIDMappingStore(): LIDMappingStore
 	getPrivacyTokenManager(): PrivacyTokenManager
+	migrateSession(fromJid: string, toJid: string): Promise<void>
 }

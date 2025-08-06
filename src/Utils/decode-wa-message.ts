@@ -203,9 +203,33 @@ export const decryptMessageNode = (
 								break
 							case 'pkmsg':
 							case 'msg':
-								// DISABLE LID-BASED DECRYPTION TO PREVENT DOUBLE RATCHET ISSUES
-								// Always use original sender/author address for consistent session management
-								const user = isJidUser(sender) ? sender : author
+								// SMART SESSION LOOKUP: Try both PN and LID addresses to find existing session
+								const primaryUser = isJidUser(sender) ? sender : author
+								let user = primaryUser
+								
+								// If we have LID mapping info, intelligently choose the session address
+								if (fullMessage.key.senderLid) {
+									console.log(`🔍 Smart session lookup - checking both PN and LID for existing sessions`)
+									console.log(`  Primary (PN): ${primaryUser}`)
+									console.log(`  Alternative (LID): ${fullMessage.key.senderLid}`)
+									
+									// Get LID mapping store to check for session consistency
+									const lidStore = repository.getLIDMappingStore()
+									
+									// Check if we have a LID mapping for this contact
+									const cachedLid = lidStore.getFromCache(primaryUser)
+									if (cachedLid === fullMessage.key.senderLid) {
+										// Consistent mapping, prefer LID (WhatsApp preference)
+										user = fullMessage.key.senderLid
+										console.log(`📱 Using consistent LID address: ${user}`)
+									} else {
+										// Store the new mapping and use LID
+										console.log(`📝 Storing new LID-PN mapping: ${fullMessage.key.senderLid} ↔ ${primaryUser}`)
+										await repository.storeLIDPNMapping(fullMessage.key.senderLid, primaryUser)
+										user = fullMessage.key.senderLid
+										console.log(`📱 Using LID address for decryption: ${user}`)
+									}
+								}
 								
 								// Store LID-PN mapping if we discover both identities
 								console.log(`🔍 Individual message decryption - checking for LID-PN mapping:`)

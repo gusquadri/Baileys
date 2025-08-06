@@ -23,67 +23,48 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 	lidMapping.setPrivacyTokenManager(privacyTokenManager)
 	
 	/**
-	 * Reactive session migration - migrate when contact changes type
-	 * Based on whatsmeow's approach
+	 * Server-coordinated session migration - migrate only when server notifies
+	 * Based on actual WhatsApp/whatsmeow approach (NOT reactive)
 	 */
-	const reactiveSessionMigration = async (recipientJid: string): Promise<string> => {
-		const { server, user } = jidDecode(recipientJid)!
+	const coordinatedSessionMigration = async (fromJid: string, toJid: string): Promise<void> => {
+		// WHATSAPP'S PROPER MIGRATION: Only called when server sends migration notification
+		// This prevents reactive migration during message processing that causes Bad MAC
 		
-		// Determine current contact type from JID
-		const isLidContact = server === 'lid'
-		const currentJid = recipientJid
+		console.log(`🔄 Server-coordinated migration: ${fromJid} → ${toJid}`)
 		
-		// Determine alternative JID format for this contact
-		const alternativeJid = isLidContact 
-			? jidEncode(user, 's.whatsapp.net')  // LID -> PN format
-			: jidEncode(user, 'lid')             // PN -> LID format
+		const fromAddr = jidToSignalProtocolAddress(fromJid)
+		const toAddr = jidToSignalProtocolAddress(toJid)
 		
-		// Check if we have sessions in both formats (indicates type change)
-		const currentAddr = jidToSignalProtocolAddress(currentJid)
-		const alternativeAddr = jidToSignalProtocolAddress(alternativeJid)
-		
-		const currentSession = await storage.loadSession(currentAddr.toString())
-		const alternativeSession = await storage.loadSession(alternativeAddr.toString())
-		
-		const hasCurrentSession = currentSession && currentSession.haveOpenSession()
-		const hasAlternativeSession = alternativeSession && alternativeSession.haveOpenSession()
-		
-		if (hasAlternativeSession && !hasCurrentSession) {
-			// Contact changed type! Migrate session
-			console.log(`🔄 Reactive migration: ${alternativeJid} → ${currentJid}`)
-			
-			try {
-				// Copy session to new format
-				await storage.storeSession(currentAddr.toString(), alternativeSession)
-				
-				// Migrate privacy token (critical for maintaining authorization - whatsmeow approach)
-				try {
-					await privacyTokenManager.migratePrivacyToken(alternativeJid, currentJid)
-					console.log(`🔐 Privacy token migrated: ${alternativeJid} → ${currentJid}`)
-				} catch (tokenError) {
-					console.warn(`⚠️ Privacy token migration failed (non-critical): ${alternativeJid} → ${currentJid}`, tokenError)
-					// Don't fail session migration for token issues
-				}
-				
-				// Update LID mapping cache to reflect the type change
-				if (isLidContact) {
-					// Contact switched to LID - store the mapping
-					const pnJid = jidEncode(user, 's.whatsapp.net')
-					await lidMapping.storeLIDPNMapping(currentJid, pnJid)
-					console.log(`📝 Stored LID mapping: ${currentJid} ↔ ${pnJid}`)
-				} else {
-					// Contact switched to PN - update cache
-					lidMapping.invalidateContact(alternativeJid)
-					console.log(`🗑️ Invalidated old LID mapping for: ${alternativeJid}`)
-				}
-				
-				console.log(`✅ Session migrated successfully: ${alternativeJid} → ${currentJid}`)
-			} catch (error) {
-				console.error(`❌ Failed to migrate session: ${alternativeJid} → ${currentJid}`, error)
+		try {
+			// 1. Load existing session from old address
+			const fromSession = await storage.loadSession(fromAddr.toString())
+			if (!fromSession || !fromSession.haveOpenSession()) {
+				console.log(`⚠️ No active session found at ${fromJid} - skipping migration`)
+				return
 			}
+			
+			// 2. ATOMIC MIGRATION: Copy complete session state
+			await storage.storeSession(toAddr.toString(), fromSession)
+			
+			// 3. Migrate privacy tokens
+			try {
+				await privacyTokenManager.migratePrivacyToken(fromJid, toJid)
+				console.log(`🔐 Privacy token migrated: ${fromJid} → ${toJid}`)
+			} catch (tokenError) {
+				console.warn(`⚠️ Privacy token migration failed: ${fromJid} → ${toJid}`, tokenError)
+			}
+			
+			// 4. Update LID mapping
+			await lidMapping.storeLIDPNMapping(toJid, fromJid)
+			
+			// 5. Invalidate old session (optional - WhatsApp keeps both temporarily)
+			// await storage.storeSession(fromAddr.toString(), null)
+			
+			console.log(`✅ Coordinated migration completed: ${fromJid} → ${toJid}`)
+		} catch (error) {
+			console.error(`❌ Failed coordinated migration: ${fromJid} → ${toJid}`, error)
+			throw error
 		}
-		
-		return currentJid
 	}
 
 	/**
@@ -285,9 +266,34 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			
 			let encryptionJid = jid
 			
-			// DISABLE REACTIVE MIGRATION TO PREVENT DOUBLE RATCHET ISSUES  
-			// Keep original JID for encryption to maintain session consistency
-			console.log(`📤 Encrypting message to: ${encryptionJid} (migration disabled)`)
+			// SMART SESSION SELECTION: Use existing session or prefer LID if available
+			const lidForPN = await lidMapping.getLIDForPN(jid)
+			if (lidForPN) {
+				console.log(`🔍 Found LID mapping: ${jid} → ${lidForPN}`)
+				
+				// Check which address has an existing session
+				const pnAddr = jidToSignalProtocolAddress(jid)  
+				const lidAddr = jidToSignalProtocolAddress(lidForPN)
+				
+				const pnSession = await storage.loadSession(pnAddr.toString())
+				const lidSession = await storage.loadSession(lidAddr.toString())
+				
+				const hasPnSession = pnSession && pnSession.haveOpenSession()
+				const hasLidSession = lidSession && lidSession.haveOpenSession()
+				
+				if (hasLidSession) {
+					encryptionJid = lidForPN
+					console.log(`📱 Using existing LID session: ${encryptionJid}`)
+				} else if (hasPnSession) {
+					console.log(`📱 Using existing PN session: ${encryptionJid}`)
+				} else {
+					// No existing session, prefer LID for new sessions (WhatsApp preference)
+					encryptionJid = lidForPN
+					console.log(`📱 Creating new LID session: ${encryptionJid}`)
+				}
+			} else {
+				console.log(`📤 No LID mapping found, using PN: ${encryptionJid}`)
+			}
 			
 			const addr = jidToSignalProtocolAddress(encryptionJid)
 			const cipher = new libsignal.SessionCipher(storage, addr)
@@ -399,6 +405,13 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 		 */
 		getPrivacyTokenManager() {
 			return privacyTokenManager
+		},
+		/**
+		 * Server-coordinated migration - only call when server notifies about LID changes
+		 * This is WhatsApp's proper migration approach (prevents Bad MAC errors)
+		 */
+		async migrateSession(fromJid: string, toJid: string) {
+			await coordinatedSessionMigration(fromJid, toJid)
 		}
 	}
 }
