@@ -203,8 +203,9 @@ export const decryptMessageNode = (
 								break
 							case 'pkmsg':
 							case 'msg':
-								// Use senderLid if available, otherwise fall back to sender/author
-								const user = fullMessage.key.senderLid || (isJidUser(sender) ? sender : author)
+								// DISABLE LID-BASED DECRYPTION TO PREVENT DOUBLE RATCHET ISSUES
+								// Always use original sender/author address for consistent session management
+								const user = isJidUser(sender) ? sender : author
 								
 								// Store LID-PN mapping if we discover both identities
 								console.log(`🔍 Individual message decryption - checking for LID-PN mapping:`)
