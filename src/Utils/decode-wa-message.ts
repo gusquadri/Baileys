@@ -229,44 +229,83 @@ export const decryptMessageNode = (
 								break
 							case 'pkmsg':
 							case 'msg':
-								// ALWAYS USE SENDER ADDRESS: This is the exact address used for encryption
-								// No fallback to author - sender is the actual encryption address
-								const user = sender
-								console.log(`📱 Using sender address for decryption: ${user}`)
+								// BAILEYS APPROACH: Determine sender encryption identity
+								// Following whatsmeow logic but adapted to Baileys' architecture
+								let senderEncryptionJid = sender
+								console.log(`📱 Initial sender address: ${sender}`)
 								
-								// Store LID-PN mapping if we have both identities (for future reference)
-								if (fullMessage.key.senderLid && sender !== fullMessage.key.senderLid) {
-									console.log(`📝 Storing LID-PN mapping: ${fullMessage.key.senderLid} ↔ ${sender}`)
-									await repository.storeLIDPNMapping(fullMessage.key.senderLid, sender)
+								// Store discovered LID-PN mappings (for future reference)
+								let didStoreLIDMapping = false
+								if (fullMessage.key.senderLid && fullMessage.key.senderLid !== sender) {
+									console.log(`🔍 Discovered LID-PN mapping: ${fullMessage.key.senderLid} ↔ ${sender}`)
+									try {
+										await repository.storeLIDPNMapping(fullMessage.key.senderLid, sender)
+										didStoreLIDMapping = true
+									} catch (error) {
+										logger.warn({ error, lid: fullMessage.key.senderLid, pn: sender }, 'Failed to store LID-PN mapping')
+									}
 								}
 								
-								// Store LID-PN mapping if we discover both identities
-								console.log(`🔍 Individual message decryption - checking for LID-PN mapping:`)
-								console.log(`  senderLid: ${fullMessage.key.senderLid || 'NOT PRESENT'}`)
-								console.log(`  participant: ${fullMessage.key.participant || 'NOT PRESENT'}`)
-								console.log(`  sender: ${sender}`)
-								console.log(`  author: ${author}`)
+								// ADAPTIVE DECRYPTION: Try appropriate address first, fallback if needed
+								console.log(`📱 Using sender address for decryption: ${senderEncryptionJid}`)
 								
-								// Try multiple combinations to find LID-PN pairs
-								if (fullMessage.key.senderLid && fullMessage.key.participant) {
-									console.log(`📝 Storing LID-PN mapping from individual message (participant)`)
-									await repository.storeLIDPNMapping(fullMessage.key.senderLid, fullMessage.key.participant)
-								} else if (fullMessage.key.senderLid && author) {
-									console.log(`📝 Storing LID-PN mapping from individual message (author)`)
-									await repository.storeLIDPNMapping(fullMessage.key.senderLid, author)
-								} else if (fullMessage.key.senderLid && sender) {
-									console.log(`📝 Storing LID-PN mapping from individual message (sender)`)
-									await repository.storeLIDPNMapping(fullMessage.key.senderLid, sender)
-								} else {
-									console.log(`⚠️ Individual message - not storing mapping (missing data)`)
-									console.log(`  Available: senderLid=${!!fullMessage.key.senderLid}, participant=${!!fullMessage.key.participant}, author=${!!author}, sender=${!!sender}`)
+								try {
+									msgBuffer = await repository.decryptMessage({
+										jid: senderEncryptionJid,
+										type: e2eType,
+										ciphertext: content
+									})
+								} catch (decryptError: any) {
+									// BAILEYS PATTERN: Graceful fallback on decryption failure
+									if (decryptError.message?.includes('Bad MAC') || decryptError.message?.includes('No matching sessions')) {
+										logger.debug({ 
+											primaryJid: senderEncryptionJid, 
+											senderLid: fullMessage.key.senderLid,
+											error: decryptError.message 
+										}, 'Primary decryption failed, checking for session migration opportunity')
+										
+										// Try alternate addressing if we have the mapping
+										let alternateJid: string | null = null
+										if (fullMessage.key.senderLid && fullMessage.key.senderLid !== senderEncryptionJid) {
+											alternateJid = fullMessage.key.senderLid
+										} else if (didStoreLIDMapping) {
+											// Check if we can get alternate address from mapping store
+											const lidMapping = repository.getLIDMappingStore()
+											if (senderEncryptionJid.includes('@s.whatsapp.net')) {
+												alternateJid = await lidMapping.getLIDForPN(senderEncryptionJid)
+											} else if (senderEncryptionJid.includes('@lid')) {
+												alternateJid = await lidMapping.getPNForLID(senderEncryptionJid)
+											}
+										}
+										
+										if (alternateJid) {
+											logger.debug({ primary: senderEncryptionJid, alternate: alternateJid }, 'Attempting decryption with alternate address')
+											try {
+												msgBuffer = await repository.decryptMessage({
+													jid: alternateJid,
+													type: e2eType,
+													ciphertext: content
+												})
+												
+												// Success - migrate session for future consistency (Baileys pattern)
+												await repository.migrateSession(alternateJid, senderEncryptionJid)
+												logger.debug({ from: alternateJid, to: senderEncryptionJid }, 'Migrated session after successful alternate decryption')
+											} catch (alternateError: any) {
+												logger.error({ 
+													primaryError: decryptError.message,
+													alternateError: alternateError.message,
+													primary: senderEncryptionJid,
+													alternate: alternateJid
+												}, 'Both primary and alternate decryption failed')
+												throw decryptError // Throw original error
+											}
+										} else {
+											throw decryptError // No alternate address available
+										}
+									} else {
+										throw decryptError // Not a session-related error
+									}
 								}
-								
-								msgBuffer = await repository.decryptMessage({
-									jid: user,
-									type: e2eType,
-									ciphertext: content
-								})
 								break
 							case 'plaintext':
 								msgBuffer = content

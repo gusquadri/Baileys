@@ -14,7 +14,7 @@ import type { StorageType } from 'libsignal'
 
 export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository {
 	const lidMapping = new LIDMappingStore(auth.keys as SignalKeyStoreWithTransaction)
-	const storage : StorageType & SenderKeyStore = signalStorage(auth, lidMapping)
+	const storage : StorageType & SenderKeyStore = signalStorage(auth)
 	
 	// Initialize privacy token manager for session migration (following whatsmeow approach)
 	const privacyTokenManager = new PrivacyTokenManager(auth.keys as SignalKeyStoreWithTransaction, lidMapping)
@@ -215,14 +215,11 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			})
 		},
 		async decryptMessage({ jid, type, ciphertext }) {
-			// DISABLE REACTIVE MIGRATION TO PREVENT DOUBLE RATCHET ISSUES
-			// Use original JID for decryption to maintain session consistency
-			const decryptionJid = jid
-			const addr = jidToSignalProtocolAddress(decryptionJid)
-			const session = new libsignal.SessionCipher(storage, addr)
-
 			// Use transaction to ensure atomicity
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
+				const addr = jidToSignalProtocolAddress(jid)
+				const session = new libsignal.SessionCipher(storage, addr)
+				
 				let result: Buffer
 				switch (type) {
 					case 'pkmsg':
@@ -231,91 +228,82 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 					case 'msg':
 						result = await session.decryptWhisperMessage(ciphertext)
 						break
-				default:
-					throw new Error(`Unknown message type: ${type}`)
+					default:
+						throw new Error(`Unknown message type: ${type}`)
 				}
-
+				
 				return result
 			})
 		},
 		async encryptMessage({ jid, data, conversationContext }) {
-			// Get user info for optimizations  
-			const authCreds = (auth as any).creds || auth
-			const ownPhoneNumber = authCreds.me?.id?.split('@')[0]?.split(':')[0]
-			const targetUser = jidDecode(jid)?.user
-			
+			// BAILEYS ADAPTIVE ENCRYPTION: Balance whatsmeow logic with Baileys patterns
 			let encryptionJid = jid
 			
-			// CONTEXT-AWARE ADDRESS HANDLING: Follow whatsmeow's approach
-			// Use the addressing mode from conversation context first
+			// Use conversation context to guide addressing preference (Baileys-specific)
+			const preferLID = conversationContext?.preferredAddressingMode === 'lid'
+			const preferPN = conversationContext?.preferredAddressingMode === 'pn'
 			
-			if (conversationContext?.preferredAddressingMode) {
-				console.log(`🎯 Using conversation context addressing mode: ${conversationContext.preferredAddressingMode}`)
-				
-				if (conversationContext.preferredAddressingMode === 'lid') {
-					// Try to use LID if conversation context indicates it
-					if (LIDMappingStore.isPN(jid)) {
-						const lidForPN = await lidMapping.getLIDForPN(jid)
-						if (lidForPN) {
-							// Migrate sessions following whatsmeow's approach (send.go:1183)
-							await migrateSession(jid, lidForPN)
-							encryptionJid = lidForPN
-							console.log(`📤 Using LID per conversation context: ${encryptionJid}`)
-						}
-					}
-				} else {
-					// Conversation context indicates PN - stick with PN even if LID exists
-					if (LIDMappingStore.isLID(jid)) {
-						// Convert LID back to PN if we have the mapping
-						const pnForLID = await lidMapping.getPNForLID(jid)
-						if (pnForLID) {
-							encryptionJid = pnForLID
-							console.log(`📤 Using PN per conversation context: ${encryptionJid}`)
-						}
-					}
-				}
-			} else {
-				// FALLBACK: No conversation context - use session availability logic
-				console.log(`🔍 No conversation context, checking session availability`)
-				
-				if (LIDMappingStore.isLID(jid)) {
-					// Input is already a LID - use it directly
-					console.log(`📤 Input is already LID, using directly: ${encryptionJid}`)
-				} else if (LIDMappingStore.isPN(jid)) {
-					// Input is PN - check if LID session exists but don't prioritize it
+			if (!preferPN && LIDMappingStore.isPN(jid)) {
+				// For PN addresses, check if we have a LID mapping (whatsmeow pattern)
+				try {
 					const lidForPN = await lidMapping.getLIDForPN(jid)
 					if (lidForPN) {
-						const lidAddr = jidToSignalProtocolAddress(lidForPN)
-						const lidSession = await storage.loadSession(lidAddr.toString())
-						const pnAddr = jidToSignalProtocolAddress(jid)
-						const pnSession = await storage.loadSession(pnAddr.toString())
+						console.log(`🔄 Found LID mapping for encryption: ${jid} → ${lidForPN}`)
+						encryptionJid = lidForPN
 						
-						// Only use LID if PN session doesn't exist but LID session does
-						if (!pnSession?.haveOpenSession() && lidSession?.haveOpenSession()) {
-							// Migrate sessions following whatsmeow's approach
-							await migrateSession(jid, lidForPN)
-							encryptionJid = lidForPN
-							console.log(`📤 Using LID due to session availability: ${encryptionJid}`)
-						} else {
-							console.log(`📤 Using PN (original): ${encryptionJid}`)
-						}
-					} else {
-						console.log(`📤 No LID mapping found, using PN: ${encryptionJid}`)
+						// Proactive session preparation (Baileys pattern: prepare before encrypt)
+						await migrateSession(jid, lidForPN)
 					}
-				} else {
-					// Neither LID nor PN - use as-is
-					console.log(`📤 Unknown JID format, using as-is: ${encryptionJid}`)
+				} catch (error) {
+					// Baileys pattern: graceful fallback on mapping errors
+					console.warn(`⚠️ LID mapping lookup failed for ${jid}, using original address`)
+				}
+			} else if (!preferLID && LIDMappingStore.isLID(jid)) {
+				// For LID addresses, respect conversation context preference for PN
+				if (preferPN) {
+					try {
+						const pnForLID = await lidMapping.getPNForLID(jid)
+						if (pnForLID) {
+							console.log(`🔄 Using PN per conversation context: ${jid} → ${pnForLID}`)
+							encryptionJid = pnForLID
+						}
+					} catch (error) {
+						console.warn(`⚠️ PN mapping lookup failed for ${jid}, using original LID`)
+					}
 				}
 			}
 			
+			console.log(`📤 Final encryption address: ${encryptionJid}`)
+			
 			const addr = jidToSignalProtocolAddress(encryptionJid)
-			const cipher = new libsignal.SessionCipher(storage, addr)
-
-			// Use transaction to ensure atomicity
+			
+			// Use transaction to ensure atomicity (Baileys pattern)
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
-					const { type: sigType, body } = await cipher.encrypt(data)
-					const type = sigType === 3 ? 'pkmsg' : 'msg'
-					return { type, ciphertext: Buffer.from(body as any, 'binary') }
+				// BAILEYS SESSION MANAGEMENT: Verify session availability before encryption
+				const targetSession = await storage.loadSession(addr.toString())
+				
+				if (!targetSession || !targetSession.haveOpenSession()) {
+					console.log(`⚠️ No session at ${encryptionJid}`)
+					
+					// BAILEYS FALLBACK PATTERN: Look for alternate session only if needed
+					if (encryptionJid !== jid) {
+						// We changed addresses, check if original has session
+						const origAddr = jidToSignalProtocolAddress(jid)
+						const origSession = await storage.loadSession(origAddr.toString())
+						
+						if (origSession && origSession.haveOpenSession()) {
+							console.log(`✅ Found session at original address, migrating: ${jid} → ${encryptionJid}`)
+							await migrateSession(jid, encryptionJid)
+						}
+					}
+				}
+				
+				// Create cipher and attempt encryption
+				const cipher = new libsignal.SessionCipher(storage, addr)
+				
+				const { type: sigType, body } = await cipher.encrypt(data)
+				const type = sigType === 3 ? 'pkmsg' : 'msg'
+				return { type, ciphertext: Buffer.from(body as any, 'binary') }
 			})
 		},
 		async encryptGroupMessage({ group, meId, data }) {
@@ -422,7 +410,7 @@ const jidToSignalSenderKeyName = (group: string, user: string): SenderKeyName =>
 	return new SenderKeyName(group, jidToSignalProtocolAddress(user))
 }
 
-function signalStorage({ creds, keys }: SignalAuthState, lidMappingStore: LIDMappingStore): StorageType & SenderKeyStore & Record<string, any> {
+function signalStorage({ creds, keys }: SignalAuthState): StorageType & SenderKeyStore & Record<string, any> {
 	return {
 		loadSession: async (id: string) => {
 			try {
