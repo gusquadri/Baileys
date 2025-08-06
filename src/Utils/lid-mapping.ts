@@ -7,6 +7,7 @@ import {
     isJidUser,
     jidEncode
 } from '../WABinary'
+import type { PrivacyTokenManager } from '../Signal/privacy-tokens'
 
 /**
  * LID-PN mapping storage and management
@@ -18,6 +19,9 @@ export class LIDMappingStore {
     
     // Unified LRU cache for both directions with auto-fetch
     private readonly cache: LRUCache<string, string>
+    
+    // Privacy token manager for cross-referencing (optional - set via setPrivacyTokenManager)
+    private privacyTokenManager?: PrivacyTokenManager
     
     constructor(keys: SignalKeyStoreWithTransaction) {
         this.keys = keys
@@ -86,6 +90,15 @@ export class LIDMappingStore {
     }
 
     /**
+     * Set privacy token manager for cross-referencing tokens during mapping operations
+     * Called after both managers are initialized to avoid circular dependencies
+     */
+    setPrivacyTokenManager(manager: PrivacyTokenManager): void {
+        this.privacyTokenManager = manager
+        console.log('🔗 Privacy token manager linked to LID mapping store')
+    }
+
+    /**
      * Store a LID-PN mapping (bidirectional) with automatic type detection
      * @param first Either LID or PN JID (e.g., "248274980196484@lid" or "554391318447@s.whatsapp.net")
      * @param second Either PN or LID JID (e.g., "554391318447@s.whatsapp.net" or "248274980196484@lid")
@@ -140,6 +153,27 @@ export class LIDMappingStore {
                 this.cache.set(`lid-${lidNormalized}`, pnNormalized)
                 
                 console.log(`✅ Updated cache: ${pnNormalized} ↔ ${lidNormalized}`)
+                
+                // Cross-reference privacy tokens if manager is available (following whatsmeow's approach)
+                if (this.privacyTokenManager) {
+                    try {
+                        // Check if either contact has a privacy token and cross-reference
+                        const pnToken = await this.privacyTokenManager.getPrivacyToken(pn)
+                        const lidToken = await this.privacyTokenManager.getPrivacyToken(lid)
+                        
+                        // Cross-reference tokens for both addresses (whatsmeow pattern)
+                        if (pnToken && !lidToken) {
+                            await this.privacyTokenManager.storePrivacyToken(lid, pnToken.token)
+                            console.log(`🔗 Cross-referenced privacy token: ${pn} → ${lid}`)
+                        } else if (lidToken && !pnToken) {
+                            await this.privacyTokenManager.storePrivacyToken(pn, lidToken.token)
+                            console.log(`🔗 Cross-referenced privacy token: ${lid} → ${pn}`)
+                        }
+                    } catch (tokenError) {
+                        console.error('⚠️ Privacy token cross-reference failed (non-critical):', tokenError)
+                        // Don't fail the mapping operation for token issues
+                    }
+                }
             })
         } catch (error) {
             console.error('❌ Failed to store LID-PN mapping:', error)

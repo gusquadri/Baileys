@@ -88,6 +88,9 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			stdTTL: DEFAULT_CACHE_TTLS.MSG_RETRY, // 1 hour
 			useClones: false
 		})
+
+	// Privacy token manager is accessed via signalRepository when needed
+
 	const callOfferCache =
 		config.callOfferCache ||
 		new NodeCache<WACallEvent>({
@@ -442,17 +445,89 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 		switch (nodeType) {
 			case 'privacy_token':
-				const tokenList = getBinaryNodeChildren(child, 'token')
+				// Enhanced privacy token handling following whatsmeow's validation patterns
+				const ownJID = authState.creds.me?.id
+				const ownLID = authState.creds.me?.lid
+				
+				if (!ownJID) {
+					logger.debug('Ignoring privacy token notification, session not established')
+					break
+				}
+				
+				const tokens = getBinaryNodeChild(child, 'tokens')
+				if (!tokens) {
+					logger.warn('privacy_token notification did not contain <tokens> tag')
+					break
+				}
+				
+				const sender = node.attrs.from
+				if (!sender) {
+					logger.warn('privacy_token notification did not have a sender')
+					break
+				}
+				
+				const tokenList = getBinaryNodeChildren(tokens, 'token')
 				for (const { attrs, content } of tokenList) {
-					const jid = attrs.jid
-					ev.emit('chats.update', [
-						{
-							id: jid,
-							tcToken: content as Buffer
+					const targetJID = attrs.jid
+					const tokenType = attrs.type
+					const timestamp = attrs.t ? parseInt(attrs.t) * 1000 : Date.now() // Convert to ms
+					const token = content as Buffer
+					
+					// Validate token is for current user (following whatsmeow)
+					if (targetJID !== ownJID && targetJID !== ownLID) {
+						// Don't log about own privacy tokens for other users
+						if (sender !== ownJID && sender !== ownLID) {
+							logger.warn({ targetJID, sender }, 'privacy_token notification contained token for different user')
 						}
-					])
+						continue
+					}
+					
+					// Validate token type (following whatsmeow)
+					if (tokenType && tokenType !== 'trusted_contact') {
+						logger.warn({ tokenType }, 'privacy_token notification contained unexpected token type')
+						continue
+					}
+					
+					// Validate token is binary data (following whatsmeow)
+					if (!Buffer.isBuffer(token) || token.length === 0) {
+						logger.warn('privacy_token notification contained invalid token data')
+						continue
+					}
+					
+					if (!targetJID) {
+						logger.warn('privacy_token notification missing target JID')
+						continue
+					}
+					
+					try {
+						// Store privacy token with timestamp (enhanced from whatsmeow)
+						await signalRepository.getPrivacyTokenManager().storePrivacyToken(targetJID, token)
+						
+						// Emit update event for backward compatibility
+						ev.emit('chats.update', [
+							{
+								id: targetJID,
+								tcToken: token
+							}
+						])
 
-					logger.debug({ jid }, 'got privacy token update')
+						logger.debug({ 
+							targetJID, 
+							sender, 
+							tokenLength: token.length, 
+							timestamp: new Date(timestamp).toISOString() 
+						}, 'stored privacy token from sender')
+					} catch (error) {
+						logger.error({ targetJID, sender, error }, 'failed to save privacy token')
+						
+						// Still emit update event even if storage failed
+						ev.emit('chats.update', [
+							{
+								id: targetJID,
+								tcToken: token
+							}
+						])
+					}
 				}
 
 				break

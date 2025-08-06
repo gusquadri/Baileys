@@ -1,5 +1,6 @@
 import { proto } from '../../WAProto/index.js'
 import type { LIDMappingStore } from '../Utils/lid-mapping'
+import type { PrivacyTokenManager } from '../Signal/privacy-tokens'
 
 type DecryptGroupSignalOpts = {
 	group: string
@@ -66,4 +67,5 @@ export type SignalRepository = {
 	jidToSignalProtocolAddress(jid: string): string
 	storeLIDPNMapping(lid: string, pn: string): Promise<void>
 	getLIDMappingStore(): LIDMappingStore
+	getPrivacyTokenManager(): PrivacyTokenManager
 }

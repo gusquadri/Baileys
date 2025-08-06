@@ -5,6 +5,7 @@ import type { SignalRepository } from '../Types/Signal'
 import { generateSignalPubKey } from '../Utils'
 import { jidDecode, jidEncode } from '../WABinary'
 import { LIDMappingStore } from '../Utils/lid-mapping'
+import { PrivacyTokenManager } from './privacy-tokens'
 import type { SenderKeyStore } from './Group/group_cipher'
 import { SenderKeyName } from './Group/sender-key-name'
 import { SenderKeyRecord } from './Group/sender-key-record'
@@ -14,6 +15,12 @@ import type { StorageType } from 'libsignal'
 export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository {
 	const lidMapping = new LIDMappingStore(auth.keys as SignalKeyStoreWithTransaction)
 	const storage : StorageType & SenderKeyStore = signalStorage(auth, lidMapping)
+	
+	// Initialize privacy token manager for session migration (following whatsmeow approach)
+	const privacyTokenManager = new PrivacyTokenManager(auth.keys as SignalKeyStoreWithTransaction, lidMapping)
+	
+	// Link managers for cross-referencing (avoiding circular dependency)
+	lidMapping.setPrivacyTokenManager(privacyTokenManager)
 	
 	/**
 	 * Reactive session migration - migrate when contact changes type
@@ -48,6 +55,15 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			try {
 				// Copy session to new format
 				await storage.storeSession(currentAddr.toString(), alternativeSession)
+				
+				// Migrate privacy token (critical for maintaining authorization - whatsmeow approach)
+				try {
+					await privacyTokenManager.migratePrivacyToken(alternativeJid, currentJid)
+					console.log(`🔐 Privacy token migrated: ${alternativeJid} → ${currentJid}`)
+				} catch (tokenError) {
+					console.warn(`⚠️ Privacy token migration failed (non-critical): ${alternativeJid} → ${currentJid}`, tokenError)
+					// Don't fail session migration for token issues
+				}
 				
 				// Update LID mapping cache to reflect the type change
 				if (isLidContact) {
@@ -393,6 +409,12 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 		 */
 		getLIDMappingStore() {
 			return lidMapping
+		},
+		/**
+		 * Get privacy token manager instance
+		 */
+		getPrivacyTokenManager() {
+			return privacyTokenManager
 		}
 	}
 }

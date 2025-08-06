@@ -55,6 +55,7 @@ import {
 	STORIES_JID
 } from '../WABinary'
 import { USyncQuery, USyncUser } from '../WAUSync'
+import { PrivacyTokenUtils } from '../Signal/privacy-tokens'
 import { makeGroupsSocket } from './groups'
 import type { NewsletterSocket } from './newsletter'
 import { makeNewsletterSocket } from './newsletter'
@@ -85,6 +86,25 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 	// Initialize built-in message cache (replaces external getMessage)
 	const messageCache = new MessageCache(logger, messageCacheConfig)
+
+	// Helper function to get privacy token with LID-PN cross-referencing (enhanced from whatsmeow)
+	const getPrivacyToken = async (jid: string): Promise<Buffer | null> => {
+		try {
+			// Use the privacy token manager for proper LID-PN cross-referencing
+			const privacyTokenManager = signalRepository.getPrivacyTokenManager()
+			const tokenData = await privacyTokenManager.getPrivacyToken(jid)
+			
+			if (tokenData?.token && Buffer.isBuffer(tokenData.token)) {
+				logger.trace({ jid }, 'privacy token found for message sending with LID cross-referencing')
+				return tokenData.token
+			}
+			
+			return null
+		} catch (error) {
+			logger.debug({ jid, error }, 'failed to get privacy token')
+			return null
+		}
+	}
 
 	// Cleanup cache on socket destruction
 	const originalDestroy = (sock as any).destroy
@@ -418,6 +438,9 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		if (!isStatus && !isGroup && senderJid !== meId) {
 			logger.debug({ destinationJid, senderJid, meId }, 'using LID sender identity for recipient')
 		}
+
+		// PRIVACY TOKENS: Get privacy token for recipient (following whatsmeow approach)
+		const privacyToken = !isGroup && !isStatus ? await getPrivacyToken(destinationJid) : null
 		
 		const binaryNodeContent: BinaryNode[] = []
 		const devices: JidWithDevice[] = []
@@ -476,6 +499,13 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					attrs: {},
 					content: bytes
 				})
+
+				// Add privacy token for newsletter if available (following whatsmeow approach)
+				if (privacyToken) {
+					binaryNodeContent.push(PrivacyTokenUtils.createTokenNode(privacyToken))
+					logger.debug({ msgId, to: jid }, 'included privacy token in newsletter message')
+				}
+
 				const stanza: BinaryNode = {
 					tag: 'message',
 					attrs: {
@@ -646,6 +676,12 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 						content: participants
 					})
 				}
+			}
+
+			// Add privacy token to content if available (following whatsmeow approach)
+			if (privacyToken) {
+				binaryNodeContent.push(PrivacyTokenUtils.createTokenNode(privacyToken))
+				logger.debug({ msgId, to: destinationJid }, 'included privacy token in message')
 			}
 
 			const stanza: BinaryNode = {
