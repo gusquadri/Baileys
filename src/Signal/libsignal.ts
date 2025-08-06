@@ -267,14 +267,33 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			let encryptionJid = jid
 			
 			// USE LID MAPPING IF AVAILABLE: Respect established contact format
-			const lidForPN = await lidMapping.getLIDForPN(jid)
+			// Extract device ID from original JID to preserve it
+			const decoded = jidDecode(jid)
+			const device = decoded?.device
+			
+			// Use base JID (without device) for LID mapping lookup
+			const baseJid = jidEncode(decoded!.user, 's.whatsapp.net')
+			console.log(`🔍 LID mapping lookup for encryption: ${baseJid}`)
+			
+			const lidForPN = await lidMapping.getLIDForPN(baseJid)
 			if (lidForPN) {
-				// Check if we have an active LID session
-				const lidAddr = jidToSignalProtocolAddress(lidForPN)
+				// Reconstruct LID with same device ID to preserve device-specific sessions
+				const lidDecoded = jidDecode(lidForPN)
+				let lidWithDevice = lidForPN
+				
+				// If original JID had a device ID, apply it to LID
+				if (device && lidDecoded) {
+					lidWithDevice = jidEncode(lidDecoded.user, 'lid', device)
+				}
+				
+				console.log(`✅ Found LID mapping: ${baseJid} → ${lidWithDevice}`)
+				
+				// Check if we have an active LID session with preserved device ID
+				const lidAddr = jidToSignalProtocolAddress(lidWithDevice)
 				const lidSession = await storage.loadSession(lidAddr.toString())
 				
 				if (lidSession && lidSession.haveOpenSession()) {
-					encryptionJid = lidForPN
+					encryptionJid = lidWithDevice
 					console.log(`📤 Using established LID session: ${encryptionJid}`)
 				} else {
 					console.log(`📤 LID mapping exists but no session, using PN: ${encryptionJid}`)
