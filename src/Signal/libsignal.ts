@@ -266,34 +266,9 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			
 			let encryptionJid = jid
 			
-			// SMART SESSION SELECTION: Use existing session or prefer LID if available
-			const lidForPN = await lidMapping.getLIDForPN(jid)
-			if (lidForPN) {
-				console.log(`🔍 Found LID mapping: ${jid} → ${lidForPN}`)
-				
-				// Check which address has an existing session
-				const pnAddr = jidToSignalProtocolAddress(jid)  
-				const lidAddr = jidToSignalProtocolAddress(lidForPN)
-				
-				const pnSession = await storage.loadSession(pnAddr.toString())
-				const lidSession = await storage.loadSession(lidAddr.toString())
-				
-				const hasPnSession = pnSession && pnSession.haveOpenSession()
-				const hasLidSession = lidSession && lidSession.haveOpenSession()
-				
-				if (hasLidSession) {
-					encryptionJid = lidForPN
-					console.log(`📱 Using existing LID session: ${encryptionJid}`)
-				} else if (hasPnSession) {
-					console.log(`📱 Using existing PN session: ${encryptionJid}`)
-				} else {
-					// No existing session, prefer LID for new sessions (WhatsApp preference)
-					encryptionJid = lidForPN
-					console.log(`📱 Creating new LID session: ${encryptionJid}`)
-				}
-			} else {
-				console.log(`📤 No LID mapping found, using PN: ${encryptionJid}`)
-			}
+			// CONSISTENT ENCRYPTION: Keep using our established choice for this contact
+			// Only change when WhatsApp server explicitly requests migration
+			console.log(`📤 Encrypting to original address: ${encryptionJid} (sender's choice)`)
 			
 			const addr = jidToSignalProtocolAddress(encryptionJid)
 			const cipher = new libsignal.SessionCipher(storage, addr)
