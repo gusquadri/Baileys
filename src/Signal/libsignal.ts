@@ -254,11 +254,9 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			})
 		},
 		async decryptMessage({ jid, type, ciphertext }) {
-			// REACTIVE MIGRATION: Handle contact type changes on incoming messages
-			const migratedJid = await reactiveSessionMigration(jid)
-			
-			// Find the correct JID/session for decryption (handles LID/PN migration)
-			const decryptionJid = await findSessionForDecryption(migratedJid)
+			// DISABLE REACTIVE MIGRATION TO PREVENT DOUBLE RATCHET ISSUES
+			// Use original JID for decryption to maintain session consistency
+			const decryptionJid = jid
 			const addr = jidToSignalProtocolAddress(decryptionJid)
 			const session = new libsignal.SessionCipher(storage, addr)
 
@@ -287,14 +285,9 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			
 			let encryptionJid = jid
 			
-			// REACTIVE SESSION MIGRATION: Handle contact type changes
-			if (ownPhoneNumber !== targetUser) {
-				// Perform reactive migration for external contacts
-				encryptionJid = await reactiveSessionMigration(encryptionJid)
-				console.log(`📤 Encrypting message to: ${encryptionJid}`)
-			} else {
-				console.log(`⚡ Fast path: Encrypting to own device (${encryptionJid})`)
-			}
+			// DISABLE REACTIVE MIGRATION TO PREVENT DOUBLE RATCHET ISSUES  
+			// Keep original JID for encryption to maintain session consistency
+			console.log(`📤 Encrypting message to: ${encryptionJid} (migration disabled)`)
 			
 			const addr = jidToSignalProtocolAddress(encryptionJid)
 			const cipher = new libsignal.SessionCipher(storage, addr)
