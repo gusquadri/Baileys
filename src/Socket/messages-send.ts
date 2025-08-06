@@ -35,6 +35,7 @@ import {
 	unixTimestampSeconds
 } from '../Utils'
 import { getUrlInfo } from '../Utils/link-preview'
+import { getMessageSenderJid } from '../Utils/sender-identity'
 import {
 	areJidsSameUser,
 	type BinaryNode,
@@ -409,6 +410,15 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 		const participants: BinaryNode[] = []
 		const destinationJid = !isStatus ? jidEncode(user, isLid ? 'lid' : isGroup ? 'g.us' : 's.whatsapp.net') : statusJid
+		
+		// WHATSAPP SENDER IDENTITY: Determine correct sender JID based on recipient
+		// This ensures consistent sender identity to prevent chat separation
+		const senderJid = !isStatus && !isGroup ? getMessageSenderJid(destinationJid, authState.creds) : meId
+		
+		if (!isStatus && !isGroup && senderJid !== meId) {
+			logger.debug({ destinationJid, senderJid, meId }, 'using LID sender identity for recipient')
+		}
+		
 		const binaryNodeContent: BinaryNode[] = []
 		const devices: JidWithDevice[] = []
 
@@ -470,6 +480,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					tag: 'message',
 					attrs: {
 						to: jid,
+						from: senderJid,
 						id: msgId,
 						type: getMessageType(message),
 						...(additionalAttributes || {})
@@ -640,6 +651,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			const stanza: BinaryNode = {
 				tag: 'message',
 				attrs: {
+					from: senderJid,
 					id: msgId,
 					type: getMessageType(message),
 					...(additionalAttributes || {})

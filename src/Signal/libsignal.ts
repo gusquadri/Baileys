@@ -16,6 +16,61 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 	const storage : StorageType & SenderKeyStore = signalStorage(auth, lidMapping)
 	
 	/**
+	 * Reactive session migration - migrate when contact changes type
+	 * Based on whatsmeow's approach
+	 */
+	const reactiveSessionMigration = async (recipientJid: string): Promise<string> => {
+		const { server, user } = jidDecode(recipientJid)!
+		
+		// Determine current contact type from JID
+		const isLidContact = server === 'lid'
+		const currentJid = recipientJid
+		
+		// Determine alternative JID format for this contact
+		const alternativeJid = isLidContact 
+			? jidEncode(user, 's.whatsapp.net')  // LID -> PN format
+			: jidEncode(user, 'lid')             // PN -> LID format
+		
+		// Check if we have sessions in both formats (indicates type change)
+		const currentAddr = jidToSignalProtocolAddress(currentJid)
+		const alternativeAddr = jidToSignalProtocolAddress(alternativeJid)
+		
+		const currentSession = await storage.loadSession(currentAddr.toString())
+		const alternativeSession = await storage.loadSession(alternativeAddr.toString())
+		
+		const hasCurrentSession = currentSession && currentSession.haveOpenSession()
+		const hasAlternativeSession = alternativeSession && alternativeSession.haveOpenSession()
+		
+		if (hasAlternativeSession && !hasCurrentSession) {
+			// Contact changed type! Migrate session
+			console.log(`🔄 Reactive migration: ${alternativeJid} → ${currentJid}`)
+			
+			try {
+				// Copy session to new format
+				await storage.storeSession(currentAddr.toString(), alternativeSession)
+				
+				// Update LID mapping cache to reflect the type change
+				if (isLidContact) {
+					// Contact switched to LID - store the mapping
+					const pnJid = jidEncode(user, 's.whatsapp.net')
+					await lidMapping.storeLIDPNMapping(currentJid, pnJid)
+					console.log(`📝 Stored LID mapping: ${currentJid} ↔ ${pnJid}`)
+				} else {
+					// Contact switched to PN - update cache
+					lidMapping.invalidateContact(alternativeJid)
+					console.log(`🗑️ Invalidated old LID mapping for: ${alternativeJid}`)
+				}
+				
+				console.log(`✅ Session migrated successfully: ${alternativeJid} → ${currentJid}`)
+			} catch (error) {
+				console.error(`❌ Failed to migrate session: ${alternativeJid} → ${currentJid}`, error)
+			}
+		}
+		
+		return currentJid
+	}
+
+	/**
 	 * Migrate session from one address to another (for LID/PN compatibility)
 	 */
 	const migrateSession = async (fromJid: string, toJid: string): Promise<void> => {
@@ -183,8 +238,11 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			})
 		},
 		async decryptMessage({ jid, type, ciphertext }) {
+			// REACTIVE MIGRATION: Handle contact type changes on incoming messages
+			const migratedJid = await reactiveSessionMigration(jid)
+			
 			// Find the correct JID/session for decryption (handles LID/PN migration)
-			const decryptionJid = await findSessionForDecryption(jid)
+			const decryptionJid = await findSessionForDecryption(migratedJid)
 			const addr = jidToSignalProtocolAddress(decryptionJid)
 			const session = new libsignal.SessionCipher(storage, addr)
 
@@ -206,19 +264,29 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			})
 		},
 		async encryptMessage({ jid, data }) {
-			// SIMPLIFIED: Just use the JID provided by the caller
-			// No automatic LID conversion - if they want LID privacy, they should send to LID
-			const encryptionJid = jid
-			
-			// Skip extra processing for our own devices (performance optimization)
+			// Get user info for optimizations
 			const authCreds = (auth as any).creds || auth
 			const ownPhoneNumber = authCreds.me?.id?.split('@')[0]?.split(':')[0]
 			const targetUser = jidDecode(jid)?.user
 			
-			if (ownPhoneNumber === targetUser) {
-				console.log(`⚡ Fast path: Encrypting to own device (${jid})`)
+			let encryptionJid = jid
+			
+			// PRIMARY DEVICE OPTIMIZATION: Strip device ID to encrypt to primary device only
+			const decoded = jidDecode(jid)
+			if (decoded && decoded.device && ownPhoneNumber !== targetUser) {
+				// Convert multi-device JID to primary device (device 0)
+				const primaryJid = jidEncode(decoded.user, decoded.server as any)
+				console.log(`📱 Primary device optimization: ${jid} → ${primaryJid}`)
+				encryptionJid = primaryJid
+			}
+			
+			// REACTIVE SESSION MIGRATION: Handle contact type changes
+			if (ownPhoneNumber !== targetUser) {
+				// Perform reactive migration for external contacts
+				encryptionJid = await reactiveSessionMigration(encryptionJid)
+				console.log(`📤 Encrypting message to: ${encryptionJid}`)
 			} else {
-				console.log(`📤 Encrypting message to: ${jid}`)
+				console.log(`⚡ Fast path: Encrypting to own device (${encryptionJid})`)
 			}
 			
 			const addr = jidToSignalProtocolAddress(encryptionJid)
