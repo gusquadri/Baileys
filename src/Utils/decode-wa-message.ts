@@ -1,6 +1,6 @@
 import { Boom } from '@hapi/boom'
 import { proto } from '../../WAProto/index.js'
-import type { SignalRepository, WAMessage, WAMessageKey } from '../Types'
+import type { SignalRepository, WAMessage, WAMessageKey, AddressingMode } from '../Types'
 import {
 	areJidsSameUser,
 	type BinaryNode,
@@ -17,6 +17,32 @@ import type { ILogger } from './logger'
 
 export const NO_MESSAGE_FOUND_ERROR_TEXT = 'Message absent from node'
 export const MISSING_KEYS_ERROR_TEXT = 'Key used already or never filled'
+
+/**
+ * Extract addressing mode and alternative identities from message stanza
+ * Following whatsmeow's approach in message.go:79-92
+ */
+export const extractAddressingContext = (stanza: BinaryNode, _from: string, _participant?: string) => {
+	const addressingMode = (stanza.attrs.addressing_mode as AddressingMode) || 'pn'
+	let senderAlt: string | undefined
+	let recipientAlt: string | undefined
+	
+	if (addressingMode === 'lid') {
+		// Message is LID-addressed: sender is LID, extract corresponding PN
+		senderAlt = stanza.attrs.participant_pn || stanza.attrs.sender_pn
+		recipientAlt = stanza.attrs.recipient_pn
+	} else {
+		// Message is PN-addressed: sender is PN, extract corresponding LID
+		senderAlt = stanza.attrs.participant_lid || stanza.attrs.sender_lid
+		recipientAlt = stanza.attrs.recipient_lid
+	}
+	
+	return {
+		addressingMode,
+		senderAlt,
+		recipientAlt
+	}
+}
 
 export const NACK_REASONS = {
 	ParsingError: 487,
@@ -110,7 +136,7 @@ export function decodeMessageNode(stanza: BinaryNode, meId: string, meLid: strin
 		remoteJid: chatId,
 		fromMe,
 		id: msgId,
-		senderLid: stanza?.attrs?.sender_lid,
+		senderLid: stanza?.attrs?.sender_lid || stanza?.attrs?.peer_recipient_lid,
 		senderPn: stanza?.attrs?.sender_pn  || stanza?.attrs?.peer_recipient_pn,
 		participant,
 		participantPn: stanza?.attrs?.participant_pn,

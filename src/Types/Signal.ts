@@ -22,6 +22,9 @@ type DecryptSignalProtoOpts = {
 type EncryptMessageOpts = {
 	jid: string
 	data: Uint8Array
+	conversationContext?: {
+		preferredAddressingMode?: 'pn' | 'lid'
+	}
 }
 
 type EncryptGroupMessageOpts = {

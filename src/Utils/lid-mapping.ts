@@ -5,7 +5,7 @@ import {
     jidNormalizedUser, 
     isLidUser, 
     isJidUser,
-    jidEncode
+    jidDecode
 } from '../WABinary'
 import type { PrivacyTokenManager } from '../Signal/privacy-tokens'
 
@@ -48,10 +48,24 @@ export class LIDMappingStore {
                 try {
                     // Use transaction to prevent race conditions during fetch
                     return await this.keys.transaction(async () => {
-                        // Simple direct key lookup - Redis keys match our storage format
-                        const sessionKey = key.startsWith('lid-') 
-                            ? key.replace('lid-', '').replace('@lid', '').replace(':', '.') + '_1'
-                            : key.replace('@s.whatsapp.net', '').replace(':', '.')
+                        // Convert JID to Redis session key format (preserving device IDs)
+                        let sessionKey: string
+                        if (key.startsWith('lid-')) {
+                            // LID lookup: "lid-102765716062358:43@lid" → "102765716062358_1.43" 
+                            const lidJid = key.replace('lid-', '')
+                            const decoded = jidDecode(lidJid)
+                            if (!decoded) return undefined
+                            sessionKey = decoded.device 
+                                ? `${decoded.user}_1.${decoded.device}`
+                                : `${decoded.user}_1`
+                        } else {
+                            // PN lookup: "554391318447:43@s.whatsapp.net" → "554391318447.43"
+                            const decoded = jidDecode(key)
+                            if (!decoded) return undefined
+                            sessionKey = decoded.device 
+                                ? `${decoded.user}.${decoded.device}`
+                                : decoded.user
+                        }
                         
                         console.log(`🔍 fetchMethod: cache key="${key}" → Redis key="${sessionKey}"`)
                         
@@ -59,11 +73,22 @@ export class LIDMappingStore {
                         
                         console.log(`📦 Redis fetch result: ${value || 'NOT FOUND'}`)
                         
-                        // If found, convert back to JID format for cache
+                        // If found, convert back to JID format for cache  
                         if (value && typeof value === 'string') {
-                            const fullValue = key.startsWith('lid-')
-                                ? value.replace('.', ':') + '@s.whatsapp.net'  // LID->PN lookup
-                                : value.replace('_1', '').replace('.', ':') + '@lid'  // PN->LID lookup
+                            let fullValue: string
+                            if (key.startsWith('lid-')) {
+                                // LID->PN: "554391318447.43" → "554391318447:43@s.whatsapp.net"
+                                const parts = value.split('.')
+                                fullValue = parts.length > 1 
+                                    ? `${parts[0]}:${parts[1]}@s.whatsapp.net`
+                                    : `${parts[0]}@s.whatsapp.net`
+                            } else {
+                                // PN->LID: "102765716062358_1.43" → "102765716062358:43@lid"
+                                const parts = value.replace('_1', '').split('.')
+                                fullValue = parts.length > 1
+                                    ? `${parts[0]}:${parts[1]}@lid`
+                                    : `${parts[0]}@lid`
+                            }
                             
                             console.log(`✅ fetchMethod returning: ${fullValue}`)
                             return fullValue
@@ -118,20 +143,30 @@ export class LIDMappingStore {
             return
         }
 
-        const lidNormalized = jidNormalizedUser(lid)
-        const pnNormalized = jidNormalizedUser(pn)
+        // PRESERVE DEVICE IDs: Don't use jidNormalizedUser - it removes device info
+        // We need device-specific mappings since each device has separate sessions
+        const decoded = jidDecode(pn)
+        const lidDecoded = jidDecode(lid)
+        
+        if (!decoded || !lidDecoded) {
+            throw new Error(`Invalid JID format: PN=${pn}, LID=${lid}`)
+        }
 
-        // Convert to session-style format matching your Redis pattern
-        // PN: "554391318447@s.whatsapp.net" → "554391318447"
-        // LID: "102765716062358@lid" → "102765716062358_1"
-        const pnKey = pnNormalized.replace('@s.whatsapp.net', '').replace(':', '.')
-        const lidKey = lidNormalized.replace('@lid', '').replace(':', '.') + '_1'
+        // Convert to session-style format with device preservation
+        // PN: "554391318447:43@s.whatsapp.net" → "554391318447.43"
+        // LID: "102765716062358:43@lid" → "102765716062358_1.43"
+        const pnKey = decoded.device 
+            ? `${decoded.user}.${decoded.device}`
+            : decoded.user
+        const lidKey = lidDecoded.device
+            ? `${lidDecoded.user}_1.${lidDecoded.device}`  
+            : `${lidDecoded.user}_1`
 
         // Use transaction to ensure atomicity (like other Signal operations)
         try {
             console.log(`📝 Storing LID-PN mapping:`)
-            console.log(`  PN: ${pn} → ${pnNormalized} → Redis key: ${pnKey}`)
-            console.log(`  LID: ${lid} → ${lidNormalized} → Redis key: ${lidKey}`)
+            console.log(`  PN: ${pn} → Redis key: ${pnKey}`)
+            console.log(`  LID: ${lid} → Redis key: ${lidKey}`)
             
             await this.keys.transaction(async () => {
                 // CRITICAL: Invalidate any existing cache entries first
@@ -148,11 +183,11 @@ export class LIDMappingStore {
                 
                 console.log(`✅ Stored in Redis: ${pnKey} ↔ ${lidKey}`)
                 
-                // Update cache atomically after successful storage (use original normalized format)
-                this.cache.set(pnNormalized, lidNormalized)
-                this.cache.set(`lid-${lidNormalized}`, pnNormalized)
+                // Update cache atomically after successful storage (preserve device info)
+                this.cache.set(pn, lid)  // Store full JIDs with device IDs
+                this.cache.set(`lid-${lid}`, pn)
                 
-                console.log(`✅ Updated cache: ${pnNormalized} ↔ ${lidNormalized}`)
+                console.log(`✅ Updated cache: ${pn} ↔ ${lid}`)
                 
                 // Cross-reference privacy tokens if manager is available (following whatsmeow's approach)
                 if (this.privacyTokenManager) {
@@ -190,18 +225,17 @@ export class LIDMappingStore {
             return null
         }
         
-        const pnNormalized = jidNormalizedUser(pn)
-        
-        console.log(`🔍 Looking up LID for PN: ${pn} → ${pnNormalized}`)
+        // DON'T normalize - preserve device ID for device-specific session mapping
+        console.log(`🔍 Looking up LID for PN: ${pn} → ${pn}`)
         
         // Use transaction for consistent reads during concurrent writes
         return await this.keys.transaction(async () => {
             // Check cache first (without fetch to see what's actually cached)
-            const cachedResult = this.cache.get(pnNormalized)
-            console.log(`💾 Cache check for "${pnNormalized}": ${cachedResult || 'NOT IN CACHE'}`)
+            const cachedResult = this.cache.get(pn)
+            console.log(`💾 Cache check for "${pn}": ${cachedResult || 'NOT IN CACHE'}`)
             
             // LRU cache handles everything - fetch from storage if needed
-            const lid = await this.cache.fetch(pnNormalized)
+            const lid = await this.cache.fetch(pn)
             // fetchMethod already returns properly formatted JID, no need to encode again
             const result = lid || null
             
@@ -220,12 +254,12 @@ export class LIDMappingStore {
             return null
         }
         
-        const lidNormalized = jidNormalizedUser(lid)
+        // DON'T normalize - preserve device ID for device-specific session mapping
         
         // Use transaction for consistent reads during concurrent writes
         return await this.keys.transaction(async () => {
             // LRU cache handles everything - fetch from storage if needed
-            const pn = await this.cache.fetch(`lid-${lidNormalized}`)
+            const pn = await this.cache.fetch(`lid-${lid}`)  // Use full LID with device
             // fetchMethod already returns properly formatted JID, no need to encode again
             return pn || null
         })
@@ -241,12 +275,11 @@ export class LIDMappingStore {
             return null
         }
         
-        const pnNormalized = jidNormalizedUser(pn)
-        const cachedLid = this.cache.get(pnNormalized)
+        const cachedLid = this.cache.get(pn)  // Use full JID with device
         
         if (cachedLid) {
-            console.log(`⚡ Fast cache hit: ${pnNormalized} → ${cachedLid}`)
-            return jidEncode(cachedLid, 'lid')
+            console.log(`⚡ Fast cache hit: ${pn} → ${cachedLid}`)
+            return cachedLid  // Already in proper JID format
         }
         
         return null
@@ -291,19 +324,25 @@ export class LIDMappingStore {
     /**
      * Invalidate cache for a specific contact (when session updates)
      */
-    invalidateContact(pn: string) {
-        if (!isJidUser(pn)) return
+    invalidateContact(jid: string) {
+        if (!isJidUser(jid) && !isLidUser(jid)) return
         
-        const pnNormalized = jidNormalizedUser(pn)
-        const cachedLid = this.cache.get(pnNormalized)
+        // Don't normalize - preserve device IDs for cache invalidation
+        const cachedValue = this.cache.get(jid)
         
         // Remove both directions from cache
-        this.cache.delete(pnNormalized)
-        if (cachedLid) {
-            this.cache.delete(`lid-${cachedLid}`)
+        this.cache.delete(jid)
+        if (cachedValue) {
+            if (isJidUser(jid)) {
+                // PN->LID mapping, remove reverse LID->PN
+                this.cache.delete(`lid-${cachedValue}`)
+            } else {
+                // LID->PN mapping, remove reverse PN->LID  
+                this.cache.delete(cachedValue)
+            }
         }
         
-        console.log(`🗑️ Invalidated cache for: ${pnNormalized}`)
+        console.log(`🗑️ Invalidated cache for: ${jid}`)
     }
     
     /**
@@ -312,14 +351,13 @@ export class LIDMappingStore {
     invalidateMapping(lid: string, pn: string) {
         if (!isLidUser(lid) || !isJidUser(pn)) return
         
-        const lidNormalized = jidNormalizedUser(lid)
-        const pnNormalized = jidNormalizedUser(pn)
+        // Don't normalize - preserve device IDs for cache invalidation
         
         // Remove both directions from cache
-        this.cache.delete(pnNormalized)
-        this.cache.delete(`lid-${lidNormalized}`)
+        this.cache.delete(pn)
+        this.cache.delete(`lid-${lid}`)
         
-        console.log(`🗑️ Invalidated bidirectional cache: ${pnNormalized} ↔ ${lidNormalized}`)
+        console.log(`🗑️ Invalidated bidirectional cache: ${pn} ↔ ${lid}`)
     }
     
     /**

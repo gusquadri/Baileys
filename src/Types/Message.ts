@@ -9,6 +9,20 @@ import type { CacheStore } from './Socket'
 
 // export the WAMessage Prototypes
 export { proto as WAProto }
+
+export type AddressingMode = 'pn' | 'lid'
+
+// MessageSource contains basic sender and chat information about a message
+export interface MessageSource {
+	chat: string      // The chat where the message was sent
+	sender: string    // The user who sent the message  
+	isFromMe: boolean // Whether the message was sent by the current user
+	isGroup: boolean  // Whether the chat is a group chat or broadcast list
+	
+	addressingMode?: AddressingMode // The addressing mode of the message (phone number or LID)
+	senderAlt?: string              // The alternative address of the user who sent the message
+	recipientAlt?: string           // The alternative address of the recipient (for DMs)
+}
 export type WAMessage = proto.IWebMessageInfo & { key: WAMessageKey }
 export type WAMessageContent = proto.IMessage
 export type WAContactMessage = proto.Message.IContactMessage

@@ -22,6 +22,7 @@ import {
 	decodeMediaRetryNode,
 	decodeMessageNode,
 	decryptMessageNode,
+	extractAddressingContext,
 	delay,
 	derivePairingCodeKey,
 	encodeBigEndian,
@@ -56,6 +57,7 @@ import {
 } from '../WABinary'
 import { extractGroupMetadata } from './groups'
 import { makeMessagesSocket } from './messages-send'
+import { ConversationContextManager } from '../Utils/conversation-context'
 
 export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	const { logger, retryRequestDelayMs, maxMsgRetryCount, shouldIgnoreJid } = config
@@ -90,6 +92,9 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		})
 
 	// Privacy token manager is accessed via signalRepository when needed
+	
+	// Initialize conversation context manager for addressing mode tracking
+	const conversationContextManager = new ConversationContextManager(authState.keys)
 
 	const callOfferCache =
 		config.callOfferCache ||
@@ -968,6 +973,35 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			decrypt
 		} = decryptMessageNode(node, authState.creds.me!.id, authState.creds.me!.lid || '', signalRepository, logger)
 
+		// Extract and store addressing context from incoming message (following whatsmeow's approach)
+		if (msg && author && !msg.key.fromMe) {
+			try {
+				const { addressingMode } = extractAddressingContext(node, node.attrs.from!, node.attrs.participant)
+				
+				// Update conversation context with the addressing mode the sender is using
+				await conversationContextManager.updateFromIncomingMessage(
+					author,
+					addressingMode,
+					msg.messageTimestamp as number
+				)
+				
+				// Also store LID-PN mappings if present (enhanced from existing logic)
+				if (addressingMode === 'lid' && node.attrs.participant_pn) {
+					// Sender is using LID, participant_pn contains the PN mapping
+					signalRepository.storeLIDPNMapping(author, node.attrs.participant_pn)
+					// Migrate sessions following whatsmeow's approach (message.go:288)
+					await signalRepository.migrateSession(node.attrs.participant_pn, author)
+				} else if (addressingMode === 'pn' && node.attrs.participant_lid) {
+					// Sender is using PN, participant_lid contains the LID mapping
+					signalRepository.storeLIDPNMapping(node.attrs.participant_lid, author)
+					// Migrate sessions following whatsmeow's approach  
+					await signalRepository.migrateSession(author, node.attrs.participant_lid)
+				}
+			} catch (error) {
+				logger.warn({ error, author }, 'Failed to extract addressing context from message')
+			}
+		}
+
 		if (response && msg?.messageStubParameters?.[0] === NO_MESSAGE_FOUND_ERROR_TEXT) {
 			msg.messageStubParameters = [NO_MESSAGE_FOUND_ERROR_TEXT, response]
 		}
@@ -1522,6 +1556,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		sendRetryRequest,
 		rejectCall,
 		fetchMessageHistory,
-		requestPlaceholderResend
+		requestPlaceholderResend,
+		conversationContextManager
 	}
 }

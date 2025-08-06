@@ -59,6 +59,7 @@ import { PrivacyTokenUtils } from '../Signal/privacy-tokens'
 import { makeGroupsSocket } from './groups'
 import type { NewsletterSocket } from './newsletter'
 import { makeNewsletterSocket } from './newsletter'
+import { ConversationContextManager } from '../Utils/conversation-context'
 
 export const makeMessagesSocket = (config: SocketConfig) => {
 	const {
@@ -86,6 +87,9 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 	// Initialize built-in message cache (replaces external getMessage)
 	const messageCache = new MessageCache(logger, messageCacheConfig)
+	
+	// Initialize conversation context manager for addressing mode tracking
+	const conversationContextManager = new ConversationContextManager(authState.keys)
 
 	// Helper function to get privacy token with LID-PN cross-referencing (enhanced from whatsmeow)
 	const getPrivacyToken = async (jid: string): Promise<Buffer | null> => {
@@ -374,7 +378,15 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				}
 
 				const bytes = encodeWAMessage(patchedMessage)
-				const { type, ciphertext } = await signalRepository.encryptMessage({ jid, data: bytes })
+				
+				// Get conversation context for addressing mode
+				const conversationContext = await conversationContextManager.getContext(jid)
+				
+				const { type, ciphertext } = await signalRepository.encryptMessage({ 
+					jid, 
+					data: bytes,
+					conversationContext: conversationContext || undefined
+				})
 				if (type === 'pkmsg') {
 					shouldIncludeDeviceIdentity = true
 				}
@@ -675,11 +687,21 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				logger.debug({ msgId, to: destinationJid }, 'included privacy token in message')
 			}
 
+			// Add addressing mode attribute following whatsmeow's approach (send.go:1091)
+			const conversationContext = await conversationContextManager.getContext(destinationJid)
+			const addressingModeAttrs: Record<string, string> = {}
+			if (conversationContext?.preferredAddressingMode) {
+				addressingModeAttrs.addressing_mode = conversationContext.preferredAddressingMode
+				logger.debug({ msgId, addressingMode: conversationContext.preferredAddressingMode }, 'adding addressing_mode to outgoing message')
+			}
+
 			const stanza: BinaryNode = {
 				tag: 'message',
 				attrs: {
 					id: msgId,
+					to: destinationJid,
 					type: getMessageType(message),
+					...addressingModeAttrs,
 					...(additionalAttributes || {})
 				},
 				content: binaryNodeContent

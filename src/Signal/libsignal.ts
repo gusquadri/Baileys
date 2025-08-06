@@ -3,7 +3,7 @@ import * as libsignal from 'libsignal'
 import type { SignalAuthState, SignalKeyStoreWithTransaction } from '../Types'
 import type { SignalRepository } from '../Types/Signal'
 import { generateSignalPubKey } from '../Utils'
-import { jidDecode, jidEncode } from '../WABinary'
+import { jidDecode } from '../WABinary'
 import { LIDMappingStore } from '../Utils/lid-mapping'
 import { PrivacyTokenManager } from './privacy-tokens'
 import type { SenderKeyStore } from './Group/group_cipher'
@@ -131,26 +131,17 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 		
 		// If it's a phone number (and not our own), check for LID mapping
 		if (LIDMappingStore.isPN(jid)) {
-			// Extract device ID from original JID to preserve it
-			const decoded = jidDecode(jid)
-			const device = decoded?.device
+			// Use full JID (with device) for device-specific mapping
 			
-			// Use base JID (without device) for LID mapping lookup
-			const baseJid = jidEncode(decoded!.user, 's.whatsapp.net')
-			console.log(`🔍 LID mapping lookup for external contact: ${baseJid}`)
+			// Use full JID (with device) for device-specific LID mapping lookup
+			console.log(`🔍 LID mapping lookup for external contact: ${jid}`)
 			
-			const lidForPN = await lidMapping.getLIDForPN(baseJid)
+			const lidForPN = await lidMapping.getLIDForPN(jid)
 			if (lidForPN) {
-				// Reconstruct LID with same device ID
-				const lidDecoded = jidDecode(lidForPN)
-				let lidWithDevice = lidForPN
+				// Mapping already returns the device-specific LID
+				const lidWithDevice = lidForPN
 				
-				// If original JID had a device ID, apply it to LID
-				if (device && lidDecoded) {
-					lidWithDevice = jidEncode(lidDecoded.user, 'lid', device)
-				}
-				
-				console.log(`✅ Found LID mapping: ${baseJid} → ${lidWithDevice}`)
+				console.log(`✅ Found LID mapping: ${jid} → ${lidWithDevice}`)
 				
 				const lidAddr = jidToSignalProtocolAddress(lidWithDevice)
 				const lidSession = await storage.loadSession(lidAddr.toString())
@@ -160,28 +151,17 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 					return lidWithDevice // Use LID for this decryption
 				}
 			} else {
-				console.log(`❌ No LID mapping found for: ${baseJid}`)
+				console.log(`❌ No LID mapping found for: ${jid}`)
 			}
 		}
 		
 		// If it's a LID, check for PN mapping
 		if (LIDMappingStore.isLID(jid)) {
-			// Extract device ID from original JID to preserve it
-			const decoded = jidDecode(jid)
-			const device = decoded?.device
-			
-			// Use base JID (without device) for PN mapping lookup
-			const baseJid = jidEncode(decoded!.user, 'lid')
-			const pnForLID = await lidMapping.getPNForLID(baseJid)
+			// Use full JID (with device) for device-specific PN mapping lookup
+			const pnForLID = await lidMapping.getPNForLID(jid)
 			if (pnForLID) {
-				// Reconstruct PN with same device ID
-				const pnDecoded = jidDecode(pnForLID)
-				let pnWithDevice = pnForLID
-				
-				// If original JID had a device ID, apply it to PN
-				if (device && pnDecoded) {
-					pnWithDevice = jidEncode(pnDecoded.user, 's.whatsapp.net', device)
-				}
+				// Mapping already returns the device-specific PN
+				const pnWithDevice = pnForLID
 				
 				const pnAddr = jidToSignalProtocolAddress(pnWithDevice)
 				const pnSession = await storage.loadSession(pnAddr.toString())
@@ -258,57 +238,74 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 				return result
 			})
 		},
-		async encryptMessage({ jid, data }) {
-			// Get user info for optimizations
+		async encryptMessage({ jid, data, conversationContext }) {
+			// Get user info for optimizations  
 			const authCreds = (auth as any).creds || auth
 			const ownPhoneNumber = authCreds.me?.id?.split('@')[0]?.split(':')[0]
 			const targetUser = jidDecode(jid)?.user
 			
 			let encryptionJid = jid
 			
-			// SMART ADDRESS HANDLING: Handle both LID and PN inputs
-			// Extract device ID from original JID to preserve it
-			const decoded = jidDecode(jid)
-			const device = decoded?.device
+			// CONTEXT-AWARE ADDRESS HANDLING: Follow whatsmeow's approach
+			// Use the addressing mode from conversation context first
 			
-			// Check if input is already a LID or if it's a PN
-			if (LIDMappingStore.isLID(jid)) {
-				// Input is already a LID - use it directly
-				console.log(`📤 Input is already LID, using directly: ${encryptionJid}`)
-			} else if (LIDMappingStore.isPN(jid)) {
-				// Input is PN - look up LID mapping and prefer LID if available
-				const baseJid = jidEncode(decoded!.user, 's.whatsapp.net')
-				console.log(`🔍 LID mapping lookup for PN encryption: ${baseJid}`)
+			if (conversationContext?.preferredAddressingMode) {
+				console.log(`🎯 Using conversation context addressing mode: ${conversationContext.preferredAddressingMode}`)
 				
-				const lidForPN = await lidMapping.getLIDForPN(baseJid)
-				if (lidForPN) {
-					// Reconstruct LID with same device ID to preserve device-specific sessions
-					const lidDecoded = jidDecode(lidForPN)
-					let lidWithDevice = lidForPN
-					
-					// If original JID had a device ID, apply it to LID
-					if (device && lidDecoded) {
-						lidWithDevice = jidEncode(lidDecoded.user, 'lid', device)
-					}
-					
-					console.log(`✅ Found LID mapping: ${baseJid} → ${lidWithDevice}`)
-					
-					// Check if we have an active LID session with preserved device ID
-					const lidAddr = jidToSignalProtocolAddress(lidWithDevice)
-					const lidSession = await storage.loadSession(lidAddr.toString())
-					
-					if (lidSession && lidSession.haveOpenSession()) {
-						encryptionJid = lidWithDevice
-						console.log(`📤 Using established LID session: ${encryptionJid}`)
-					} else {
-						console.log(`📤 LID mapping exists but no session, using PN: ${encryptionJid}`)
+				if (conversationContext.preferredAddressingMode === 'lid') {
+					// Try to use LID if conversation context indicates it
+					if (LIDMappingStore.isPN(jid)) {
+						const lidForPN = await lidMapping.getLIDForPN(jid)
+						if (lidForPN) {
+							// Migrate sessions following whatsmeow's approach (send.go:1183)
+							await migrateSession(jid, lidForPN)
+							encryptionJid = lidForPN
+							console.log(`📤 Using LID per conversation context: ${encryptionJid}`)
+						}
 					}
 				} else {
-					console.log(`📤 No LID mapping found, using PN: ${encryptionJid}`)
+					// Conversation context indicates PN - stick with PN even if LID exists
+					if (LIDMappingStore.isLID(jid)) {
+						// Convert LID back to PN if we have the mapping
+						const pnForLID = await lidMapping.getPNForLID(jid)
+						if (pnForLID) {
+							encryptionJid = pnForLID
+							console.log(`📤 Using PN per conversation context: ${encryptionJid}`)
+						}
+					}
 				}
 			} else {
-				// Neither LID nor PN - use as-is
-				console.log(`📤 Unknown JID format, using as-is: ${encryptionJid}`)
+				// FALLBACK: No conversation context - use session availability logic
+				console.log(`🔍 No conversation context, checking session availability`)
+				
+				if (LIDMappingStore.isLID(jid)) {
+					// Input is already a LID - use it directly
+					console.log(`📤 Input is already LID, using directly: ${encryptionJid}`)
+				} else if (LIDMappingStore.isPN(jid)) {
+					// Input is PN - check if LID session exists but don't prioritize it
+					const lidForPN = await lidMapping.getLIDForPN(jid)
+					if (lidForPN) {
+						const lidAddr = jidToSignalProtocolAddress(lidForPN)
+						const lidSession = await storage.loadSession(lidAddr.toString())
+						const pnAddr = jidToSignalProtocolAddress(jid)
+						const pnSession = await storage.loadSession(pnAddr.toString())
+						
+						// Only use LID if PN session doesn't exist but LID session does
+						if (!pnSession?.haveOpenSession() && lidSession?.haveOpenSession()) {
+							// Migrate sessions following whatsmeow's approach
+							await migrateSession(jid, lidForPN)
+							encryptionJid = lidForPN
+							console.log(`📤 Using LID due to session availability: ${encryptionJid}`)
+						} else {
+							console.log(`📤 Using PN (original): ${encryptionJid}`)
+						}
+					} else {
+						console.log(`📤 No LID mapping found, using PN: ${encryptionJid}`)
+					}
+				} else {
+					// Neither LID nor PN - use as-is
+					console.log(`📤 Unknown JID format, using as-is: ${encryptionJid}`)
+				}
 			}
 			
 			const addr = jidToSignalProtocolAddress(encryptionJid)
