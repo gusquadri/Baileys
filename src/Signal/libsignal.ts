@@ -445,33 +445,13 @@ function signalStorage({ creds, keys }: SignalAuthState, lidMappingStore: LIDMap
 		storeSession: async (id: string, session: any) => {
 			await keys.set({ session: { [id]: session.serialize() } })
 			
-			// CRITICAL: Invalidate LID mapping cache when session is updated
-			// This prevents using outdated cached sessions after new keys are received
-			try {
-				console.log(`🗑️ Session stored: ${id} - invalidating LID cache`)
-				
-				// Extract JID from session ID and invalidate only the relevant contact
-				const sessionParts = id.split('.')
-				if (sessionParts.length >= 1 && sessionParts[0]) {
-					const baseId = sessionParts[0]
-					
-					// Convert session ID back to JID and invalidate
-					if (baseId.includes('_1')) {
-						// LID session format: "102765716062358_1" → "102765716062358@lid"
-						const lidUser = baseId.replace('_1', '')
-						const lidJid = `${lidUser}@lid`
-						lidMappingStore.invalidateContact(lidJid)
-						console.log(`🗑️ Invalidated LID cache for: ${lidJid}`)
-					} else {
-						// Regular PN session format: "554391318447" → "554391318447@s.whatsapp.net"  
-						const pnJid = `${baseId}@s.whatsapp.net`
-						lidMappingStore.invalidateContact(pnJid)
-						console.log(`🗑️ Invalidated PN cache for: ${pnJid}`)
-					}
-				}
-			} catch (error) {
-				console.warn('Failed to invalidate LID mapping cache:', error)
-			}
+			// NOTE: LID cache invalidation removed - LID mappings are identity relationships,
+			// not session keys. They don't change when cryptographic sessions are updated.
+			// LID cache should only be invalidated when:
+			// 1. Server sends LID migration notification  
+			// 2. Manual cache cleanup/maintenance
+			// 3. Contact deletion
+			console.log(`💾 Session stored: ${id}`)
 		},
 		isTrustedIdentity: async (_address: string, _identityKey: Buffer) => {
 			return true
