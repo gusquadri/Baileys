@@ -103,79 +103,6 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 		}
 	}
 
-	/**
-	 * Find and migrate LID sessions for decryption
-	 */
-	const findSessionForDecryption = async (jid: string): Promise<string> => {
-		const addr = jidToSignalProtocolAddress(jid)
-		const addrStr = addr.toString()
-		
-		// First try the provided JID
-		const existingSession = await storage.loadSession(addrStr)
-		if (existingSession && existingSession.haveOpenSession()) {
-			console.log(`✅ Session found and active for ${jid}`)
-			return jid
-		}
-		
-		// Check if this is our own device - skip LID mapping for performance
-		// Note: auth.creds here is SignalCreds, but we need to get the full AuthenticationCreds
-		// For now, we'll check if the auth object has the me property through type assertion
-		const authCreds = (auth as any).creds || auth
-		const ownPhoneNumber = authCreds.me?.id?.split('@')[0]?.split(':')[0]
-		const incomingUser = jidDecode(jid)?.user
-		
-		if (ownPhoneNumber && incomingUser === ownPhoneNumber) {
-			console.log(`⚡ Fast path: Own device detected (${jid}), skipping LID lookup`)
-			return jid // Return original JID - no LID mapping needed for own devices
-		}
-		
-		// If it's a phone number (and not our own), check for LID mapping
-		if (LIDMappingStore.isPN(jid)) {
-			// Use full JID (with device) for device-specific mapping
-			
-			// Use full JID (with device) for device-specific LID mapping lookup
-			console.log(`🔍 LID mapping lookup for external contact: ${jid}`)
-			
-			const lidForPN = await lidMapping.getLIDForPN(jid)
-			if (lidForPN) {
-				// Mapping already returns the device-specific LID
-				const lidWithDevice = lidForPN
-				
-				console.log(`✅ Found LID mapping: ${jid} → ${lidWithDevice}`)
-				
-				const lidAddr = jidToSignalProtocolAddress(lidWithDevice)
-				const lidSession = await storage.loadSession(lidAddr.toString())
-				if (lidSession && lidSession.haveOpenSession()) {
-					// Migrate session from LID to PN for future use
-					await migrateSession(lidWithDevice, jid)
-					return lidWithDevice // Use LID for this decryption
-				}
-			} else {
-				console.log(`❌ No LID mapping found for: ${jid}`)
-			}
-		}
-		
-		// If it's a LID, check for PN mapping
-		if (LIDMappingStore.isLID(jid)) {
-			// Use full JID (with device) for device-specific PN mapping lookup
-			const pnForLID = await lidMapping.getPNForLID(jid)
-			if (pnForLID) {
-				// Mapping already returns the device-specific PN
-				const pnWithDevice = pnForLID
-				
-				const pnAddr = jidToSignalProtocolAddress(pnWithDevice)
-				const pnSession = await storage.loadSession(pnAddr.toString())
-				if (pnSession && pnSession.haveOpenSession()) {
-					// Migrate session from PN to LID for future use
-					await migrateSession(pnWithDevice, jid)
-					return pnWithDevice // Use PN for this decryption
-				}
-			}
-		}
-		
-		// No session found, return original JID
-		return jid
-	}
 
 	return {
 		decryptGroupMessage({ group, authorJid, msg }) {
@@ -236,36 +163,31 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			})
 		},
 		async encryptMessage({ jid, data }) {
-			// CONSERVATIVE APPROACH: Only use LID-PN mapping for PN addresses
-			// Don't try to use LID when directly sending to LID addresses
+			// WHATSMEOW EXACT LOGIC: Always prefer LID when available
 			let encryptionJid = jid
 			
-			if (LIDMappingStore.isPN(jid)) {
-				// whatsmeow send.go:996 - Try to get LID for PN
+			// OWN DEVICE OPTIMIZATION: Skip LID lookup for our own devices to prevent session corruption
+			const authCreds = (auth as any).creds || auth
+			const ownPhoneNumber = authCreds.me?.id?.split('@')[0]?.split(':')[0]
+			const targetUser = jidDecode(jid)?.user
+			
+			if (ownPhoneNumber && targetUser === ownPhoneNumber) {
+				console.log(`⚡ Own device optimization: Skipping LID lookup for ${jid} (own device)`)
+				// Use the provided address directly - don't convert to LID
+				encryptionJid = jid
+			} else if (LIDMappingStore.isPN(jid)) {
+				// whatsmeow send.go:996 - Always try to get LID for PN (external contacts only)
 				try {
 					const lidForPN = await lidMapping.getLIDForPN(jid)
 					if (lidForPN) {
-						console.log(`🔄 Found LID for PN: ${jid} → ${lidForPN}`)
-						
-						// Check if we have a working session for the LID first
-						const lidAddr = jidToSignalProtocolAddress(lidForPN)
-						const lidSession = await storage.loadSession(lidAddr.toString())
-						
-						if (lidSession && lidSession.haveOpenSession()) {
-							console.log(`✅ LID session exists, using LID for encryption`)
-							encryptionJid = lidForPN
-							// Migrate session for consistency
-							await migrateSession(jid, lidForPN)
-						} else {
-							console.log(`⚠️ LID session not found, using original PN`)
-						}
+						console.log(`🔄 whatsmeow pattern: Found LID for PN: ${jid} → ${lidForPN}`)
+						encryptionJid = lidForPN
+						// Proactive migration (whatsmeow pattern)
+						await migrateSession(jid, lidForPN)
 					}
 				} catch (error) {
 					console.warn(`⚠️ LID lookup failed for ${jid}, using PN`)
 				}
-			} else if (LIDMappingStore.isLID(jid)) {
-				// Direct LID address - use as-is, no conversion
-				console.log(`📤 Direct LID address, using as-is: ${encryptionJid}`)
 			}
 			
 			console.log(`📤 Final encryption identity: ${encryptionJid}`)
@@ -274,11 +196,11 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			
 			// Use transaction to ensure atomicity (Baileys pattern)
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
-				// BAILEYS SESSION MANAGEMENT: Verify session availability before encryption
+				// SESSION VALIDATION: Check session health before encryption
 				const targetSession = await storage.loadSession(addr.toString())
 				
 				if (!targetSession || !targetSession.haveOpenSession()) {
-					console.log(`⚠️ No session at ${encryptionJid}`)
+					console.log(`⚠️ No active session at ${encryptionJid}`)
 					
 					// BAILEYS FALLBACK PATTERN: Look for alternate session only if needed
 					if (encryptionJid !== jid) {
@@ -290,6 +212,19 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 							console.log(`✅ Found session at original address, migrating: ${jid} → ${encryptionJid}`)
 							await migrateSession(jid, encryptionJid)
 						}
+					}
+				} else {
+					// Session exists - validate it's not corrupted
+					console.log(`✅ Active session found for ${encryptionJid}`)
+					
+					// Additional validation: check if session has proper sessions data
+					try {
+						const sessions = (targetSession as any).sessions
+						if (!sessions || sessions.length === 0) {
+							console.warn(`⚠️ Session missing session data for ${encryptionJid}`)
+						}
+					} catch (validationError) {
+						console.warn(`⚠️ Session validation failed for ${encryptionJid}:`, validationError)
 					}
 				}
 				
