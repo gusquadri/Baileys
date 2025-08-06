@@ -275,33 +275,9 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 
 			// Use transaction to ensure atomicity
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
-				try {
 					const { type: sigType, body } = await cipher.encrypt(data)
 					const type = sigType === 3 ? 'pkmsg' : 'msg'
 					return { type, ciphertext: Buffer.from(body as any, 'binary') }
-				} catch (error: any) {
-					// Handle assertion failures and corrupted sessions
-					if (error.message?.includes('Assertion failed') || error.message?.includes('serialize')) {
-						console.error(`⚠️ Session corruption detected for ${encryptionJid}, clearing session`)
-						
-						// Clear the corrupted session
-						const addrStr = addr.toString()
-						await storage.storeSession(addrStr, null)
-						
-						// Clear cache to force fresh session establishment
-						if (LIDMappingStore.isLID(encryptionJid)) {
-							lidMapping.invalidateContact(encryptionJid)
-						} else if (LIDMappingStore.isPN(encryptionJid)) {
-							lidMapping.invalidateContact(encryptionJid)
-						}
-						
-						// Throw a more descriptive error
-						throw new Error(`Session corrupted for ${encryptionJid}. Please retry - a new session will be established.`)
-					}
-					
-					// Re-throw other errors
-					throw error
-				}
 			})
 		},
 		async encryptGroupMessage({ group, meId, data }) {
