@@ -35,7 +35,6 @@ import {
 	unixTimestampSeconds
 } from '../Utils'
 import { getUrlInfo } from '../Utils/link-preview'
-import { getMessageSenderJid } from '../Utils/sender-identity'
 import {
 	areJidsSameUser,
 	type BinaryNode,
@@ -296,35 +295,59 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			const sessions = await authState.keys.get('session', addrs)
 			for (const jid of jids) {
 				const signalId = signalRepository.jidToSignalProtocolAddress(jid)
-				if (!sessions[signalId]) {
+				const session = sessions[signalId]
+				
+				// ENHANCED VALIDATION: Session health check (following whatsmeow)
+				if (!session) {
 					jidsRequiringFetch.push(jid)
+					logger.debug({ jid }, 'session missing - will fetch')
+				} else {
+					try {
+						// Validate session can be deserialized and has open session
+						const sessionRecord = require('libsignal').SessionRecord.deserialize(session)
+						if (!sessionRecord.haveOpenSession()) {
+							jidsRequiringFetch.push(jid)
+							logger.debug({ jid }, 'session closed - will refresh')
+						}
+					} catch (sessionError) {
+						// Session corruption detected
+						jidsRequiringFetch.push(jid)
+						logger.warn({ jid, sessionError }, 'session corrupted - will refresh')
+					}
 				}
 			}
 		}
 
 		if (jidsRequiringFetch.length) {
 			logger.debug({ jidsRequiringFetch }, 'fetching sessions')
-			const result = await query({
-				tag: 'iq',
-				attrs: {
-					xmlns: 'encrypt',
-					type: 'get',
-					to: S_WHATSAPP_NET
-				},
-				content: [
-					{
-						tag: 'key',
-						attrs: {},
-						content: jidsRequiringFetch.map(jid => ({
-							tag: 'user',
-							attrs: { jid }
-						}))
-					}
-				]
-			})
-			await parseAndInjectE2ESessions(result, signalRepository)
-
-			didFetchNewSession = true
+			
+			try {
+				const result = await query({
+					tag: 'iq',
+					attrs: {
+						xmlns: 'encrypt',
+						type: 'get',
+						to: S_WHATSAPP_NET
+					},
+					content: [
+						{
+							tag: 'key',
+							attrs: {},
+							content: jidsRequiringFetch.map(jid => ({
+								tag: 'user',
+								attrs: { jid }
+							}))
+						}
+					]
+				})
+				await parseAndInjectE2ESessions(result, signalRepository)
+				didFetchNewSession = true
+				logger.debug({ count: jidsRequiringFetch.length }, 'successfully fetched and injected new sessions')
+			} catch (sessionFetchError) {
+				logger.error({ jidsRequiringFetch, sessionFetchError }, 'failed to fetch sessions - message may fail')
+				// Don't throw here - let the encryption attempt proceed and fail gracefully
+				// This allows for better error messages at the message level
+			}
 		}
 
 		return didFetchNewSession
@@ -413,6 +436,11 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			statusJidList
 		}: MessageRelayOptions
 	) => {
+		// CRITICAL VALIDATION: Pre-send connection state validation (following whatsmeow)
+		if (!sock.ws?.isOpen) {
+			throw new Boom('Connection not established - websocket closed', { statusCode: 503 })
+		}
+		
 		const meId = authState.creds.me!.id
 
 		let shouldIncludeDeviceIdentity = false
@@ -431,13 +459,9 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		const participants: BinaryNode[] = []
 		const destinationJid = !isStatus ? jidEncode(user, isLid ? 'lid' : isGroup ? 'g.us' : 's.whatsapp.net') : statusJid
 		
-		// WHATSAPP SENDER IDENTITY: Determine correct sender JID based on recipient
-		// This ensures consistent sender identity to prevent chat separation
-		const senderJid = !isStatus && !isGroup ? getMessageSenderJid(destinationJid, authState.creds) : meId
-		
-		if (!isStatus && !isGroup && senderJid !== meId) {
-			logger.debug({ destinationJid, senderJid, meId }, 'using LID sender identity for recipient')
-		}
+		// WHATSAPP SENDER IDENTITY: Always use consistent sender identity to prevent chat duplication
+		// LID/PN addressing is handled at encryption level, not at message stanza level
+		const senderJid = meId
 
 		// PRIVACY TOKENS: Get privacy token for recipient (following whatsmeow approach)
 		const privacyToken = !isGroup && !isStatus ? await getPrivacyToken(destinationJid) : null
@@ -558,6 +582,12 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					}
 
 					const additionalDevices = await getUSyncDevices(participantsList, !!useUserDevicesCache, false)
+					
+					// CRITICAL VALIDATION: Ensure we have valid devices for group message (following whatsmeow)
+					if (!participant && additionalDevices.length === 0 && participantsList.length > 0) {
+						logger.warn({ participantsList: participantsList.length }, 'no valid devices found for group participants - message may fail')
+					}
+					
 					devices.push(...additionalDevices)
 				}
 
@@ -625,6 +655,12 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 					if (additionalAttributes?.['category'] !== 'peer') {
 						const additionalDevices = await getUSyncDevices([meId, jid], !!useUserDevicesCache, true)
+						
+						// CRITICAL VALIDATION: Ensure we have valid devices for direct message (following whatsmeow)
+						if (additionalDevices.length === 0) {
+							logger.warn({ meId, targetJid: jid }, 'no additional devices found - message will only send to primary devices')
+						}
+						
 						devices.push(...additionalDevices)
 					}
 				}
@@ -647,6 +683,13 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 					allJids.push(jid)
 				}
+
+				// CRITICAL VALIDATION: Ensure we have devices to encrypt to (following whatsmeow)
+				if (allJids.length === 0) {
+					throw new Boom(`No valid devices found for message delivery to ${jid}`, { statusCode: 404 })
+				}
+				
+				logger.debug({ deviceCount: allJids.length, devices: allJids }, 'encrypting message to devices')
 
 				await assertSessions(allJids, false)
 
@@ -757,7 +800,23 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 			logger.debug({ msgId }, `sending message to ${participants.length} devices`)
 
-			await sendNode(stanza)
+			// CRITICAL: Message-level timeout handling (following whatsmeow approach)
+			const MESSAGE_SEND_TIMEOUT = 30000 // 30 seconds
+			const timeoutPromise = new Promise<never>((_, reject) => {
+				setTimeout(() => {
+					reject(new Boom(`Message send timeout after ${MESSAGE_SEND_TIMEOUT}ms for ${msgId}`, { statusCode: 408 }))
+				}, MESSAGE_SEND_TIMEOUT)
+			})
+
+			try {
+				await Promise.race([
+					sendNode(stanza),
+					timeoutPromise
+				])
+			} catch (error: any) {
+				logger.error({ msgId, jid, error: error.message }, 'failed to send message stanza')
+				throw error
+			}
 		})
 
 		return msgId
