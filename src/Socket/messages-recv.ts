@@ -168,16 +168,67 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		const { key: msgKey } = fullMessage
 		const msgId = msgKey.id!
 
-		const key = `${msgId}:${msgKey?.participant}`
-		let retryCount = msgRetryCache.get<number>(key) || 0
+		const originalKey = `${msgId}:${msgKey?.participant}`
+		let retryCount = msgRetryCache.get<number>(originalKey) || 0
+		let alternativeRetryAttempted = false
+		
+		// SMART LID/PN RETRY LOGIC - Try alternative addressing after 2 failed attempts  
+		if (retryCount >= 2 && msgKey?.participant) {
+			const lidStore = signalRepository.getLIDMappingStore()
+			
+			if (msgKey.participant.includes('@s.whatsapp.net')) {
+				// Current participant is PN, try LID alternative
+				const lid = lidStore.getFromCache(msgKey.participant) // Use fast cache lookup
+				if (lid) {
+					const alternativeKey = `${msgId}:${lid}`
+					const altRetryCount = msgRetryCache.get<number>(alternativeKey) || 0
+					if (altRetryCount < 2) {
+						logger.info({ 
+							msgId, 
+							originalParticipant: msgKey.participant, 
+							lidParticipant: lid,
+							attempt: altRetryCount + 1
+						}, 'smart retry: attempting with LID addressing')
+						msgKey.participant = lid
+						retryCount = altRetryCount
+						alternativeRetryAttempted = true
+					}
+				}
+			} else if (msgKey.participant.includes('@lid')) {
+				// Current participant is LID, try PN alternative  
+				const pn = await lidStore.getPNForLID(msgKey.participant)
+				if (pn) {
+					const alternativeKey = `${msgId}:${pn}`
+					const altRetryCount = msgRetryCache.get<number>(alternativeKey) || 0
+					if (altRetryCount < 2) {
+						logger.info({
+							msgId,
+							originalParticipant: msgKey.participant,
+							pnParticipant: pn,
+							attempt: altRetryCount + 1
+						}, 'smart retry: attempting with PN addressing')
+						msgKey.participant = pn
+						retryCount = altRetryCount
+						alternativeRetryAttempted = true
+					}
+				}
+			}
+		}
+		
+		const retryKey = `${msgId}:${msgKey?.participant}`
+		
 		if (retryCount >= maxMsgRetryCount) {
-			logger.debug({ retryCount, msgId }, 'reached retry limit, clearing')
-			msgRetryCache.del(key)
+			logger.debug({ retryCount, msgId, participant: msgKey?.participant }, 'reached retry limit, clearing')
+			msgRetryCache.del(retryKey)
+			// Also clear original key if we tried alternative addressing
+			if (alternativeRetryAttempted && retryKey !== originalKey) {
+				msgRetryCache.del(originalKey)
+			}
 			return
 		}
 
 		retryCount += 1
-		msgRetryCache.set(key, retryCount)
+		msgRetryCache.set(retryKey, retryCount)
 
 		const { account, signedPreKey, signedIdentityKey: identityKey } = authState.creds
 
@@ -599,7 +650,44 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		// todo: implement a cache to store the last 256 sent messages (copy whatsmeow)
 		const msgs = await Promise.all(ids.map(id => getMessage({ ...key, id })))
 		const remoteJid = key.remoteJid!
-		const participant = key.participant || remoteJid
+		let participant = key.participant || remoteJid
+		
+		// SMART RETRY: Check if we should try alternative addressing
+		const retryCount = +retryNode.attrs.count! || 1
+		let alternativeAddressingUsed = false
+		
+		if (retryCount > 2 && participant && participant !== remoteJid) {
+			const lidStore = signalRepository.getLIDMappingStore()
+			
+			if (participant.includes('@s.whatsapp.net')) {
+				// Try LID alternative for PN participant
+				const lid = lidStore.getFromCache(participant)
+				if (lid) {
+					logger.info({ 
+						remoteJid, 
+						originalParticipant: participant, 
+						lidParticipant: lid, 
+						retryCount 
+					}, 'retry receipt: attempting with LID addressing')
+					participant = lid
+					alternativeAddressingUsed = true
+				}
+			} else if (participant.includes('@lid')) {
+				// Try PN alternative for LID participant
+				const pn = await lidStore.getPNForLID(participant)
+				if (pn) {
+					logger.info({ 
+						remoteJid, 
+						originalParticipant: participant, 
+						pnParticipant: pn, 
+						retryCount 
+					}, 'retry receipt: attempting with PN addressing')
+					participant = pn
+					alternativeAddressingUsed = true
+				}
+			}
+		}
+		
 		// if it's the primary jid sending the request
 		// just re-send the message to everyone
 		// prevents the first message decryption failure
@@ -610,7 +698,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			await authState.keys.set({ 'sender-key-memory': { [remoteJid]: null } })
 		}
 
-		logger.debug({ participant, sendToAll }, 'forced new session for retry recp')
+		logger.debug({ participant, sendToAll, alternativeAddressingUsed }, 'forced new session for retry recp')
 
 		for (const [i, msg] of msgs.entries()) {
 			if (msg) {
@@ -624,6 +712,10 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 						jid: participant,
 						count: +retryNode.attrs.count!
 					}
+				}
+
+				if (alternativeAddressingUsed) {
+					logger.info({ messageId: ids[i], participant, retryCount }, 'relaying message with alternative addressing')
 				}
 
 				await relayMessage(key.remoteJid!, msg, msgRelayOpts)
