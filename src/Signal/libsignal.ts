@@ -287,15 +287,6 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			
 			let encryptionJid = jid
 			
-			// PRIMARY DEVICE OPTIMIZATION: Strip device ID to encrypt to primary device only
-			const decoded = jidDecode(jid)
-			if (decoded && decoded.device && ownPhoneNumber !== targetUser) {
-				// Convert multi-device JID to primary device (device 0)
-				const primaryJid = jidEncode(decoded.user, decoded.server as any)
-				console.log(`📱 Primary device optimization: ${jid} → ${primaryJid}`)
-				encryptionJid = primaryJid
-			}
-			
 			// REACTIVE SESSION MIGRATION: Handle contact type changes
 			if (ownPhoneNumber !== targetUser) {
 				// Perform reactive migration for external contacts
