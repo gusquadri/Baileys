@@ -235,45 +235,30 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 				return result
 			})
 		},
-		async encryptMessage({ jid, data, conversationContext }) {
-			// BAILEYS ADAPTIVE ENCRYPTION: Balance whatsmeow logic with Baileys patterns
+		async encryptMessage({ jid, data }) {
+			// WHATSMEOW EXACT LOGIC: Always prefer LID when available for individuals
+			// (conversation context only matters for groups in whatsmeow)
 			let encryptionJid = jid
 			
-			// Use conversation context to guide addressing preference (Baileys-specific)
-			const preferLID = conversationContext?.preferredAddressingMode === 'lid'
-			const preferPN = conversationContext?.preferredAddressingMode === 'pn'
-			
-			if (!preferPN && LIDMappingStore.isPN(jid)) {
-				// For PN addresses, check if we have a LID mapping (whatsmeow pattern)
+			if (LIDMappingStore.isPN(jid)) {
+				// whatsmeow send.go:996 - Always try to get LID for PN
 				try {
 					const lidForPN = await lidMapping.getLIDForPN(jid)
 					if (lidForPN) {
-						console.log(`🔄 Found LID mapping for encryption: ${jid} → ${lidForPN}`)
+						console.log(`🔄 whatsmeow pattern: Found LID for PN: ${jid} → ${lidForPN}`)
 						encryptionJid = lidForPN
 						
-						// Proactive session preparation (Baileys pattern: prepare before encrypt)
+						// Proactive migration (whatsmeow pattern)
 						await migrateSession(jid, lidForPN)
 					}
 				} catch (error) {
-					// Baileys pattern: graceful fallback on mapping errors
-					console.warn(`⚠️ LID mapping lookup failed for ${jid}, using original address`)
-				}
-			} else if (!preferLID && LIDMappingStore.isLID(jid)) {
-				// For LID addresses, respect conversation context preference for PN
-				if (preferPN) {
-					try {
-						const pnForLID = await lidMapping.getPNForLID(jid)
-						if (pnForLID) {
-							console.log(`🔄 Using PN per conversation context: ${jid} → ${pnForLID}`)
-							encryptionJid = pnForLID
-						}
-					} catch (error) {
-						console.warn(`⚠️ PN mapping lookup failed for ${jid}, using original LID`)
-					}
+					console.warn(`⚠️ LID lookup failed for ${jid}, using PN`)
 				}
 			}
+			// Note: whatsmeow doesn't use conversation context for individual messages
+			// Only groups use addressing_mode to determine encryption identity
 			
-			console.log(`📤 Final encryption address: ${encryptionJid}`)
+			console.log(`📤 Final encryption identity: ${encryptionJid}`)
 			
 			const addr = jidToSignalProtocolAddress(encryptionJid)
 			

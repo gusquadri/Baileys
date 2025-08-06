@@ -229,20 +229,33 @@ export const decryptMessageNode = (
 								break
 							case 'pkmsg':
 							case 'msg':
-								// BAILEYS APPROACH: Determine sender encryption identity
-								// Following whatsmeow logic but adapted to Baileys' architecture
+								// WHATSMEOW EXACT DECRYPTION LOGIC (message.go:284-298)
 								let senderEncryptionJid = sender
 								console.log(`📱 Initial sender address: ${sender}`)
 								
-								// Store discovered LID-PN mappings (for future reference)
-								let didStoreLIDMapping = false
-								if (fullMessage.key.senderLid && fullMessage.key.senderLid !== sender) {
-									console.log(`🔍 Discovered LID-PN mapping: ${fullMessage.key.senderLid} ↔ ${sender}`)
-									try {
+								// whatsmeow logic: Check sender type and SenderAlt priority
+								if (sender.includes('@s.whatsapp.net') && !sender.includes('bot')) {
+									if (fullMessage.key.senderLid?.includes('@lid')) {
+										// SenderAlt (LID) takes priority - whatsmeow line 286-288
+										console.log(`🔄 whatsmeow: SenderAlt (LID) found, using for decryption: ${fullMessage.key.senderLid}`)
+										senderEncryptionJid = fullMessage.key.senderLid
+										
+										// Store mapping and migrate session
 										await repository.storeLIDPNMapping(fullMessage.key.senderLid, sender)
-										didStoreLIDMapping = true
-									} catch (error) {
-										logger.warn({ error, lid: fullMessage.key.senderLid, pn: sender }, 'Failed to store LID-PN mapping')
+										await repository.migrateSession(sender, fullMessage.key.senderLid)
+									} else {
+										// No SenderAlt, check stored LID mapping - whatsmeow line 289-297
+										const lidMapping = repository.getLIDMappingStore()
+										const lidForPN = await lidMapping.getLIDForPN(sender)
+										
+										if (lidForPN) {
+											console.log(`🔄 whatsmeow: Found stored LID mapping: ${sender} → ${lidForPN}`)
+											await repository.migrateSession(sender, lidForPN)
+											senderEncryptionJid = lidForPN
+											fullMessage.key.senderLid = lidForPN
+										} else {
+											console.log(`⚠️ whatsmeow: No LID found for ${sender}`)
+										}
 									}
 								}
 								
@@ -268,7 +281,7 @@ export const decryptMessageNode = (
 										let alternateJid: string | null = null
 										if (fullMessage.key.senderLid && fullMessage.key.senderLid !== senderEncryptionJid) {
 											alternateJid = fullMessage.key.senderLid
-										} else if (didStoreLIDMapping) {
+										} else {
 											// Check if we can get alternate address from mapping store
 											const lidMapping = repository.getLIDMappingStore()
 											if (senderEncryptionJid.includes('@s.whatsapp.net')) {

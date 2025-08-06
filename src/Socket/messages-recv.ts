@@ -57,7 +57,6 @@ import {
 } from '../WABinary'
 import { extractGroupMetadata } from './groups'
 import { makeMessagesSocket } from './messages-send'
-import { ConversationContextManager } from '../Utils/conversation-context'
 
 export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	const { logger, retryRequestDelayMs, maxMsgRetryCount, shouldIgnoreJid } = config
@@ -93,8 +92,6 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 	// Privacy token manager is accessed via signalRepository when needed
 	
-	// Initialize conversation context manager for addressing mode tracking
-	const conversationContextManager = new ConversationContextManager(authState.keys)
 
 	const callOfferCache =
 		config.callOfferCache ||
@@ -978,12 +975,6 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			try {
 				const { addressingMode } = extractAddressingContext(node, node.attrs.from!, node.attrs.participant)
 				
-				// Update conversation context with the addressing mode the sender is using
-				await conversationContextManager.updateFromIncomingMessage(
-					author,
-					addressingMode,
-					msg.messageTimestamp as number
-				)
 				
 				// Also store LID-PN mappings if present (enhanced from existing logic)
 				if (addressingMode === 'lid' && node.attrs.participant_pn) {
@@ -1556,7 +1547,6 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		sendRetryRequest,
 		rejectCall,
 		fetchMessageHistory,
-		requestPlaceholderResend,
-		conversationContextManager
+		requestPlaceholderResend
 	}
 }
