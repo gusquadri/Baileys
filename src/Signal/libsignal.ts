@@ -236,27 +236,37 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			})
 		},
 		async encryptMessage({ jid, data }) {
-			// WHATSMEOW EXACT LOGIC: Always prefer LID when available for individuals
-			// (conversation context only matters for groups in whatsmeow)
+			// CONSERVATIVE APPROACH: Only use LID-PN mapping for PN addresses
+			// Don't try to use LID when directly sending to LID addresses
 			let encryptionJid = jid
 			
 			if (LIDMappingStore.isPN(jid)) {
-				// whatsmeow send.go:996 - Always try to get LID for PN
+				// whatsmeow send.go:996 - Try to get LID for PN
 				try {
 					const lidForPN = await lidMapping.getLIDForPN(jid)
 					if (lidForPN) {
-						console.log(`🔄 whatsmeow pattern: Found LID for PN: ${jid} → ${lidForPN}`)
-						encryptionJid = lidForPN
+						console.log(`🔄 Found LID for PN: ${jid} → ${lidForPN}`)
 						
-						// Proactive migration (whatsmeow pattern)
-						await migrateSession(jid, lidForPN)
+						// Check if we have a working session for the LID first
+						const lidAddr = jidToSignalProtocolAddress(lidForPN)
+						const lidSession = await storage.loadSession(lidAddr.toString())
+						
+						if (lidSession && lidSession.haveOpenSession()) {
+							console.log(`✅ LID session exists, using LID for encryption`)
+							encryptionJid = lidForPN
+							// Migrate session for consistency
+							await migrateSession(jid, lidForPN)
+						} else {
+							console.log(`⚠️ LID session not found, using original PN`)
+						}
 					}
 				} catch (error) {
 					console.warn(`⚠️ LID lookup failed for ${jid}, using PN`)
 				}
+			} else if (LIDMappingStore.isLID(jid)) {
+				// Direct LID address - use as-is, no conversion
+				console.log(`📤 Direct LID address, using as-is: ${encryptionJid}`)
 			}
-			// Note: whatsmeow doesn't use conversation context for individual messages
-			// Only groups use addressing_mode to determine encryption identity
 			
 			console.log(`📤 Final encryption identity: ${encryptionJid}`)
 			
@@ -286,9 +296,36 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 				// Create cipher and attempt encryption
 				const cipher = new libsignal.SessionCipher(storage, addr)
 				
-				const { type: sigType, body } = await cipher.encrypt(data)
-				const type = sigType === 3 ? 'pkmsg' : 'msg'
-				return { type, ciphertext: Buffer.from(body as any, 'binary') }
+				try {
+					const { type: sigType, body } = await cipher.encrypt(data)
+					const type = sigType === 3 ? 'pkmsg' : 'msg'
+					return { type, ciphertext: Buffer.from(body as any, 'binary') }
+				} catch (encryptionError: any) {
+					console.error(`❌ libsignal encryption failed for ${encryptionJid}:`, encryptionError.message)
+					console.error(`Session address: ${addr.toString()}`)
+					
+					// Check if this is the protobuf serialization error
+					if (encryptionError.message?.includes('Assertion failed')) {
+						// This might be a corrupted session - check if we have an alternate
+						if (encryptionJid !== jid) {
+							console.log(`🔄 Encryption failed with LID, trying original PN: ${jid}`)
+							const origAddr = jidToSignalProtocolAddress(jid)
+							const origCipher = new libsignal.SessionCipher(storage, origAddr)
+							
+							try {
+								const { type: sigType, body } = await origCipher.encrypt(data)
+								const type = sigType === 3 ? 'pkmsg' : 'msg'
+								console.log(`✅ Encryption succeeded with original PN`)
+								return { type, ciphertext: Buffer.from(body as any, 'binary') }
+							} catch (origError: any) {
+								console.error(`❌ Original PN encryption also failed: ${origError.message}`)
+								throw encryptionError // Throw original error
+							}
+						}
+					}
+					
+					throw encryptionError
+				}
 			})
 		},
 		async encryptGroupMessage({ group, meId, data }) {
