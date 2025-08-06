@@ -430,14 +430,6 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 		const participants: BinaryNode[] = []
 		const destinationJid = !isStatus ? jidEncode(user, isLid ? 'lid' : isGroup ? 'g.us' : 's.whatsapp.net') : statusJid
-		
-		// WHATSAPP SENDER IDENTITY: Determine correct sender JID based on recipient
-		// This ensures consistent sender identity to prevent chat separation
-		const senderJid = !isStatus && !isGroup ? getMessageSenderJid(destinationJid, authState.creds) : meId
-		
-		if (!isStatus && !isGroup && senderJid !== meId) {
-			logger.debug({ destinationJid, senderJid, meId }, 'using LID sender identity for recipient')
-		}
 
 		// PRIVACY TOKENS: Get privacy token for recipient (following whatsmeow approach)
 		const privacyToken = !isGroup && !isStatus ? await getPrivacyToken(destinationJid) : null
@@ -510,7 +502,6 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					tag: 'message',
 					attrs: {
 						to: jid,
-						from: senderJid,
 						id: msgId,
 						type: getMessageType(message),
 						...(additionalAttributes || {})
@@ -687,7 +678,6 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			const stanza: BinaryNode = {
 				tag: 'message',
 				attrs: {
-					from: senderJid,
 					id: msgId,
 					type: getMessageType(message),
 					...(additionalAttributes || {})
