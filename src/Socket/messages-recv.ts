@@ -77,7 +77,8 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		sendReceipt,
 		uploadPreKeys,
 		sendPeerDataOperationMessage,
-		getMessage
+		getMessage,
+		receiptTracker
 	} = sock
 
 	/** this mutex ensures that each retryRequest will wait for the previous one to finish */
@@ -830,6 +831,14 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		if (Array.isArray(content)) {
 			const items = getBinaryNodeChildren(content[0], 'item')
 			ids.push(...items.map(i => i.attrs.id!))
+		}
+
+		// Track receipt for outgoing message timeout system
+		if (receiptTracker && attrs.type !== 'retry' && attrs.type !== 'sender') {
+			const senderJid = attrs.participant || attrs.from
+			for (const messageId of ids) {
+				receiptTracker.handleReceipt(messageId, senderJid!, attrs.type || 'delivery')
+			}
 		}
 
 		try {

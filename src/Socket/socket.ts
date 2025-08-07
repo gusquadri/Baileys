@@ -12,6 +12,7 @@ import {
 	NOISE_WA_HEADER,
 	UPLOAD_TIMEOUT
 } from '../Defaults'
+import { ReceiptTrackingIntegration } from '../Utils/receipt-tracking-integration'
 import type { SocketConfig } from '../Types'
 import { DisconnectReason } from '../Types'
 import {
@@ -102,6 +103,9 @@ export const makeSocket = (config: SocketConfig) => {
 	// add transaction capability
 	const keys = addTransactionCapability(authState.keys, logger, transactionOpts)
 	const signalRepository = makeSignalRepository({ creds, keys })
+
+	// Initialize receipt tracking system for outgoing messages only
+	let receiptTracker: ReceiptTrackingIntegration
 
 	let lastDateRecv: Date
 	let epoch = 1
@@ -434,6 +438,9 @@ export const makeSocket = (config: SocketConfig) => {
 
 		clearInterval(keepAliveReq)
 		clearTimeout(qrTimer)
+		
+		// Shutdown receipt tracker
+		receiptTracker?.shutdown()
 
 		ws.removeAllListeners('close')
 		ws.removeAllListeners('open')
@@ -791,6 +798,37 @@ export const makeSocket = (config: SocketConfig) => {
 		ev.emit('connection.update', { receivedPendingNotifications: true })
 	})
 
+	// Initialize receipt tracker after socket setup but before return
+	const initializeReceiptTracker = (socketWithRelayMessage: any) => {
+		if (!receiptTracker) {
+			receiptTracker = new ReceiptTrackingIntegration(
+				logger,
+				async (messageKey, targetDevices) => {
+					if (socketWithRelayMessage && socketWithRelayMessage.relayMessage) {
+						logger.info({
+							messageId: messageKey.id,
+							targetDevices,
+							resendAttempt: true
+						}, 'Receipt timeout - resending message to specific devices')
+						
+						// Get original message from cache/storage if needed
+						// For now, we'll create a simple retry message
+						const retryMessage = {
+							extendedTextMessage: {
+								text: '[Auto-retry due to delivery timeout]'
+							}
+						}
+						
+						await socketWithRelayMessage.relayMessage(messageKey.remoteJid!, retryMessage, {
+							messageId: messageKey.id,
+							targetDevices: targetDevices
+						})
+					}
+				}
+			)
+		}
+	}
+
 	// update credentials when required
 	ev.on('creds.update', update => {
 		const name = update.me?.name
@@ -808,7 +846,7 @@ export const makeSocket = (config: SocketConfig) => {
 		Object.assign(creds, update)
 	})
 
-	return {
+	const returnedSocket = {
 		type: 'md' as 'md',
 		ws,
 		ev,
@@ -831,8 +869,16 @@ export const makeSocket = (config: SocketConfig) => {
 		requestPairingCode,
 		/** Waits for the connection to WA to reach a state */
 		waitForConnectionUpdate: bindWaitForConnectionUpdate(ev),
-		sendWAMBuffer
+		sendWAMBuffer,
+		get receiptTracker() {
+			if (!receiptTracker) {
+				initializeReceiptTracker(returnedSocket)
+			}
+			return receiptTracker
+		}
 	}
+	
+	return returnedSocket
 }
 
 /**

@@ -349,6 +349,8 @@ export type MessageRelayOptions = MinimalRelayOptions & {
 	useUserDevicesCache?: boolean
 	/** jid list of participants for status@broadcast */
 	statusJidList?: string[]
+	/** specific devices to target for receipt timeout resends */
+	targetDevices?: string[]
 }
 
 export type MiscMessageGenerationOptions = MinimalRelayOptions & {

@@ -81,7 +81,8 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		fetchPrivacySettings,
 		sendNode,
 		groupMetadata,
-		groupToggleEphemeral
+		groupToggleEphemeral,
+		receiptTracker
 	} = sock
 
 	// Initialize built-in message cache (replaces external getMessage)
@@ -483,7 +484,8 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			additionalNodes,
 			useUserDevicesCache,
 			useCachedGroupMetadata,
-			statusJidList
+			statusJidList,
+			targetDevices
 		}: MessageRelayOptions
 	) => {
 		const meId = authState.creds.me!.id
@@ -682,14 +684,30 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				const { user: meUser } = jidDecode(meId)!
 
 				if (!participant) {
-					devices.push({ user })
-					if (user !== meUser) {
-						devices.push({ user: meUser })
-					}
+					// If targetDevices is specified (for receipt timeout resends), use only those
+					if (targetDevices && targetDevices.length > 0) {
+						for (const deviceJid of targetDevices) {
+							const decoded = jidDecode(deviceJid)
+							if (decoded) {
+								devices.push({ user: decoded.user, device: decoded.device })
+							}
+						}
+						logger.info({
+							msgId,
+							targetDevices,
+							reason: 'receipt_timeout_resend'
+						}, 'Sending to specific devices due to missing receipts')
+					} else {
+						// Normal device resolution
+						devices.push({ user })
+						if (user !== meUser) {
+							devices.push({ user: meUser })
+						}
 
-					if (additionalAttributes?.['category'] !== 'peer') {
-						const additionalDevices = await getUSyncDevices([meId, jid], !!useUserDevicesCache, true)
-						devices.push(...additionalDevices)
+						if (additionalAttributes?.['category'] !== 'peer') {
+							const additionalDevices = await getUSyncDevices([meId, jid], !!useUserDevicesCache, true)
+							devices.push(...additionalDevices)
+						}
 					}
 				}
 
@@ -826,6 +844,34 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			logger.debug({ msgId }, `sending message to ${participants.length} devices`)
 
 			await sendNode(stanza)
+
+			// Track receipt timeout for outgoing messages only
+			if (receiptTracker) {
+				const messageKey: WAMessageKey = {
+					remoteJid: jid,
+					fromMe: true,
+					id: msgId
+				}
+
+				// Extract device JIDs for tracking
+				const targetDevices = participants
+					.map(p => p.attrs.jid)
+					.filter((jid): jid is string => jid != null && jid !== authState.creds.me?.id)
+
+				if (targetDevices.length > 0) {
+					receiptTracker.trackMessageSent(
+						messageKey,
+						jid,
+						isGroup ? targetDevices : undefined
+					)
+					
+					logger.trace({
+						msgId,
+						targetDevices: targetDevices.length,
+						isGroup
+					}, 'Started receipt timeout tracking for outgoing message')
+				}
+			}
 		})
 
 		return msgId
