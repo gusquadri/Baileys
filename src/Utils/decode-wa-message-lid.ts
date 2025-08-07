@@ -24,14 +24,14 @@ export async function determineLIDEncryptionJid(
     }
 
     // Own device optimization
-    if (meId) {
-        const ownNumber = meId.split('@')[0]?.split(':')[0]
-        const targetNumber = sender.split('@')[0]?.split(':')[0]
-        if (ownNumber === targetNumber) {
-            logger.debug({ sender }, 'Own device - using PN directly')
-            return { encryptionJid, shouldMigrate }
-        }
-    }
+    // if (meId) {
+    //     const ownNumber = meId.split('@')[0]?.split(':')[0]
+    //     const targetNumber = sender.split('@')[0]?.split(':')[0]
+    //     if (ownNumber === targetNumber) {
+    //         logger.debug({ sender }, 'Own device - using PN directly')
+    //         return { encryptionJid, shouldMigrate }
+    //     }
+    // }
 
     // Helper function to check session existence
     const hasSession = async (jid: string): Promise<boolean> => {
