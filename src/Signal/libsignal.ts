@@ -234,7 +234,9 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 					if (lidForPN) {
 						console.log(`🔄 whatsmeow pattern: Found LID for PN: ${jid} → ${lidForPN}`)
 						encryptionJid = lidForPN
-						// WHATSMEOW: NO proactive migration - only when server notifies
+						
+						// WHATSMEOW: Migrate when stored mapping exists (send.go:1184)
+						await migrateSession(jid, lidForPN)
 					}
 				} catch (error) {
 					console.warn(`⚠️ LID lookup failed for ${jid}, using PN`)
@@ -363,20 +365,60 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			return privacyTokenManager
 		},
 		/**
-		 * Server-coordinated migration - ONLY call when server explicitly notifies about LID changes
-		 * This is WhatsApp's proper migration approach (prevents Bad MAC errors)
-		 * 
-		 * WARNING: Do NOT call this during message processing - only when server sends migration notifications!
+		 * WHATSMEOW EXACT: MigratePNToLID - ONE-WAY migration from PN to LID only
+		 * This is NOT bidirectional! Only PN→LID, never LID→PN
 		 */
 		async migrateSession(fromJid: string, toJid: string) {
-			console.log(`⚠️ migrateSession called - this should ONLY happen when server sends migration notifications!`)
-			console.trace('Migration call stack')
+			// WHATSMEOW RULE: Only migrate PN → LID, never the reverse
+			const isPN = fromJid.includes('@s.whatsapp.net')
+			const isLID = toJid.includes('@lid')
 			
-			// For now, disable all migrations to prevent double ratchet
-			console.log(`🚫 Migration disabled to prevent double ratchet: ${fromJid} → ${toJid}`)
-			return
+			if (!isPN || !isLID) {
+				console.log(`🚫 Invalid migration direction: ${fromJid} → ${toJid} (only PN→LID allowed)`)
+				return
+			}
 			
-			// await coordinatedSessionMigration(fromJid, toJid)
+			const migrationKey = `${fromJid}→${toJid}`
+			
+			// Check if migration was recently completed (LRU + TTL)
+			if (isRecentlyMigrated(migrationKey)) {
+				console.log(`✅ Migration already completed recently: ${migrationKey}`)
+				return
+			}
+			
+			console.log(`🔄 whatsmeow MigratePNToLID: ${fromJid} → ${toJid}`)
+			
+			// ATOMIC MIGRATION: All operations in single transaction (whatsmeow pattern)
+			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
+				try {
+					const fromAddr = jidToSignalProtocolAddress(fromJid)
+					const toAddr = jidToSignalProtocolAddress(toJid)
+					const fromAddrStr = fromAddr.toString()
+					const toAddrStr = toAddr.toString()
+					
+					// Check if destination already has a session - if yes, skip migration
+					const toSession = await storage.loadSession(toAddrStr)
+					if (toSession && toSession.haveOpenSession()) {
+						console.log(`✅ LID session already exists, skipping migration`)
+						markAsMigrated(migrationKey)
+						return
+					}
+					
+					// MIGRATE PN SESSION TO LID (whatsmeow MigratePNToLID pattern)
+					const fromSession = await storage.loadSession(fromAddrStr)
+					if (fromSession && fromSession.haveOpenSession()) {
+						await storage.storeSession(toAddrStr, fromSession)
+						console.log(`✅ Migrated PN session to LID: ${fromAddrStr} → ${toAddrStr}`)
+						markAsMigrated(migrationKey)
+					} else {
+						console.log(`ℹ️ No PN session to migrate: ${fromJid}`)
+					}
+					
+				} catch (error) {
+					console.error(`❌ PN→LID migration failed: ${fromJid} → ${toJid}`, error)
+					throw error
+				}
+			})
 		}
 	}
 }

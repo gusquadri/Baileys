@@ -221,8 +221,15 @@ export const decryptMessageNode = (
 								// WHATSMEOW EXACT LOGIC (message.go:284-298) - NO reactive migrations!
 								let senderEncryptionJid = sender
 								
-								// whatsmeow: Check sender type and SenderAlt priority ONLY
-								if (sender.includes('@s.whatsapp.net') && !sender.includes('bot')) {
+								// OWN DEVICE OPTIMIZATION: Skip LID logic for our own devices (prevents session corruption)
+								const ownPhoneNumber = meId.split('@')[0]?.split(':')[0]
+								const targetUser = sender.split('@')[0]?.split(':')[0]
+								
+								if (ownPhoneNumber && targetUser === ownPhoneNumber) {
+									logger.debug({ sender }, '⚡ Own device optimization: Skipping LID logic for own device')
+									// Use the provided address directly - don't convert to LID
+									senderEncryptionJid = sender
+								} else if (sender.includes('@s.whatsapp.net') && !sender.includes('bot')) {
 									if (fullMessage.key.senderLid?.includes('@lid')) {
 										// SenderAlt (LID) takes priority - whatsmeow line 286-288
 										logger.debug({ 
@@ -233,8 +240,11 @@ export const decryptMessageNode = (
 										
 										// Store mapping (whatsmeow does this)
 										await repository.storeLIDPNMapping(fullMessage.key.senderLid, sender)
+										
+										// WHATSMEOW: Migrate when SenderAlt is present (message.go:288)
+										await repository.migrateSession(sender, fullMessage.key.senderLid)
 									} else {
-										// No SenderAlt, check stored LID mapping - whatsmeow line 289-297
+										// No SenderAlt, check stored LID mapping - whatsmeow line 289-297  
 										const lidMapping = repository.getLIDMappingStore()
 										const lidForPN = await lidMapping.getLIDForPN(sender)
 										
@@ -243,6 +253,10 @@ export const decryptMessageNode = (
 												pn: sender, 
 												lid: lidForPN 
 											}, 'whatsmeow: Using stored LID mapping for decryption')
+											
+											// WHATSMEOW: Migrate when stored mapping exists (message.go:292)
+											await repository.migrateSession(sender, lidForPN)
+											
 											senderEncryptionJid = lidForPN
 											fullMessage.key.senderLid = lidForPN
 										} else {

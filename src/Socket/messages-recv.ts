@@ -1003,6 +1003,38 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		) {
 			ev.emit('chats.phoneNumberShare', { lid: node.attrs.from!, jid: node.attrs.sender_pn })
 		}
+		
+		// Handle LID Migration Sync Messages - MISSING from Baileys! (whatsmeow message.go:750-751)
+		if (msg.message?.protocolMessage?.lidMigrationMappingSyncMessage?.encodedMappingPayload) {
+			try {
+				const payload = msg.message.protocolMessage.lidMigrationMappingSyncMessage.encodedMappingPayload
+				const decoded = proto.LIDMigrationMappingSyncPayload.decode(payload)
+				
+				logger.debug({ 
+					mappingCount: decoded.pnToLidMappings?.length || 0,
+					timestamp: decoded.chatDbMigrationTimestamp 
+				}, 'Received LID migration sync message from server')
+				
+				// Store PN-LID mappings from server (whatsmeow message.go:893-909)
+				const lidMapping = signalRepository.getLIDMappingStore()
+				if (decoded.pnToLidMappings && decoded.pnToLidMappings.length > 0) {
+					for (const mapping of decoded.pnToLidMappings) {
+						const pn = `${mapping.pn}@s.whatsapp.net`
+						const lid = `${mapping.assignedLid}@lid`
+						await lidMapping.storeLIDPNMapping(lid, pn)
+						logger.debug({ pn, lid }, 'Stored server-provided PN-LID mapping')
+					}
+				}
+				
+				// Store migration timestamp if provided
+				if (decoded.chatDbMigrationTimestamp) {
+					logger.debug({ timestamp: decoded.chatDbMigrationTimestamp }, 'Server LID migration timestamp')
+				}
+				
+			} catch (error) {
+				logger.error({ error }, 'Failed to process LID migration sync message')
+			}
+		}
 
 		try {
 			await Promise.all([
