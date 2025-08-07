@@ -853,21 +853,30 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					id: msgId
 				}
 
-				// Extract device JIDs for tracking
-				const targetDevices = participants
+				// Extract ALL device JIDs for tracking (including our own devices)
+				const allTargetDevices = participants
 					.map(p => p.attrs.jid)
-					.filter((jid): jid is string => jid != null && jid !== authState.creds.me?.id)
+					.filter((jid): jid is string => jid != null)
 
-				if (targetDevices.length > 0) {
+				// Filter to get only recipient devices (exclude our own main ID but keep our device variants)
+				const recipientDevices = allTargetDevices.filter(deviceJid => {
+					// Don't track our main JID, but track our device variants
+					const isOurMainId = deviceJid === authState.creds.me?.id
+					return !isOurMainId
+				})
+
+				if (recipientDevices.length > 0) {
 					receiptTracker.trackMessageSent(
 						messageKey,
 						jid,
-						isGroup ? targetDevices : undefined
+						isGroup ? recipientDevices : undefined
 					)
 					
 					logger.trace({
 						msgId,
-						targetDevices: targetDevices.length,
+						targetDevices: recipientDevices.length,
+						allDevices: allTargetDevices.length,
+						recipientDevices: recipientDevices,
 						isGroup
 					}, 'Started receipt timeout tracking for outgoing message')
 				}

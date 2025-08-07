@@ -31,28 +31,26 @@ export class ReceiptTrackingIntegration {
             let targetDevices: string[] = []
 
             if (participants && participants.length > 0) {
-                // Group message - track participants
+                // Group message OR direct message with specific device list - track all provided devices
                 targetDevices = participants
+                this.logger.debug({
+                    messageId: messageKey.id,
+                    deviceCount: participants.length,
+                    devices: participants
+                }, 'Tracking specific devices for message receipt')
             } else {
-                // Direct message - target the main JID
-                // In reality, WhatsApp sends to all user devices automatically
-                // We track the main JID and let device-specific receipts come in
+                // Direct message without specific devices - track the main JID
                 targetDevices = [targetJid]
-                
-                // If it's a user JID, also consider device variants that might send receipts
-                if (isJidUser(targetJid)) {
-                    const normalizedUser = jidNormalizedUser(targetJid)
-                    // We can't predict device IDs, so we track the base JID
-                    // Individual device receipts will be handled in handleReceipt
-                    targetDevices = [normalizedUser]
-                }
+                this.logger.debug({
+                    messageId: messageKey.id,
+                    targetJid,
+                    fallbackMode: true
+                }, 'Tracking fallback JID for direct message')
             }
 
-            // Filter out own devices (they don't send receipts)
-            const filteredDevices = targetDevices.filter(device => {
-                // Skip our own device JIDs (they don't acknowledge)
-                return !device.includes(messageKey.fromMe ? 'own-device-marker' : 'never-match')
-            })
+            // All devices should be tracked for receipts
+            // The message-send layer already filters out inappropriate devices
+            const filteredDevices = targetDevices
 
             if (filteredDevices.length > 0) {
                 this.logger.debug({
