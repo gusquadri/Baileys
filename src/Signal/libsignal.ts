@@ -236,32 +236,10 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 				console.log(`⚡ Own device optimization: Skipping LID lookup for ${jid} (own device)`)
 				// Use the provided address directly - don't convert to LID
 				encryptionJid = jid
-			} else if (LIDMappingStore.isPN(jid)) {
-				// whatsmeow send.go:1180-1186 - Always try to get LID for PN (external contacts only)
-				try {
-					const lidForPN = await lidMapping.getLIDForPN(jid)
-					if (lidForPN) {
-						console.log(`🔄 whatsmeow pattern: Found LID for PN: ${jid} → ${lidForPN}`)
-						
-						// CRITICAL: Validate LID session exists before using it
-						const lidAddr = jidToSignalProtocolAddress(lidForPN)
-						const lidSession = await storage.loadSession(lidAddr.toString())
-						
-						if (lidSession && lidSession.haveOpenSession()) {
-							console.log(`✅ LID session validated: ${lidForPN}`)
-						encryptionJid = lidForPN
-						} else {
-							console.log(`⚠️ LID session missing/invalid for ${lidForPN}, using PN: ${jid}`)
-							// Fall back to PN if LID session is not available
-							encryptionJid = jid
-						}
-						
-						// REMOVED: Don't migrate during encryption - only when receiving messages
-						// Migration during encryption corrupts sessions and causes "Assertion failed"
-					}
-				} catch (error) {
-					console.warn(`⚠️ LID lookup failed for ${jid}, using PN`)
-				}
+			} else if (false && LIDMappingStore.isPN(jid)) {
+				// DISABLED: LID mapping is too complex for real-time handling
+				// Use session as received without LID conversion for consistency testing
+				console.log(`🚫 LID mapping disabled - using provided JID: ${jid}`)
 			}
 			
 			console.log(`📤 Final encryption identity: ${encryptionJid}`)
@@ -302,7 +280,19 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 				console.error(`❌ libsignal encryption failed for ${encryptionJid}:`, encryptionError.message)
 				console.error(`Session address: ${addr.toString()}`)
 				
-				// WHATSMEOW: NO fallback encryption attempts - fail fast
+				// CRITICAL: If Assertion failed, the session is corrupted beyond repair
+				if (encryptionError.message?.includes('Assertion failed')) {
+					console.error(`🚨 Session corrupted beyond repair: ${addr.toString()}`)
+					console.error(`💀 Deleting corrupted session to prevent future failures`)
+					
+					// Delete the corrupted session completely
+					await storage.storeSession(addr.toString(), null)
+					
+					// This will require a fresh prekey exchange on next message
+					throw new Error(`Session corrupted for ${encryptionJid} - deleted corrupted state, retry with fresh prekey exchange`)
+				}
+				
+				// For other errors, fail fast without recovery attempts
 				throw encryptionError
 			}
 		},
