@@ -972,28 +972,11 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			decrypt
 		} = decryptMessageNode(node, authState.creds.me!.id, authState.creds.me!.lid || '', signalRepository, logger)
 
-		// Extract and store addressing context from incoming message (following whatsmeow's approach)
-		if (msg && author && !msg.key.fromMe) {
-			try {
-				const { addressingMode } = extractAddressingContext(node, node.attrs.from!, node.attrs.participant)
-				
-				
-				// Also store LID-PN mappings if present (enhanced from existing logic)
-				if (addressingMode === 'lid' && node.attrs.participant_pn) {
-					// Sender is using LID, participant_pn contains the PN mapping
-					signalRepository.storeLIDPNMapping(author, node.attrs.participant_pn)
-					// Migrate sessions following whatsmeow's approach (message.go:288)
-					await signalRepository.migrateSession(node.attrs.participant_pn, author)
-				} else if (addressingMode === 'pn' && node.attrs.participant_lid) {
-					// Sender is using PN, participant_lid contains the LID mapping
-					signalRepository.storeLIDPNMapping(node.attrs.participant_lid, author)
-					// Migrate sessions following whatsmeow's approach  
-					await signalRepository.migrateSession(author, node.attrs.participant_lid)
-				}
-			} catch (error) {
-				logger.warn({ error, author }, 'Failed to extract addressing context from message')
-			}
-		}
+		// REMOVED: LID mapping logic moved to decode-wa-message.ts for better consistency
+		// The decode-wa-message.ts handles LID mappings during decryption with:
+		// - Device consistency validation
+		// - Conservative mapping approach  
+		// - No session migration (prevents Bad MAC errors)
 
 		if (response && msg?.messageStubParameters?.[0] === NO_MESSAGE_FOUND_ERROR_TEXT) {
 			msg.messageStubParameters = [NO_MESSAGE_FOUND_ERROR_TEXT, response]

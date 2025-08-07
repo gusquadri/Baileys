@@ -234,14 +234,25 @@ export const decryptMessageNode = (
 									// If LID has no device info, we can store it (device 0 assumed)
 									
 									if (shouldStoreMapping) {
-										logger.debug({ 
-											lid: fullMessage.key.senderLid,
-											pn: author,
-											note: 'Group device consistency validated'
-										}, '✅ Storing group LID-PN mapping with matching devices')
+										// Ensure both addresses have the same device ID for consistency
+										const lidWithDevice = fullMessage.key.senderLid.includes(':') 
+											? fullMessage.key.senderLid 
+											: `${fullMessage.key.senderLid.replace('@lid', '')}:${pnDeviceId}@lid`
 										
-										// Store mapping between actual addresses from message
-										await repository.storeLIDPNMapping(fullMessage.key.senderLid, author)
+										const pnWithDevice = author.includes(':') 
+											? author 
+											: `${author.replace('@s.whatsapp.net', '')}:${pnDeviceId}@s.whatsapp.net`
+										
+										logger.debug({ 
+											originalLid: fullMessage.key.senderLid,
+											lidWithDevice,
+											originalPn: author,
+											pnWithDevice,
+											note: 'Added matching device IDs for group consistency'
+										}, '✅ Storing group LID-PN mapping with device-consistent addresses')
+										
+										// Store mapping with device-consistent addresses
+										await repository.storeLIDPNMapping(lidWithDevice, pnWithDevice)
 									}
 								}
 								
@@ -298,14 +309,25 @@ export const decryptMessageNode = (
 										// If LID has no device info, we can store it (device 0 assumed)
 										
 										if (shouldStoreMapping) {
-											logger.debug({ 
-												lid: fullMessage.key.senderLid,
-												pn: sender,
-												note: 'Device consistency validated'
-											}, '✅ Storing LID-PN mapping with matching devices')
+											// Ensure both addresses have the same device ID for consistency
+											const lidWithDevice = fullMessage.key.senderLid.includes(':') 
+												? fullMessage.key.senderLid 
+												: `${fullMessage.key.senderLid.replace('@lid', '')}:${pnDeviceId}@lid`
 											
-											// Store mapping between actual addresses from message
-											await repository.storeLIDPNMapping(fullMessage.key.senderLid, sender)
+											const pnWithDevice = sender.includes(':') 
+												? sender 
+												: `${sender.replace('@s.whatsapp.net', '')}:${pnDeviceId}@s.whatsapp.net`
+											
+											logger.debug({ 
+												originalLid: fullMessage.key.senderLid,
+												lidWithDevice,
+												originalPn: sender,
+												pnWithDevice,
+												note: 'Added matching device IDs for consistency'
+											}, '✅ Storing LID-PN mapping with device-consistent addresses')
+											
+											// Store mapping with device-consistent addresses
+											await repository.storeLIDPNMapping(lidWithDevice, pnWithDevice)
 										}
 										
 										// DISABLED: Session migration during decryption causes Bad MAC errors
