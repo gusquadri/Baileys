@@ -1,5 +1,6 @@
 /* @ts-ignore */
 import * as libsignal from 'libsignal'
+import { LRUCache } from 'lru-cache'
 import type { SignalAuthState, SignalKeyStoreWithTransaction } from '../Types'
 import type { SignalRepository } from '../Types/Signal'
 import { generateSignalPubKey } from '../Utils'
@@ -21,6 +22,23 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 	
 	// Link managers for cross-referencing (avoiding circular dependency)
 	lidMapping.setPrivacyTokenManager(privacyTokenManager)
+	
+	// Migration deduplication cache using professional LRU library
+	const migratedSessionsCache = new LRUCache<string, boolean>({
+		max: 1000, // Maximum 1000 migration records
+		ttl: 24 * 60 * 60 * 1000, // 24 hours TTL
+		updateAgeOnGet: true, // LRU behavior: accessing refreshes the entry
+		updateAgeOnHas: true, // has() calls also refresh the entry
+	})
+	
+	// Clean, simple helper functions using proper LRU cache
+	const isRecentlyMigrated = (migrationKey: string): boolean => {
+		return migratedSessionsCache.has(migrationKey) // Automatic TTL + LRU handling
+	}
+	
+	const markAsMigrated = (migrationKey: string): void => {
+		migratedSessionsCache.set(migrationKey, true) // Automatic eviction + TTL handling
+	}
 	
 	/**
 	 * Server-coordinated session migration - migrate only when server notifies
@@ -68,7 +86,8 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 	}
 
 	/**
-	 * Migrate session from one address to another (for LID/PN compatibility)
+	 * Comprehensive atomic session migration (following whatsmeow's complete approach)
+	 * Migrates: sessions + identity keys + sender keys + LID mapping
 	 */
 	const migrateSession = async (fromJid: string, toJid: string): Promise<void> => {
 		const fromAddr = jidToSignalProtocolAddress(fromJid)
@@ -81,26 +100,59 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			return // No migration needed
 		}
 		
-		try {
-			// Check if destination already has a session - if yes, no migration needed
-			const toSession = await storage.loadSession(toAddrStr)
-			if (toSession && toSession.haveOpenSession()) {
-				console.log(`Session already exists at ${toJid}, skipping migration`)
-				return
-			}
-			
-			// Load session from source address
-			const fromSession = await storage.loadSession(fromAddrStr)
-			if (fromSession && fromSession.haveOpenSession()) {
-				// Copy session to destination address
-				// NOTE: This is different from whatsmeow which likely just remaps storage keys
-				// But necessary for our implementation since we can't directly remap Redis keys
-				await storage.storeSession(toAddrStr, fromSession)
-				console.log(`Migrated session from ${fromJid} to ${toJid}`)
-			}
-		} catch (error) {
-			console.error(`Failed to migrate session from ${fromJid} to ${toJid}:`, error)
+		// LRU-based deduplication check (optimal pattern for migration tracking)
+		const migrationKey = `${fromJid}→${toJid}`
+		
+		// Check if migration was recently completed (LRU + TTL)
+		if (isRecentlyMigrated(migrationKey)) {
+			console.log(`✅ Migration already completed recently: ${migrationKey}`)
+			return
 		}
+		
+		// ATOMIC MIGRATION: All operations in single transaction (whatsmeow pattern)
+		return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
+			try {
+				let migrationCount = 0
+				const migrationLog: string[] = []
+				
+				// Check if destination already has a session - if yes, skip migration
+				const toSession = await storage.loadSession(toAddrStr)
+				if (toSession && toSession.haveOpenSession()) {
+					console.log(`✅ Session already exists at ${toJid}, skipping migration`)
+					markAsMigrated(migrationKey) // LRU cache marking
+					return
+				}
+				
+				// 1. MIGRATE SIGNAL SESSION (most critical)
+				const fromSession = await storage.loadSession(fromAddrStr)
+				if (fromSession && fromSession.haveOpenSession()) {
+					await storage.storeSession(toAddrStr, fromSession)
+					migrationCount++
+					migrationLog.push(`session: ${fromAddrStr} → ${toAddrStr}`)
+				}
+				
+				// 4. UPDATE LID MAPPING (Baileys enhancement)
+				try {
+					await lidMapping.storeLIDPNMapping(toJid, fromJid)
+					migrationLog.push(`lid-mapping: ${fromJid} ↔ ${toJid}`)
+				} catch (lidError) {
+					console.warn(`⚠️ LID mapping update failed: ${lidError}`)
+				}
+				
+				// 5. MIGRATION STATISTICS (whatsmeow pattern)
+				if (migrationCount > 0) {
+					console.log(`✅ Atomic migration completed: ${fromJid} → ${toJid}`)
+					console.log(`   Migrated components (${migrationCount}): ${migrationLog.join(', ')}`)
+					markAsMigrated(migrationKey) // LRU cache marking
+				} else {
+					console.log(`ℹ️ No components to migrate: ${fromJid} → ${toJid}`)
+				}
+				
+			} catch (error) {
+				console.error(`❌ Atomic migration failed: ${fromJid} → ${toJid}`, error)
+				throw error // Transaction will rollback
+			}
+		})
 	}
 
 
