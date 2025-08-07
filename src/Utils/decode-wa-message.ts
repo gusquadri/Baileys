@@ -10,7 +10,8 @@ import {
 	isJidNewsletter,
 	isJidStatusBroadcast,
 	isJidUser,
-	isLidUser
+	isLidUser,
+	jidDecode
 } from '../WABinary'
 import { unpadRandomMax16 } from './generics'
 import type { ILogger } from './logger'
@@ -204,28 +205,57 @@ export const decryptMessageNode = (
 						const e2eType = tag === 'plaintext' ? 'plaintext' : attrs.type
 						switch (e2eType) {
 							case 'skmsg':
-								// Store LID mappings from group messages - add missing device ID to both LID and PN
+								// Store LID mappings from group messages - ensure device consistency
 								if (fullMessage.key.senderLid && author) {
 									logger.debug('Storing LID-PN mapping from group message')
 									
-									// Add device ID to LID: "102765716062358@lid" → "102765716062358:0@lid"
-									const lidWithDevice = fullMessage.key.senderLid.includes(':') 
-										? fullMessage.key.senderLid 
-										: fullMessage.key.senderLid.replace('@lid', ':0@lid')
+									// Extract device from PN author to ensure consistency
+									const authorDecoded = jidDecode(author)
+									const pnDeviceId = authorDecoded?.device || 0
 									
-									// Add device ID to PN: "554396160286@s.whatsapp.net" → "554396160286:0@s.whatsapp.net"
-									const pnWithDevice = author.includes(':') 
-										? author 
-										: author.replace('@s.whatsapp.net', ':0@s.whatsapp.net')
+									// If LID already has device, check for consistency
+									let shouldStoreMapping = true
+									let lidDeviceId = 0
 									
-									logger.debug({ 
-										originalSenderLid: fullMessage.key.senderLid,
-										lidWithDevice,
-										originalAuthor: author,
-										pnWithDevice
-									}, 'Storing group LID-PN mapping with device IDs for both')
+									if (fullMessage.key.senderLid.includes(':')) {
+										const lidDecoded = jidDecode(fullMessage.key.senderLid)
+										lidDeviceId = lidDecoded?.device || 0
+										
+										// Check device consistency
+										if (pnDeviceId !== lidDeviceId) {
+											logger.warn({ 
+												pnDevice: pnDeviceId,
+												lidDevice: lidDeviceId,
+												author,
+												senderLid: fullMessage.key.senderLid
+											}, '🚫 Group message device mismatch detected - skipping LID mapping storage')
+											shouldStoreMapping = false
+										}
+									} else {
+										// Use PN device for LID
+										lidDeviceId = pnDeviceId
+									}
 									
-									await repository.storeLIDPNMapping(lidWithDevice, pnWithDevice)
+									if (shouldStoreMapping) {
+										// Add matching device ID to both LID and PN
+										const lidWithDevice = fullMessage.key.senderLid.includes(':') 
+											? fullMessage.key.senderLid 
+											: `${fullMessage.key.senderLid.replace('@lid', '')}:${lidDeviceId}@lid`
+										
+										const pnWithDevice = author.includes(':') 
+											? author 
+											: `${author.replace('@s.whatsapp.net', '')}:${pnDeviceId}@s.whatsapp.net`
+										
+										logger.debug({ 
+											originalSenderLid: fullMessage.key.senderLid,
+											lidWithDevice,
+											originalAuthor: author,
+											pnWithDevice,
+											deviceConsistency: 'validated'
+										}, 'Storing group LID-PN mapping with validated device consistency')
+										
+										await repository.storeLIDPNMapping(lidWithDevice, pnWithDevice)
+									}
 								}
 								
 								msgBuffer = await repository.decryptGroupMessage({
@@ -256,25 +286,54 @@ export const decryptMessageNode = (
 										}, 'whatsmeow: Using SenderAlt (LID) for decryption')
 										senderEncryptionJid = fullMessage.key.senderLid
 										
-										// Store mapping - add missing device ID to both LID and PN
-										// Add device ID to LID: "102765716062358@lid" → "102765716062358:0@lid"
-										const lidWithDevice = fullMessage.key.senderLid.includes(':') 
-											? fullMessage.key.senderLid 
-											: fullMessage.key.senderLid.replace('@lid', ':0@lid')
+										// Store mapping - ensure device consistency between LID and PN
+										// Extract device from PN to use for LID mapping
+										const pnDecoded = jidDecode(sender)
+										const pnDeviceId = pnDecoded?.device || 0
 										
-										// Add device ID to PN: "554396160286@s.whatsapp.net" → "554396160286:0@s.whatsapp.net"
-										const pnWithDevice = sender.includes(':') 
-											? sender 
-											: sender.replace('@s.whatsapp.net', ':0@s.whatsapp.net')
+										// If LID already has device, check for consistency
+										let shouldStoreMapping = true
+										let lidDeviceId = 0
 										
-										logger.debug({ 
-											originalSenderLid: fullMessage.key.senderLid,
-											lidWithDevice,
-											originalSender: sender,
-											pnWithDevice
-										}, 'Storing LID-PN mapping with device IDs for both')
+										if (fullMessage.key.senderLid.includes(':')) {
+											const lidDecoded = jidDecode(fullMessage.key.senderLid)
+											lidDeviceId = lidDecoded?.device || 0
+											
+											// Check device consistency
+											if (pnDeviceId !== lidDeviceId) {
+												logger.warn({ 
+													pnDevice: pnDeviceId,
+													lidDevice: lidDeviceId,
+													sender,
+													senderLid: fullMessage.key.senderLid
+												}, '🚫 Device mismatch detected - skipping LID mapping storage')
+												shouldStoreMapping = false
+											}
+										} else {
+											// Use PN device for LID
+											lidDeviceId = pnDeviceId
+										}
 										
-										await repository.storeLIDPNMapping(lidWithDevice, pnWithDevice)
+										if (shouldStoreMapping) {
+											// Add matching device ID to both LID and PN
+											const lidWithDevice = fullMessage.key.senderLid.includes(':') 
+												? fullMessage.key.senderLid 
+												: `${fullMessage.key.senderLid.replace('@lid', '')}:${lidDeviceId}@lid`
+											
+											const pnWithDevice = sender.includes(':') 
+												? sender 
+												: `${sender.replace('@s.whatsapp.net', '')}:${pnDeviceId}@s.whatsapp.net`
+											
+											logger.debug({ 
+												originalSenderLid: fullMessage.key.senderLid,
+												lidWithDevice,
+												originalSender: sender,
+												pnWithDevice,
+												deviceConsistency: 'validated'
+											}, 'Storing LID-PN mapping with validated device consistency')
+											
+											await repository.storeLIDPNMapping(lidWithDevice, pnWithDevice)
+										}
 										
 										// WHATSMEOW: Migrate when SenderAlt is present (message.go:288)
 										await repository.migrateSession(sender, fullMessage.key.senderLid)
@@ -298,27 +357,15 @@ export const decryptMessageNode = (
 											logger.debug({ 
 												pn: pnForLookup, 
 												lid: lidForPN 
-											}, 'whatsmeow: Found stored LID mapping for decryption')
+											}, 'whatsmeow: Found stored LID mapping - using LID for decryption')
 											
-											// Simple session existence check without actual decryption
-											try {
-												const lidAddr = repository.jidToSignalProtocolAddress(lidForPN)
-												logger.debug({ lidAddr }, '🔍 Checking LID session existence during decryption')
-												
-												// Use the LID for decryption if mapping exists
-												senderEncryptionJid = lidForPN
-												fullMessage.key.senderLid = lidForPN
-												
-												logger.debug({ 
-													finalJid: senderEncryptionJid 
-												}, '✅ Using LID for decryption based on stored mapping')
-											} catch (validationError: any) {
-												logger.debug({ 
-													lid: lidForPN, 
-													fallback: sender, 
-													error: validationError?.message 
-												}, '⚠️ LID validation failed, using PN for decryption')
-											}
+											// Simple approach: If mapping exists (with device consistency), use it
+											senderEncryptionJid = lidForPN
+											fullMessage.key.senderLid = lidForPN
+											
+											logger.debug({ 
+												finalJid: senderEncryptionJid 
+											}, '✅ Using LID based on device-consistent mapping')
 										} else {
 											logger.debug({ sender: pnForLookup }, 'whatsmeow: No LID mapping found, using PN')
 										}
