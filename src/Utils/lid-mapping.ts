@@ -112,17 +112,29 @@ export class LIDMappingStore {
     }
 
     /**
-     * Migrate session from PN to LID
+     * Migrate session from PN to LID - DEVICE-SPECIFIC
      */
     async migrateSession(pnJid: string, lidJid: string): Promise<void> {
         const pnDecoded = jidDecode(pnJid)
         const lidDecoded = jidDecode(lidJid)
         
-        if (!pnDecoded || !lidDecoded) return
+        if (!pnDecoded || !lidDecoded) {
+            console.error(`❌ Invalid JIDs for migration: ${pnJid} -> ${lidJid}`)
+            return
+        }
         
-        // Signal addresses
-        const pnAddr = `${pnDecoded.user}.${pnDecoded.device || 0}`
-        const lidAddr = `${lidDecoded.user}_1.${lidDecoded.device || 0}`
+        // Signal addresses - PRESERVE EXACT DEVICE IDs
+        const pnDevice = pnDecoded.device || 0
+        const lidDevice = lidDecoded.device || pnDecoded.device
+        
+        const pnAddr = `${pnDecoded.user}.${pnDevice}`
+        const lidAddr = `${lidDecoded.user}_1.${lidDevice}`
+        
+        console.log(`🔄 Attempting device-specific session migration:`)
+        console.log(`   PN JID:  ${pnJid} (device ${pnDevice})`)
+        console.log(`   LID JID: ${lidJid} (device ${lidDevice})`)
+        console.log(`   PN Addr:  ${pnAddr}`)
+        console.log(`   LID Addr: ${lidAddr}`)
         
         try {
             await this.keys.transaction(async () => {
@@ -130,18 +142,37 @@ export class LIDMappingStore {
                 const pnSession = sessions[pnAddr]
                 
                 if (pnSession) {
-                    // Copy session to LID address
+                    console.log(`✅ Found PN session for device ${pnDevice}, migrating to LID`)
+                    
+                    // Copy session to LID address (keep PN session for compatibility)
                     await this.keys.set({
                         'session': {
-                            [lidAddr]: pnSession,
-                            [pnAddr]: null  // Delete PN session
+                            [lidAddr]: pnSession
+                            // Don't delete PN session yet - WhatsApp keeps both during transition
                         }
                     })
                     console.log(`✅ Session migrated: ${pnAddr} -> ${lidAddr}`)
+                } else {
+                    console.warn(`⚠️ No PN session found for device ${pnDevice} at address ${pnAddr}`)
+                    
+                    // Check if there's a device 0 session we can copy
+                    const device0Addr = `${pnDecoded.user}.0`
+                    const device0Sessions = await this.keys.get('session', [device0Addr])
+                    const device0Session = device0Sessions[device0Addr]
+                    
+                    if (device0Session && pnDevice !== 0) {
+                        console.log(`🔄 Copying device 0 session to device ${pnDevice} LID`)
+                        await this.keys.set({
+                            'session': {
+                                [lidAddr]: device0Session
+                            }
+                        })
+                        console.log(`✅ Device 0 session copied to LID device ${lidDevice}`)
+                    }
                 }
             })
         } catch (error) {
-            console.error('Session migration failed:', error)
+            console.error(`❌ Session migration failed for ${pnJid} -> ${lidJid}:`, error)
         }
     }
 
