@@ -14,6 +14,10 @@ import {
 export class LIDMappingStore {
     private readonly keys: SignalKeyStoreWithTransaction
     
+    // Small LRU cache for immediate synchronous access in retry scenarios
+    private readonly syncCache = new Map<string, string>() // Limited cache for sync access
+    private readonly maxCacheSize = 100 // Keep small to avoid memory issues
+    
     constructor(keys: SignalKeyStoreWithTransaction) {
         this.keys = keys
     }
@@ -51,6 +55,9 @@ export class LIDMappingStore {
             })
         })
         
+        // Update sync cache after successful storage
+        this.updateSyncCache(pnUser, lidUser)
+        
         console.log(`✅ LID mapping stored: ${pnUser} ↔ ${lidUser}`)
     }
 
@@ -69,6 +76,9 @@ export class LIDMappingStore {
         const lidUser = stored[decoded.user]
         
         if (!lidUser || typeof lidUser !== 'string') return null
+        
+        // Update sync cache for immediate access
+        this.updateSyncCache(decoded.user, lidUser)
         
         // CRITICAL: Preserve device ID from input
         return decoded.device !== undefined
@@ -91,6 +101,9 @@ export class LIDMappingStore {
         const pnUser = stored[`${decoded.user}_1`]
         
         if (!pnUser || typeof pnUser !== 'string') return null
+        
+        // Update sync cache for immediate access (reverse mapping)
+        this.updateSyncCache(pnUser, decoded.user)
         
         // CRITICAL: Preserve device ID from input
         return decoded.device !== undefined
@@ -133,11 +146,36 @@ export class LIDMappingStore {
     }
 
     /**
-     * Fast Redis lookup (replaces old cache method)
+     * Helper to manage small sync cache
      */
-    async getFromCache(pn: string): Promise<string | null> {
-        // Redis is our cache now - delegate to main method
-        return this.getLIDForPN(pn)
+    private updateSyncCache(pnUser: string, lidUser: string): void {
+        // Keep cache small - remove oldest if needed
+        if (this.syncCache.size >= this.maxCacheSize) {
+            const firstKey = this.syncCache.keys().next().value
+            if (firstKey) {
+                this.syncCache.delete(firstKey)
+            }
+        }
+        this.syncCache.set(pnUser, lidUser)
+    }
+
+    /**
+     * Fast synchronous cache lookup for retry scenarios
+     */
+    getFromCache(pn: string): string | null {
+        if (!isJidUser(pn)) return null
+        
+        const decoded = jidDecode(pn)
+        if (!decoded) return null
+        
+        // Check sync cache first
+        const lidUser = this.syncCache.get(decoded.user)
+        if (!lidUser) return null
+        
+        // CRITICAL: Preserve device ID from input
+        return decoded.device !== undefined
+            ? `${lidUser}:${decoded.device}@lid`
+            : `${lidUser}@lid`
     }
 
     /**
