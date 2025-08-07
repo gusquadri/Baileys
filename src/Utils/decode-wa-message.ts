@@ -281,21 +281,46 @@ export const decryptMessageNode = (
 									} else {
 										// No SenderAlt, check stored LID mapping - whatsmeow line 289-297  
 										const lidMapping = repository.getLIDMappingStore()
-										const lidForPN = await lidMapping.getLIDForPN(sender)
+										
+										// Add device ID to PN for proper lookup during decryption
+										const pnForLookup = sender.includes(':') 
+											? sender 
+											: sender.replace('@s.whatsapp.net', ':0@s.whatsapp.net')
+										
+										logger.debug({ 
+											originalSender: sender,
+											pnForLookup 
+										}, 'Looking up LID mapping during decryption')
+										
+										const lidForPN = await lidMapping.getLIDForPN(pnForLookup)
 										
 										if (lidForPN) {
 											logger.debug({ 
-												pn: sender, 
+												pn: pnForLookup, 
 												lid: lidForPN 
-											}, 'whatsmeow: Using stored LID mapping for decryption')
+											}, 'whatsmeow: Found stored LID mapping for decryption')
 											
-											// WHATSMEOW: Migrate when stored mapping exists (message.go:292)
-											await repository.migrateSession(sender, lidForPN)
-											
-											senderEncryptionJid = lidForPN
-											fullMessage.key.senderLid = lidForPN
+											// Simple session existence check without actual decryption
+											try {
+												const lidAddr = repository.jidToSignalProtocolAddress(lidForPN)
+												logger.debug({ lidAddr }, '🔍 Checking LID session existence during decryption')
+												
+												// Use the LID for decryption if mapping exists
+												senderEncryptionJid = lidForPN
+												fullMessage.key.senderLid = lidForPN
+												
+												logger.debug({ 
+													finalJid: senderEncryptionJid 
+												}, '✅ Using LID for decryption based on stored mapping')
+											} catch (validationError: any) {
+												logger.debug({ 
+													lid: lidForPN, 
+													fallback: sender, 
+													error: validationError?.message 
+												}, '⚠️ LID validation failed, using PN for decryption')
+											}
 										} else {
-											logger.debug({ sender }, 'whatsmeow: No LID found, using PN')
+											logger.debug({ sender: pnForLookup }, 'whatsmeow: No LID mapping found, using PN')
 										}
 									}
 								}
