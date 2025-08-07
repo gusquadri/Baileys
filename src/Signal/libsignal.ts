@@ -209,15 +209,26 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 				const session = new libsignal.SessionCipher(storage, addr)
 				
 				let result: Buffer
-				switch (type) {
-					case 'pkmsg':
-						result = await session.decryptPreKeyWhisperMessage(ciphertext)
-						break
-					case 'msg':
-						result = await session.decryptWhisperMessage(ciphertext)
-						break
-					default:
-						throw new Error(`Unknown message type: ${type}`)
+				try {
+					switch (type) {
+						case 'pkmsg':
+							result = await session.decryptPreKeyWhisperMessage(ciphertext)
+							break
+						case 'msg':
+							result = await session.decryptWhisperMessage(ciphertext)
+							break
+						default:
+							throw new Error(`Unknown message type: ${type}`)
+					}
+				} catch (error: any) {
+					// TODO: Replace this hack with proper prevention:
+					// 1. Message ordering per device pair
+					// 2. Session-level mutex locking  
+					// 3. Proper migration that doesn't copy session state
+					// 4. Device-specific chain isolation
+					console.error(`❌ Session error for ${jid}: ${error.message}`)
+					console.error(`🚨 This indicates a fundamental consistency problem that needs proper fixing`)
+					throw error
 				}
 				
 				return result
@@ -242,7 +253,19 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 					const lidForPN = await lidMapping.getLIDForPN(jid)
 					if (lidForPN) {
 						console.log(`🔄 whatsmeow pattern: Found LID for PN: ${jid} → ${lidForPN}`)
-						encryptionJid = lidForPN
+						
+						// CRITICAL: Validate LID session exists before using it
+						const lidAddr = jidToSignalProtocolAddress(lidForPN)
+						const lidSession = await storage.loadSession(lidAddr.toString())
+						
+						if (lidSession && lidSession.haveOpenSession()) {
+							console.log(`✅ LID session validated: ${lidForPN}`)
+							encryptionJid = lidForPN
+						} else {
+							console.log(`⚠️ LID session missing/invalid for ${lidForPN}, using PN: ${jid}`)
+							// Fall back to PN if LID session is not available
+							encryptionJid = jid
+						}
 						
 						// REMOVED: Don't migrate during encryption - only when receiving messages
 						// Migration during encryption corrupts sessions and causes "Assertion failed"
