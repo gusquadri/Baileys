@@ -205,56 +205,43 @@ export const decryptMessageNode = (
 						const e2eType = tag === 'plaintext' ? 'plaintext' : attrs.type
 						switch (e2eType) {
 							case 'skmsg':
-								// Store LID mappings from group messages - ensure device consistency
+								// Store LID mappings from group messages - only if devices match
 								if (fullMessage.key.senderLid && author) {
 									logger.debug('Storing LID-PN mapping from group message')
 									
-									// Extract device from PN author to ensure consistency
+									// DEVICE CONSISTENCY CHECK: Only store if devices match
 									const authorDecoded = jidDecode(author)
 									const pnDeviceId = authorDecoded?.device || 0
 									
-									// If LID already has device, check for consistency
 									let shouldStoreMapping = true
-									let lidDeviceId = 0
 									
+									// If LID has device info, check consistency with PN device
 									if (fullMessage.key.senderLid.includes(':')) {
 										const lidDecoded = jidDecode(fullMessage.key.senderLid)
-										lidDeviceId = lidDecoded?.device || 0
+										const lidDeviceId = lidDecoded?.device || 0
 										
-										// Check device consistency
+										// Only store if devices match
 										if (pnDeviceId !== lidDeviceId) {
 											logger.warn({ 
 												pnDevice: pnDeviceId,
 												lidDevice: lidDeviceId,
 												author,
 												senderLid: fullMessage.key.senderLid
-											}, '🚫 Group message device mismatch detected - skipping LID mapping storage')
+											}, '🚫 Group device mismatch - skipping LID mapping (prevents PreKey errors)')
 											shouldStoreMapping = false
 										}
-									} else {
-										// Use PN device for LID
-										lidDeviceId = pnDeviceId
 									}
+									// If LID has no device info, we can store it (device 0 assumed)
 									
 									if (shouldStoreMapping) {
-										// Add matching device ID to both LID and PN
-										const lidWithDevice = fullMessage.key.senderLid.includes(':') 
-											? fullMessage.key.senderLid 
-											: `${fullMessage.key.senderLid.replace('@lid', '')}:${lidDeviceId}@lid`
-										
-										const pnWithDevice = author.includes(':') 
-											? author 
-											: `${author.replace('@s.whatsapp.net', '')}:${pnDeviceId}@s.whatsapp.net`
-										
 										logger.debug({ 
-											originalSenderLid: fullMessage.key.senderLid,
-											lidWithDevice,
-											originalAuthor: author,
-											pnWithDevice,
-											deviceConsistency: 'validated'
-										}, 'Storing group LID-PN mapping with validated device consistency')
+											lid: fullMessage.key.senderLid,
+											pn: author,
+											note: 'Group device consistency validated'
+										}, '✅ Storing group LID-PN mapping with matching devices')
 										
-										await repository.storeLIDPNMapping(lidWithDevice, pnWithDevice)
+										// Store mapping between actual addresses from message
+										await repository.storeLIDPNMapping(fullMessage.key.senderLid, author)
 									}
 								}
 								
@@ -286,57 +273,44 @@ export const decryptMessageNode = (
 										}, 'whatsmeow: Using SenderAlt (LID) for decryption')
 										senderEncryptionJid = fullMessage.key.senderLid
 										
-										// Store mapping - ensure device consistency between LID and PN
-										// Extract device from PN to use for LID mapping
+										// DEVICE CONSISTENCY CHECK: Only store if devices match
 										const pnDecoded = jidDecode(sender)
 										const pnDeviceId = pnDecoded?.device || 0
 										
-										// If LID already has device, check for consistency
 										let shouldStoreMapping = true
-										let lidDeviceId = 0
 										
+										// If LID has device info, check consistency with PN device
 										if (fullMessage.key.senderLid.includes(':')) {
 											const lidDecoded = jidDecode(fullMessage.key.senderLid)
-											lidDeviceId = lidDecoded?.device || 0
+											const lidDeviceId = lidDecoded?.device || 0
 											
-											// Check device consistency
+											// Only store if devices match
 											if (pnDeviceId !== lidDeviceId) {
 												logger.warn({ 
 													pnDevice: pnDeviceId,
 													lidDevice: lidDeviceId,
 													sender,
 													senderLid: fullMessage.key.senderLid
-												}, '🚫 Device mismatch detected - skipping LID mapping storage')
+												}, '🚫 Device mismatch - skipping LID mapping (prevents PreKey errors)')
 												shouldStoreMapping = false
 											}
-										} else {
-											// Use PN device for LID
-											lidDeviceId = pnDeviceId
 										}
+										// If LID has no device info, we can store it (device 0 assumed)
 										
 										if (shouldStoreMapping) {
-											// Add matching device ID to both LID and PN
-											const lidWithDevice = fullMessage.key.senderLid.includes(':') 
-												? fullMessage.key.senderLid 
-												: `${fullMessage.key.senderLid.replace('@lid', '')}:${lidDeviceId}@lid`
-											
-											const pnWithDevice = sender.includes(':') 
-												? sender 
-												: `${sender.replace('@s.whatsapp.net', '')}:${pnDeviceId}@s.whatsapp.net`
-											
 											logger.debug({ 
-												originalSenderLid: fullMessage.key.senderLid,
-												lidWithDevice,
-												originalSender: sender,
-												pnWithDevice,
-												deviceConsistency: 'validated'
-											}, 'Storing LID-PN mapping with validated device consistency')
+												lid: fullMessage.key.senderLid,
+												pn: sender,
+												note: 'Device consistency validated'
+											}, '✅ Storing LID-PN mapping with matching devices')
 											
-											await repository.storeLIDPNMapping(lidWithDevice, pnWithDevice)
+											// Store mapping between actual addresses from message
+											await repository.storeLIDPNMapping(fullMessage.key.senderLid, sender)
 										}
 										
-										// WHATSMEOW: Migrate when SenderAlt is present (message.go:288)
-										await repository.migrateSession(sender, fullMessage.key.senderLid)
+										// DISABLED: Session migration during decryption causes Bad MAC errors
+										// Migration should only happen when server explicitly sends migration notifications
+										// await repository.migrateSession(sender, fullMessage.key.senderLid)
 									} else {
 										// No SenderAlt, check stored LID mapping - whatsmeow line 289-297  
 										const lidMapping = repository.getLIDMappingStore()

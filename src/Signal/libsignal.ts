@@ -280,19 +280,7 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 				console.error(`❌ libsignal encryption failed for ${encryptionJid}:`, encryptionError.message)
 				console.error(`Session address: ${addr.toString()}`)
 				
-				// CRITICAL: If Assertion failed, the session is corrupted beyond repair
-				if (encryptionError.message?.includes('Assertion failed')) {
-					console.error(`🚨 Session corrupted beyond repair: ${addr.toString()}`)
-					console.error(`💀 Deleting corrupted session to prevent future failures`)
-					
-					// Delete the corrupted session completely
-					await storage.storeSession(addr.toString(), null)
-					
-					// This will require a fresh prekey exchange on next message
-					throw new Error(`Session corrupted for ${encryptionJid} - deleted corrupted state, retry with fresh prekey exchange`)
-				}
-				
-				// For other errors, fail fast without recovery attempts
+				// WHATSMEOW: NO fallback encryption attempts - fail fast
 				throw encryptionError
 			}
 		},
