@@ -204,21 +204,10 @@ export const decryptMessageNode = (
 						const e2eType = tag === 'plaintext' ? 'plaintext' : attrs.type
 						switch (e2eType) {
 							case 'skmsg':
-								console.log(`🔍 Group message decryption - checking for LID-PN mapping:`)
-								console.log(`  senderLid: ${fullMessage.key.senderLid || 'NOT PRESENT'}`)
-								console.log(`  participant: ${fullMessage.key.participant || 'NOT PRESENT'}`)
-								console.log(`  sender: ${sender}`)
-								console.log(`  author: ${author}`)
-								
-								// Store LID-PN mapping for group messages too
+								// WHATSMEOW GROUP MESSAGE: Store LID-PN mapping if present
 								if (fullMessage.key.senderLid && author) {
-									console.log(`📝 Storing LID-PN mapping from group message`)
+									logger.debug('Storing LID-PN mapping from group message')
 									await repository.storeLIDPNMapping(fullMessage.key.senderLid, author)
-								} else if (fullMessage.key.senderLid && fullMessage.key.participant) {
-									console.log(`📝 Storing LID-PN mapping from group message (participant)`)
-									await repository.storeLIDPNMapping(fullMessage.key.senderLid, fullMessage.key.participant)
-								} else {
-									console.log(`⚠️ Group message - not storing mapping (missing data)`)
 								}
 								
 								msgBuffer = await repository.decryptGroupMessage({
@@ -229,96 +218,47 @@ export const decryptMessageNode = (
 								break
 							case 'pkmsg':
 							case 'msg':
-								// WHATSMEOW EXACT DECRYPTION LOGIC (message.go:284-298)
+								// WHATSMEOW EXACT LOGIC (message.go:284-298) - NO reactive migrations!
 								let senderEncryptionJid = sender
-								console.log(`📱 Initial sender address: ${sender}`)
 								
-								// whatsmeow logic: Check sender type and SenderAlt priority
+								// whatsmeow: Check sender type and SenderAlt priority ONLY
 								if (sender.includes('@s.whatsapp.net') && !sender.includes('bot')) {
 									if (fullMessage.key.senderLid?.includes('@lid')) {
 										// SenderAlt (LID) takes priority - whatsmeow line 286-288
-										console.log(`🔄 whatsmeow: SenderAlt (LID) found, using for decryption: ${fullMessage.key.senderLid}`)
+										logger.debug({ 
+											sender, 
+											senderLid: fullMessage.key.senderLid 
+										}, 'whatsmeow: Using SenderAlt (LID) for decryption')
 										senderEncryptionJid = fullMessage.key.senderLid
 										
-										// Store mapping and migrate session
+										// Store mapping (whatsmeow does this)
 										await repository.storeLIDPNMapping(fullMessage.key.senderLid, sender)
-										await repository.migrateSession(sender, fullMessage.key.senderLid)
 									} else {
 										// No SenderAlt, check stored LID mapping - whatsmeow line 289-297
 										const lidMapping = repository.getLIDMappingStore()
 										const lidForPN = await lidMapping.getLIDForPN(sender)
 										
 										if (lidForPN) {
-											console.log(`🔄 whatsmeow: Found stored LID mapping: ${sender} → ${lidForPN}`)
-											await repository.migrateSession(sender, lidForPN)
+											logger.debug({ 
+												pn: sender, 
+												lid: lidForPN 
+											}, 'whatsmeow: Using stored LID mapping for decryption')
 											senderEncryptionJid = lidForPN
 											fullMessage.key.senderLid = lidForPN
 										} else {
-											console.log(`⚠️ whatsmeow: No LID found for ${sender}`)
+											logger.debug({ sender }, 'whatsmeow: No LID found, using PN')
 										}
 									}
 								}
 								
-								// ADAPTIVE DECRYPTION: Try appropriate address first, fallback if needed
-								console.log(`📱 Using sender address for decryption: ${senderEncryptionJid}`)
+								// WHATSMEOW: Single decryption attempt - NO fallbacks or migrations
+								logger.debug({ finalSender: senderEncryptionJid }, 'Using resolved sender for decryption')
 								
-								try {
-									msgBuffer = await repository.decryptMessage({
-										jid: senderEncryptionJid,
-										type: e2eType,
-										ciphertext: content
-									})
-								} catch (decryptError: any) {
-									// BAILEYS PATTERN: Graceful fallback on decryption failure
-									if (decryptError.message?.includes('Bad MAC') || decryptError.message?.includes('No matching sessions')) {
-										logger.debug({ 
-											primaryJid: senderEncryptionJid, 
-											senderLid: fullMessage.key.senderLid,
-											error: decryptError.message 
-										}, 'Primary decryption failed, checking for session migration opportunity')
-										
-										// Try alternate addressing if we have the mapping
-										let alternateJid: string | null = null
-										if (fullMessage.key.senderLid && fullMessage.key.senderLid !== senderEncryptionJid) {
-											alternateJid = fullMessage.key.senderLid
-										} else {
-											// Check if we can get alternate address from mapping store
-											const lidMapping = repository.getLIDMappingStore()
-											if (senderEncryptionJid.includes('@s.whatsapp.net')) {
-												alternateJid = await lidMapping.getLIDForPN(senderEncryptionJid)
-											} else if (senderEncryptionJid.includes('@lid')) {
-												alternateJid = await lidMapping.getPNForLID(senderEncryptionJid)
-											}
-										}
-										
-										if (alternateJid) {
-											logger.debug({ primary: senderEncryptionJid, alternate: alternateJid }, 'Attempting decryption with alternate address')
-											try {
-												msgBuffer = await repository.decryptMessage({
-													jid: alternateJid,
-													type: e2eType,
-													ciphertext: content
-												})
-												
-												// Success - migrate session for future consistency (Baileys pattern)
-												await repository.migrateSession(alternateJid, senderEncryptionJid)
-												logger.debug({ from: alternateJid, to: senderEncryptionJid }, 'Migrated session after successful alternate decryption')
-											} catch (alternateError: any) {
-												logger.error({ 
-													primaryError: decryptError.message,
-													alternateError: alternateError.message,
-													primary: senderEncryptionJid,
-													alternate: alternateJid
-												}, 'Both primary and alternate decryption failed')
-												throw decryptError // Throw original error
-											}
-										} else {
-											throw decryptError // No alternate address available
-										}
-									} else {
-										throw decryptError // Not a session-related error
-									}
-								}
+								msgBuffer = await repository.decryptMessage({
+									jid: senderEncryptionJid,
+									type: e2eType,
+									ciphertext: content
+								})
 								break
 							case 'plaintext':
 								msgBuffer = content

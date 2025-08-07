@@ -228,14 +228,13 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 				// Use the provided address directly - don't convert to LID
 				encryptionJid = jid
 			} else if (LIDMappingStore.isPN(jid)) {
-				// whatsmeow send.go:996 - Always try to get LID for PN (external contacts only)
+				// whatsmeow send.go:1180-1186 - Always try to get LID for PN (external contacts only)
 				try {
 					const lidForPN = await lidMapping.getLIDForPN(jid)
 					if (lidForPN) {
 						console.log(`🔄 whatsmeow pattern: Found LID for PN: ${jid} → ${lidForPN}`)
 						encryptionJid = lidForPN
-						// Proactive migration (whatsmeow pattern)
-						await migrateSession(jid, lidForPN)
+						// WHATSMEOW: NO proactive migration - only when server notifies
 					}
 				} catch (error) {
 					console.warn(`⚠️ LID lookup failed for ${jid}, using PN`)
@@ -254,17 +253,7 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 				if (!targetSession || !targetSession.haveOpenSession()) {
 					console.log(`⚠️ No active session at ${encryptionJid}`)
 					
-					// BAILEYS FALLBACK PATTERN: Look for alternate session only if needed
-					if (encryptionJid !== jid) {
-						// We changed addresses, check if original has session
-						const origAddr = jidToSignalProtocolAddress(jid)
-						const origSession = await storage.loadSession(origAddr.toString())
-						
-						if (origSession && origSession.haveOpenSession()) {
-							console.log(`✅ Found session at original address, migrating: ${jid} → ${encryptionJid}`)
-							await migrateSession(jid, encryptionJid)
-						}
-					}
+					// WHATSMEOW: NO reactive session migration - sessions stay where they are
 				} else {
 					// Session exists - validate it's not corrupted
 					console.log(`✅ Active session found for ${encryptionJid}`)
@@ -291,26 +280,7 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 					console.error(`❌ libsignal encryption failed for ${encryptionJid}:`, encryptionError.message)
 					console.error(`Session address: ${addr.toString()}`)
 					
-					// Check if this is the protobuf serialization error
-					if (encryptionError.message?.includes('Assertion failed')) {
-						// This might be a corrupted session - check if we have an alternate
-						if (encryptionJid !== jid) {
-							console.log(`🔄 Encryption failed with LID, trying original PN: ${jid}`)
-							const origAddr = jidToSignalProtocolAddress(jid)
-							const origCipher = new libsignal.SessionCipher(storage, origAddr)
-							
-							try {
-								const { type: sigType, body } = await origCipher.encrypt(data)
-								const type = sigType === 3 ? 'pkmsg' : 'msg'
-								console.log(`✅ Encryption succeeded with original PN`)
-								return { type, ciphertext: Buffer.from(body as any, 'binary') }
-							} catch (origError: any) {
-								console.error(`❌ Original PN encryption also failed: ${origError.message}`)
-								throw encryptionError // Throw original error
-							}
-						}
-					}
-					
+					// WHATSMEOW: NO fallback encryption attempts - fail fast
 					throw encryptionError
 				}
 			})
@@ -393,11 +363,20 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			return privacyTokenManager
 		},
 		/**
-		 * Server-coordinated migration - only call when server notifies about LID changes
+		 * Server-coordinated migration - ONLY call when server explicitly notifies about LID changes
 		 * This is WhatsApp's proper migration approach (prevents Bad MAC errors)
+		 * 
+		 * WARNING: Do NOT call this during message processing - only when server sends migration notifications!
 		 */
 		async migrateSession(fromJid: string, toJid: string) {
-			await coordinatedSessionMigration(fromJid, toJid)
+			console.log(`⚠️ migrateSession called - this should ONLY happen when server sends migration notifications!`)
+			console.trace('Migration call stack')
+			
+			// For now, disable all migrations to prevent double ratchet
+			console.log(`🚫 Migration disabled to prevent double ratchet: ${fromJid} → ${toJid}`)
+			return
+			
+			// await coordinatedSessionMigration(fromJid, toJid)
 		}
 	}
 }
