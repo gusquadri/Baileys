@@ -240,9 +240,18 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			} else {
 				// ENABLED: Use our LID priority system for proper message routing
 				try {
-					const { determineLIDEncryptionJid } = require('../Utils/decode-wa-message-lid')
+					// Dynamic import for ES modules compatibility
+					const { determineLIDEncryptionJid } = await import('../Utils/decode-wa-message-lid.js')
 					// Create simple logger interface
-					const simpleLogger = { debug: console.log, trace: console.log, warn: console.warn }
+					const simpleLogger = { 
+						debug: console.log, 
+						trace: console.log, 
+						warn: console.warn,
+						info: console.info,
+						error: console.error,
+						level: 'debug' as const,
+						child: () => simpleLogger
+					}
 					const { encryptionJid: lidJid, shouldMigrate } = await determineLIDEncryptionJid(
 						jid, undefined, repository, simpleLogger, authCreds.me?.id
 					)
