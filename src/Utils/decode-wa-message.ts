@@ -234,6 +234,16 @@ export const decryptMessageNode = (
 									meId
 								)
 								
+								// Store LID mapping when detected from message metadata
+								if (senderAlt && isLidUser(senderAlt) && isJidUser(sender)) {
+									try {
+										await repository.storeLIDPNMapping(senderAlt, sender)
+										logger.debug({ sender, senderAlt }, 'Stored LID mapping from message metadata')
+									} catch (error) {
+										logger.error({ sender, senderAlt, error }, 'Failed to store LID mapping from metadata')
+									}
+								}
+								
 								// Trigger session migration if needed
 								if (shouldMigrate && senderEncryptionJid !== sender) {
 									try {
