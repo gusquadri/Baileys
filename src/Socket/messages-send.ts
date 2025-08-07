@@ -287,11 +287,79 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		return deviceResults
 	}
 
-	const assertSessions = async (jids: string[], force: boolean) => {
+	// Session recreation cache for whatsmeow pattern (separate from retry cache)
+	const sessionRecreateCache = new NodeCache<number>({ stdTTL: 60 * 60 }) // 1 hour TTL
+	
+	// Helper function for whatsmeow session recreation logic
+	const shouldRecreateSessionForRetry = async (retryCount: number, participant: string): Promise<{ recreate: boolean, reason: string }> => {
+		// Check if we have a session for this participant
+		const sessionKey = signalRepository.jidToSignalProtocolAddress(participant)
+		const participantSessions = await authState.keys.get('session', [sessionKey])
+		const hasSession = Object.keys(participantSessions).length > 0 && participantSessions[sessionKey]
+		
+		if (!hasSession) {
+			return { recreate: true, reason: "no session exists with participant" }
+		}
+		
+		// Only recreate after 2+ failed attempts (whatsmeow pattern)
+		if (retryCount < 2) {
+			return { recreate: false, reason: "retry count too low" }
+		}
+		
+		// Rate limiting: only recreate once per hour per participant (whatsmeow pattern)  
+		const sessionRecreateKey = `session-recreate:${participant}`
+		const lastRecreation = sessionRecreateCache.get(sessionRecreateKey)
+		const oneHourAgo = Date.now() - (60 * 60 * 1000)
+		
+		if (!lastRecreation || lastRecreation < oneHourAgo) {
+			sessionRecreateCache.set(sessionRecreateKey, Date.now())
+			return { recreate: true, reason: "retry count >= 2 and over an hour since last recreation" }
+		}
+		
+		return { recreate: false, reason: "session recreated recently" }
+	}
+
+	const assertSessions = async (jids: string[], force: boolean, retryContext?: { retryCount: number, participant: string }) => {
 		let didFetchNewSession = false
 		let jidsRequiringFetch: string[] = []
+		
 		if (force) {
+			// WHATSMEOW PATTERN: Enhanced force logic for session recreation
+			if (retryContext) {
+				// Check if we should recreate sessions based on whatsmeow logic
+				const { retryCount, participant } = retryContext
+				const shouldRecreate = await shouldRecreateSessionForRetry(retryCount, participant)
+				
+				if (shouldRecreate.recreate) {
+					logger.info({ participant, retryCount, reason: shouldRecreate.reason }, 'Recreating session per whatsmeow pattern')
+					
+					// CRITICAL: Delete existing broken sessions first (whatsmeow pattern)
+					const sessionsToDelete: { [key: string]: null } = {}
+					const sessionKeysToRecreate: string[] = []
+					for (const jid of jids) {
+						const sessionKey = signalRepository.jidToSignalProtocolAddress(jid)
+						sessionsToDelete[sessionKey] = null
+						sessionKeysToRecreate.push(sessionKey)
+					}
+					await authState.keys.set({ 'session': sessionsToDelete })
+					
 			jidsRequiringFetch = jids
+				} else {
+					logger.debug({ participant, retryCount, reason: shouldRecreate.reason }, 'Using existing sessions')
+					// Still check which sessions are missing
+					const addrs = jids.map(jid => signalRepository.jidToSignalProtocolAddress(jid))
+					const sessions = await authState.keys.get('session', addrs)
+					for (const jid of jids) {
+						const signalId = signalRepository.jidToSignalProtocolAddress(jid)
+						if (!sessions[signalId]) {
+							jidsRequiringFetch.push(jid)
+						}
+					}
+				}
+			} else {
+				// Standard force behavior - fetch for all
+				jidsRequiringFetch = jids
+			}
 		} else {
 			const addrs = jids.map(jid => signalRepository.jidToSignalProtocolAddress(jid))
 			const sessions = await authState.keys.get('session', addrs)

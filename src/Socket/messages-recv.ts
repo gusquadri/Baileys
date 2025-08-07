@@ -223,13 +223,14 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		const retryKey = `${msgId}:${msgKey?.participant}`
 		
 		if (retryCount >= maxMsgRetryCount) {
-			logger.debug({ retryCount, msgId, participant: msgKey?.participant }, 'reached retry limit, clearing')
-			msgRetryCache.del(retryKey)
-			// Also clear original key if we tried alternative addressing
-			if (alternativeRetryAttempted && retryKey !== originalKey) {
-				msgRetryCache.del(originalKey)
+				logger.debug({ retryCount, msgId, participant: msgKey?.participant }, 'reached retry limit, clearing')
+				msgRetryCache.del(retryKey)
+				// Also clear original key if we tried alternative addressing
+				if (alternativeRetryAttempted && retryKey !== originalKey) {
+					msgRetryCache.del(originalKey)
+				}
+				return
 			}
-			return
 		}
 
 		retryCount += 1
@@ -765,11 +766,11 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			}
 		}
 		
-		// if it's the primary jid sending the request
-		// just re-send the message to everyone
-		// prevents the first message decryption failure
+		// Use enhanced assertSessions with whatsmeow retry context
+		await assertSessions([participant], true, { retryCount, participant })
+		
+		// if it's the primary jid sending the request, send to all devices
 		const sendToAll = !jidDecode(participant)?.device
-		await assertSessions([participant], true)
 
 		if (isJidGroup(remoteJid)) {
 			await authState.keys.set({ 'sender-key-memory': { [remoteJid]: null } })
