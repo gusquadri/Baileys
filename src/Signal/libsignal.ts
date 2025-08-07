@@ -209,26 +209,15 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 				const session = new libsignal.SessionCipher(storage, addr)
 				
 				let result: Buffer
-				try {
-					switch (type) {
-						case 'pkmsg':
-							result = await session.decryptPreKeyWhisperMessage(ciphertext)
-							break
-						case 'msg':
-							result = await session.decryptWhisperMessage(ciphertext)
-							break
-						default:
-							throw new Error(`Unknown message type: ${type}`)
-					}
-				} catch (error: any) {
-					// TODO: Replace this hack with proper prevention:
-					// 1. Message ordering per device pair
-					// 2. Session-level mutex locking  
-					// 3. Proper migration that doesn't copy session state
-					// 4. Device-specific chain isolation
-					console.error(`❌ Session error for ${jid}: ${error.message}`)
-					console.error(`🚨 This indicates a fundamental consistency problem that needs proper fixing`)
-					throw error
+				switch (type) {
+					case 'pkmsg':
+						result = await session.decryptPreKeyWhisperMessage(ciphertext)
+						break
+					case 'msg':
+						result = await session.decryptWhisperMessage(ciphertext)
+						break
+					default:
+						throw new Error(`Unknown message type: ${type}`)
 				}
 				
 				return result
@@ -260,7 +249,7 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 						
 						if (lidSession && lidSession.haveOpenSession()) {
 							console.log(`✅ LID session validated: ${lidForPN}`)
-							encryptionJid = lidForPN
+						encryptionJid = lidForPN
 						} else {
 							console.log(`⚠️ LID session missing/invalid for ${lidForPN}, using PN: ${jid}`)
 							// Fall back to PN if LID session is not available
@@ -279,45 +268,43 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			
 			const addr = jidToSignalProtocolAddress(encryptionJid)
 			
-			// Use transaction to ensure atomicity (Baileys pattern)
-			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
-				// SESSION VALIDATION: Check session health before encryption
-				const targetSession = await storage.loadSession(addr.toString())
+			// CRITICAL FIX: Don't use transaction for session operations to prevent concurrency issues
+			// SESSION VALIDATION: Check session health before encryption
+			const targetSession = await storage.loadSession(addr.toString())
+			
+			if (!targetSession || !targetSession.haveOpenSession()) {
+				console.log(`⚠️ No active session at ${encryptionJid}`)
 				
-				if (!targetSession || !targetSession.haveOpenSession()) {
-					console.log(`⚠️ No active session at ${encryptionJid}`)
-					
-					// WHATSMEOW: NO reactive session migration - sessions stay where they are
-				} else {
-					// Session exists - validate it's not corrupted
-					console.log(`✅ Active session found for ${encryptionJid}`)
-					
-					// Additional validation: check if session has proper sessions data
-					try {
-						const sessions = (targetSession as any).sessions
-						if (!sessions || sessions.length === 0) {
-							console.warn(`⚠️ Session missing session data for ${encryptionJid}`)
-						}
-					} catch (validationError) {
-						console.warn(`⚠️ Session validation failed for ${encryptionJid}:`, validationError)
-					}
-				}
+				// WHATSMEOW: NO reactive session migration - sessions stay where they are
+			} else {
+				// Session exists - validate it's not corrupted
+				console.log(`✅ Active session found for ${encryptionJid}`)
 				
-				// Create cipher and attempt encryption
-				const cipher = new libsignal.SessionCipher(storage, addr)
-				
+				// Additional validation: check if session has proper sessions data
 				try {
-					const { type: sigType, body } = await cipher.encrypt(data)
-					const type = sigType === 3 ? 'pkmsg' : 'msg'
-					return { type, ciphertext: Buffer.from(body as any, 'binary') }
-				} catch (encryptionError: any) {
-					console.error(`❌ libsignal encryption failed for ${encryptionJid}:`, encryptionError.message)
-					console.error(`Session address: ${addr.toString()}`)
-					
-					// WHATSMEOW: NO fallback encryption attempts - fail fast
-					throw encryptionError
+					const sessions = (targetSession as any).sessions
+					if (!sessions || sessions.length === 0) {
+						console.warn(`⚠️ Session missing session data for ${encryptionJid}`)
+					}
+				} catch (validationError) {
+					console.warn(`⚠️ Session validation failed for ${encryptionJid}:`, validationError)
 				}
-			})
+			}
+			
+			// Create cipher and attempt encryption WITHOUT transaction to prevent session corruption
+			const cipher = new libsignal.SessionCipher(storage, addr)
+			
+			try {
+				const { type: sigType, body } = await cipher.encrypt(data)
+				const type = sigType === 3 ? 'pkmsg' : 'msg'
+				return { type, ciphertext: Buffer.from(body as any, 'binary') }
+			} catch (encryptionError: any) {
+				console.error(`❌ libsignal encryption failed for ${encryptionJid}:`, encryptionError.message)
+				console.error(`Session address: ${addr.toString()}`)
+				
+				// WHATSMEOW: NO fallback encryption attempts - fail fast
+				throw encryptionError
+			}
 		},
 		async encryptGroupMessage({ group, meId, data }) {
 			const senderName = jidToSignalSenderKeyName(group, meId)
