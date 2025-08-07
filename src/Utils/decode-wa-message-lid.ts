@@ -37,7 +37,9 @@ export async function determineLIDEncryptionJid(
     const hasSession = async (jid: string): Promise<boolean> => {
         try {
             const lidStore = repository.getLIDMappingStore()
-            return await lidStore.hasSession(jid)
+            const sessionExists = await lidStore.hasSession(jid)
+            logger.debug({ jid, sessionExists }, 'Session existence check')
+            return sessionExists
         } catch (error) {
             logger.warn({ jid, error }, 'Failed to check session existence')
             return false
@@ -46,41 +48,86 @@ export async function determineLIDEncryptionJid(
 
     // WhatsApp Priority System with Session Validation:
     
-    // PRIORITY 1: Use LID from message metadata if available AND has session
+    // PRIORITY 1: Use LID from message metadata - migrate if session missing
     if (senderAlt && isLidUser(senderAlt)) {
+        logger.debug({ sender, senderAlt }, 'Checking LID from message metadata')
         const hasLidSession = await hasSession(senderAlt)
+        const hasPnSession = await hasSession(sender)
+        
         if (hasLidSession) {
-            logger.debug({ sender, senderAlt }, 'Using LID from message metadata (session exists)')
+            logger.info({ 
+                sender, 
+                senderAlt, 
+                deviceId: sender.split(':')[1]?.split('@')[0] || '0'
+            }, 'Using LID from message metadata (session already exists)')
             encryptionJid = senderAlt
-            shouldMigrate = true
+            shouldMigrate = false // Session already exists, no migration needed
+            return { encryptionJid, shouldMigrate }
+        } else if (hasPnSession) {
+            logger.info({ 
+                sender, 
+                senderAlt, 
+                deviceId: sender.split(':')[1]?.split('@')[0] || '0'
+            }, 'LID from metadata needs migration - PN session exists, LID session missing')
+            encryptionJid = senderAlt
+            shouldMigrate = true // Migrate PN session to LID
             return { encryptionJid, shouldMigrate }
         } else {
-            logger.warn({ sender, senderAlt }, 'LID from metadata has no session - falling back to PN')
+            logger.warn({ 
+                sender, 
+                senderAlt, 
+                deviceId: sender.split(':')[1]?.split('@')[0] || '0'
+            }, 'Neither LID nor PN session exists - falling back to PN for session creation')
         }
     }
 
-    // PRIORITY 2: Check stored LID mapping AND validate session
+    // PRIORITY 2: Check stored LID mapping - migrate if session missing
     try {
         const lidStore = repository.getLIDMappingStore()
         const storedLid = await lidStore.getLIDForPN(sender)
         
         if (storedLid) {
+            logger.debug({ sender, storedLid }, 'Found stored LID mapping, checking session status')
             const hasLidSession = await hasSession(storedLid)
+            const hasPnSession = await hasSession(sender)
+            
             if (hasLidSession) {
-                logger.debug({ sender, storedLid }, 'Using stored LID mapping (session exists)')
+                logger.info({ 
+                    sender, 
+                    storedLid, 
+                    deviceId: sender.split(':')[1]?.split('@')[0] || '0'
+                }, 'Using stored LID mapping (session already exists)')
                 encryptionJid = storedLid
-                shouldMigrate = true
+                shouldMigrate = false // Session already exists, no migration needed
+                return { encryptionJid, shouldMigrate }
+            } else if (hasPnSession) {
+                logger.info({ 
+                    sender, 
+                    storedLid, 
+                    deviceId: sender.split(':')[1]?.split('@')[0] || '0'
+                }, 'Stored LID mapping needs migration - PN session exists, LID session missing')
+                encryptionJid = storedLid
+                shouldMigrate = true // Migrate PN session to LID
                 return { encryptionJid, shouldMigrate }
             } else {
-                logger.warn({ sender, storedLid }, 'Stored LID has no session - falling back to PN')
+                logger.warn({ 
+                    sender, 
+                    storedLid, 
+                    deviceId: sender.split(':')[1]?.split('@')[0] || '0'
+                }, 'LID mapping exists but neither LID nor PN session found - falling back to PN for session creation')
             }
+        } else {
+            logger.debug({ sender }, 'No stored LID mapping found')
         }
     } catch (error) {
         logger.error({ sender, error }, 'Failed to lookup LID mapping')
     }
 
-    // PRIORITY 3: No LID found or no LID session - use PN
-    logger.debug({ sender }, 'No LID with valid session found - using PN')
+    // PRIORITY 3: No LID found or migration not possible - use PN
+    logger.info({ 
+        sender, 
+        deviceId: sender.split(':')[1]?.split('@')[0] || '0'
+    }, 'No LID mapping found or migration not possible - using PN')
     return { encryptionJid, shouldMigrate }
 }
 
@@ -90,7 +137,7 @@ export async function determineLIDEncryptionJid(
  */
 export async function handleLIDMigrationSync(
     encodedPayload: Uint8Array,
-    repository: SignalRepository,
+    _repository: SignalRepository,
     logger: ILogger
 ): Promise<void> {
     try {
