@@ -803,6 +803,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	}
 
 	const handleReceipt = async (node: BinaryNode) => {
+		logger.info({ node }, 'recv receipt')
 		const { attrs, content } = node
 		const isLid = attrs.from!.includes('lid')
 		const isNodeFromMe = areJidsSameUser(
@@ -869,6 +870,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 					if (attrs.type === 'retry') {
 						// correctly set who is asking for the retry
+						logger.info({ attrs, key }, 'recv retry request')
 						key.participant = key.participant || attrs.from
 						const retryNode = getBinaryNodeChild(node, 'retry')
 						if (willSendMessageAgain(ids[0]!, key.participant!)) {
@@ -1020,9 +1022,27 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				if (decoded.pnToLidMappings && decoded.pnToLidMappings.length > 0) {
 					for (const mapping of decoded.pnToLidMappings) {
 						const pn = `${mapping.pn}@s.whatsapp.net`
-						const lid = `${mapping.assignedLid}@lid`
+						// Use latestLid if available, otherwise assignedLid (proper LID refresh)
+						const lidValue = mapping.latestLid || mapping.assignedLid
+						const lid = `${lidValue}@lid`
+						
 						await lidMapping.storeLIDPNMapping(lid, pn)
-						logger.debug({ pn, lid }, 'Stored server-provided PN-LID mapping')
+						logger.debug({ 
+							pn, 
+							lid, 
+							assignedLid: mapping.assignedLid,
+							latestLid: mapping.latestLid,
+							usedLatest: !!mapping.latestLid
+						}, 'Stored server-provided PN-LID mapping')
+						
+						// If latestLid differs from assignedLid, this is a LID refresh/migration
+						if (mapping.latestLid && mapping.latestLid !== mapping.assignedLid) {
+							logger.info({ 
+								pn, 
+								oldLid: `${mapping.assignedLid}@lid`, 
+								newLid: lid 
+							}, 'LID refresh detected - updated to latest LID')
+						}
 					}
 				}
 				
@@ -1525,6 +1545,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 	ws.on('CB:receipt', node => {
 		processNode('receipt', node, 'handling receipt', handleReceipt)
+		logger.info({ node }, 'received receipt')
 	})
 
 	ws.on('CB:notification', async (node: BinaryNode) => {
