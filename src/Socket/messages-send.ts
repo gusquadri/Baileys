@@ -865,11 +865,19 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					return !isOurMainId
 				})
 
+				logger.debug({
+					msgId,
+					totalParticipants: participants.length,
+					allTargetDevices,
+					recipientDevices,
+					ourMainId: authState.creds.me?.id
+				}, 'Device extraction for receipt tracking')
+
 				if (recipientDevices.length > 0) {
 					receiptTracker.trackMessageSent(
 						messageKey,
 						jid,
-						isGroup ? recipientDevices : undefined
+						recipientDevices  // Always pass device list for both groups and 1-to-1
 					)
 					
 					logger.trace({
