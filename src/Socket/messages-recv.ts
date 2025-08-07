@@ -231,7 +231,6 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				}
 				return
 			}
-		}
 
 		retryCount += 1
 		msgRetryCache.set(retryKey, retryCount)
