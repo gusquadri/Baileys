@@ -205,22 +205,17 @@ export const decryptMessageNode = (
 						const e2eType = tag === 'plaintext' ? 'plaintext' : attrs.type
 						switch (e2eType) {
 							case 'skmsg':
-								// WHATSMEOW GROUP MESSAGE: Store LID-PN mapping if present
+								// Store LID mappings from group messages - preserve exact format
 								if (fullMessage.key.senderLid && author) {
 									logger.debug('Storing LID-PN mapping from group message')
 									
-									const authorDecoded = jidDecode(author)
-									const lidWithDevice = authorDecoded?.device 
-										? `${fullMessage.key.senderLid.replace('@lid', '')}:${authorDecoded.device}@lid`
-										: fullMessage.key.senderLid
-									
 									logger.debug({ 
-										originalLid: fullMessage.key.senderLid,
-										lidWithDevice,
+										senderLid: fullMessage.key.senderLid,
 										author 
-									}, 'Fixed LID-PN mapping with device ID')
+									}, 'Storing group LID-PN mapping with original format')
 									
-									await repository.storeLIDPNMapping(lidWithDevice, author)
+									// Use LID field exactly as provided - never modify it
+									await repository.storeLIDPNMapping(fullMessage.key.senderLid, author)
 								}
 								
 								msgBuffer = await repository.decryptGroupMessage({
@@ -251,20 +246,14 @@ export const decryptMessageNode = (
 										}, 'whatsmeow: Using SenderAlt (LID) for decryption')
 										senderEncryptionJid = fullMessage.key.senderLid
 										
-										// Store mapping (whatsmeow does this)
-										// FIX: Extract device ID from PN and add to LID for proper mapping
-										const senderDecoded = jidDecode(sender)
-										const lidWithDevice = senderDecoded?.device 
-											? `${fullMessage.key.senderLid.replace('@lid', '')}:${senderDecoded.device}@lid`
-											: fullMessage.key.senderLid
-										
+										// Store mapping - preserve LID exactly as sent by WhatsApp
 										logger.debug({ 
-											originalLid: fullMessage.key.senderLid,
-											lidWithDevice,
+											senderLid: fullMessage.key.senderLid,
 											sender 
-										}, 'Fixed LID-PN mapping with device ID')
+										}, 'Storing LID-PN mapping with original LID format')
 										
-										await repository.storeLIDPNMapping(lidWithDevice, sender)
+										// Use LID field exactly as provided - never modify it
+										await repository.storeLIDPNMapping(fullMessage.key.senderLid, sender)
 										
 										// WHATSMEOW: Migrate when SenderAlt is present (message.go:288)
 										await repository.migrateSession(sender, fullMessage.key.senderLid)
