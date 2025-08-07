@@ -262,6 +262,24 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 						
 						if (shouldMigrate) {
 							console.log(`🔄 Session migration required: ${jid} → ${lidJid}`)
+							try {
+								await repository.migrateSession(jid, lidJid)
+								console.log(`✅ Session migrated successfully: ${jid} → ${lidJid}`)
+								
+								// Verify the migrated session actually exists
+								const lidAddr = jidToSignalProtocolAddress(lidJid)
+								const migratedSession = await storage.loadSession(lidAddr.toString())
+								
+								if (!migratedSession) {
+									console.warn(`⚠️ Migrated session not found, falling back to PN: ${jid}`)
+									encryptionJid = jid
+								}
+							} catch (migrationError: any) {
+								console.error(`❌ Session migration failed: ${jid} → ${lidJid}:`, migrationError?.message || migrationError)
+								// Fallback to original JID if migration fails
+								console.log(`🔄 Falling back to original JID: ${jid}`)
+								encryptionJid = jid
+							}
 						}
 					}
 				} catch (error: any) {
