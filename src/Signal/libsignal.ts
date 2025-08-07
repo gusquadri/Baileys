@@ -244,8 +244,8 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 						console.log(`🔄 whatsmeow pattern: Found LID for PN: ${jid} → ${lidForPN}`)
 						encryptionJid = lidForPN
 						
-						// WHATSMEOW: Migrate when stored mapping exists (send.go:1184)
-						await migrateSession(jid, lidForPN)
+						// REMOVED: Don't migrate during encryption - only when receiving messages
+						// Migration during encryption corrupts sessions and causes "Assertion failed"
 					}
 				} catch (error) {
 					console.warn(`⚠️ LID lookup failed for ${jid}, using PN`)
