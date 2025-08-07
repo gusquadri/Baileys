@@ -152,15 +152,17 @@ export class LIDMappingStore {
             throw new Error(`Invalid JID format: PN=${pn}, LID=${lid}`)
         }
 
-        // Convert to session-style format with device preservation
+        // Convert to session-style format with device preservation (always add .0 as fallback)
         // PN: "554391318447:43@s.whatsapp.net" → "554391318447.43"
+        // PN: "554391318447@s.whatsapp.net" → "554391318447.0"
         // LID: "102765716062358:43@lid" → "102765716062358_1.43"
-        const pnKey = decoded.device 
+        // LID: "102765716062358@lid" → "102765716062358_1.0"
+        const pnKey = decoded.device !== undefined
             ? `${decoded.user}.${decoded.device}`
-            : decoded.user
-        const lidKey = lidDecoded.device
+            : `${decoded.user}.0`
+        const lidKey = lidDecoded.device !== undefined
             ? `${lidDecoded.user}_1.${lidDecoded.device}`  
-            : `${lidDecoded.user}_1`
+            : `${lidDecoded.user}_1.0`
 
         // Use transaction to ensure atomicity (like other Signal operations)
         try {
@@ -169,9 +171,19 @@ export class LIDMappingStore {
             console.log(`  LID: ${lid} → Redis key: ${lidKey}`)
             
             await this.keys.transaction(async () => {
-                // CRITICAL: Invalidate any existing cache entries first
-                // This prevents conflicts when relationships change or when sessions are updated
-                this.invalidateMapping(lid, pn)
+                // SMART INVALIDATION: Only invalidate if mapping is actually changing
+                const existingLidForPN = this.cache.get(pn)
+                const existingPNForLID = this.cache.get(`lid-${lid}`)
+                
+                const mappingChanged = (existingLidForPN && existingLidForPN !== lid) || 
+                                     (existingPNForLID && existingPNForLID !== pn)
+                
+                if (mappingChanged) {
+                    console.log(`🔄 Mapping changed, invalidating cache: ${pn} ↔ ${lid}`)
+                    this.invalidateMapping(lid, pn)
+                } else {
+                    console.log(`✅ Mapping unchanged, preserving cache: ${pn} ↔ ${lid}`)
+                }
                 
                 // Store bidirectional mapping using session-style keys
                 await this.keys.set({
