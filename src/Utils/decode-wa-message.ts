@@ -249,11 +249,36 @@ export const decryptMessageNode = (
 									addressingMode
 								}, 'Using LID priority for decryption')
 								
-								msgBuffer = await repository.decryptMessage({
-									jid: senderEncryptionJid,
-									type: e2eType,
-									ciphertext: content
-								})
+								// Try LID decryption first, fallback to PN on session mismatch
+								try {
+									msgBuffer = await repository.decryptMessage({
+										jid: senderEncryptionJid,
+										type: e2eType,
+										ciphertext: content
+									})
+								} catch (lidError: any) {
+									// Check if this is a Bad MAC error (session mismatch)
+									const isBadMac = lidError?.message?.includes('Bad MAC') || 
+									                lidError?.message?.includes('No matching sessions')
+									
+									if (isBadMac && senderEncryptionJid !== sender) {
+										logger.warn({
+											originalSender: sender,
+											attemptedLid: senderEncryptionJid,
+											error: lidError.message
+										}, 'LID decryption failed with session mismatch, falling back to PN')
+										
+										// Fallback to original PN address
+										msgBuffer = await repository.decryptMessage({
+											jid: sender,
+											type: e2eType,
+											ciphertext: content
+										})
+									} else {
+										// Re-throw if not a session mismatch error
+										throw lidError
+									}
+								}
 								break
 							case 'plaintext':
 								msgBuffer = content
