@@ -183,14 +183,23 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 				item.axolotlSenderKeyDistributionMessage
 			)
 			const senderNameStr = senderName.toString()
+			console.log(`🔑 Processing sender key distribution for: ${senderNameStr}`)
 
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
 				const { [senderNameStr]: senderKey } = await auth.keys.get('sender-key', [senderNameStr])
+				console.log(`🔍 Existing sender key check: ${senderKey ? 'FOUND' : 'NOT FOUND'}`)
+				
 				if (!senderKey) {
+					console.log(`📝 Creating new sender key record for: ${senderNameStr}`)
 					await storage.storeSenderKey(senderName, new SenderKeyRecord())
 				}
 
+				console.log(`⚙️ Processing sender key message...`)
 				await builder.process(senderName, senderMsg)
+				
+				// Verify the key was stored
+				const { [senderNameStr]: verifyKey } = await auth.keys.get('sender-key', [senderNameStr])
+				console.log(`✅ Sender key storage verification: ${verifyKey ? 'SUCCESS' : 'FAILED'}`)
 			})
 		},
 		async decryptMessage({ jid, type, ciphertext }) {
@@ -506,8 +515,18 @@ function signalStorage({ creds, keys }: SignalAuthState): StorageType & SenderKe
 		},
 		storeSenderKey: async (senderKeyName: SenderKeyName, key: SenderKeyRecord) => {
 			const keyId = senderKeyName.toString()
-			const serialized = JSON.stringify(key.serialize())
-			await keys.set({ 'sender-key': { [keyId]: Buffer.from(serialized, 'utf-8') } })
+			console.log(`💾 Storing sender key: ${keyId}`)
+			
+			const serialized = key.serialize()
+			console.log(`📊 Serialized sender key states: ${serialized.length} states`)
+			
+			const jsonStr = JSON.stringify(serialized)
+			const buffer = Buffer.from(jsonStr, 'utf-8')
+			
+			console.log(`📦 Buffer size: ${buffer.length} bytes`)
+			
+			await keys.set({ 'sender-key': { [keyId]: buffer } })
+			console.log(`✅ Sender key stored: ${keyId}`)
 		},
 		getOurRegistrationId: async () => creds.registrationId,
 		getOurIdentity: async () => {

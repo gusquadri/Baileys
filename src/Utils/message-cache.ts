@@ -131,9 +131,7 @@ export class MessageCache {
 	 * Simple implementation that only handles sent messages
 	 */
 	async getMessage(key: proto.IMessageKey): Promise<proto.IMessage | undefined> {
-		if (!key || !key.fromMe) {
-			// Only handle messages from self (sent messages)
-			this.misses++
+		if (!key) {
 			return undefined
 		}
 

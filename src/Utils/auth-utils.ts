@@ -425,13 +425,19 @@ export const addTransactionCapability = (
 					const key = key_ as keyof SignalDataTypeMap
 					transactionCache[key] = transactionCache[key] || ({} as any)
 
+					console.log(`🔧 Transaction set - key type: ${key}, data:`, data[key])
+
 					// Special handling for pre-keys and signed-pre-keys
 					if (key === 'pre-key') {
+						console.log(`📋 Using pre-key operations for: ${key}`)
 						await handlePreKeyOperations(data, key, transactionCache, mutations, logger, true)
 					} else {
 						// Normal handling for other key types
+						console.log(`🔧 Using normal operations for: ${key}`)
 						handleNormalKeyOperations(data, key, transactionCache, mutations)
 					}
+					
+					console.log(`📦 After handling ${key} - mutations keys:`, Object.keys(mutations))
 				}
 			} else {
 				// Not in transaction, apply directly with mutex protection
@@ -509,12 +515,17 @@ export const addTransactionCapability = (
 				// commit if this is the outermost transaction
 				if (transactionsInProgress === 1) {
 							const hasMutations = Object.keys(mutations).length > 0
+							console.log(`💾 Transaction commit - mutations keys:`, Object.keys(mutations))
+							console.log(`💾 Mutations data:`, mutations)
 
 							if (hasMutations) {
+						console.log('💾 Committing transaction with mutations')
 						logger.trace('committing transaction')
 								await commitWithRetry(mutations, state, getKeyTypeMutex, maxCommitRetries, delayBetweenTriesMs, logger)
 								logger.trace({ dbQueriesInTransaction }, 'transaction completed')
+								console.log('✅ Transaction committed successfully')
 					} else {
+						console.log('❌ No mutations in transaction to commit')
 						logger.trace('no mutations in transaction')
 					}
 				}

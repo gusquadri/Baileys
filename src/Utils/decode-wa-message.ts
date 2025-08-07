@@ -10,7 +10,8 @@ import {
 	isJidNewsletter,
 	isJidStatusBroadcast,
 	isJidUser,
-	isLidUser
+	isLidUser,
+	jidDecode
 } from '../WABinary'
 import { unpadRandomMax16 } from './generics'
 import type { ILogger } from './logger'
@@ -207,7 +208,19 @@ export const decryptMessageNode = (
 								// WHATSMEOW GROUP MESSAGE: Store LID-PN mapping if present
 								if (fullMessage.key.senderLid && author) {
 									logger.debug('Storing LID-PN mapping from group message')
-									await repository.storeLIDPNMapping(fullMessage.key.senderLid, author)
+									
+									const authorDecoded = jidDecode(author)
+									const lidWithDevice = authorDecoded?.device 
+										? `${fullMessage.key.senderLid.replace('@lid', '')}:${authorDecoded.device}@lid`
+										: fullMessage.key.senderLid
+									
+									logger.debug({ 
+										originalLid: fullMessage.key.senderLid,
+										lidWithDevice,
+										author 
+									}, 'Fixed LID-PN mapping with device ID')
+									
+									await repository.storeLIDPNMapping(lidWithDevice, author)
 								}
 								
 								msgBuffer = await repository.decryptGroupMessage({
@@ -239,7 +252,19 @@ export const decryptMessageNode = (
 										senderEncryptionJid = fullMessage.key.senderLid
 										
 										// Store mapping (whatsmeow does this)
-										await repository.storeLIDPNMapping(fullMessage.key.senderLid, sender)
+										// FIX: Extract device ID from PN and add to LID for proper mapping
+										const senderDecoded = jidDecode(sender)
+										const lidWithDevice = senderDecoded?.device 
+											? `${fullMessage.key.senderLid.replace('@lid', '')}:${senderDecoded.device}@lid`
+											: fullMessage.key.senderLid
+										
+										logger.debug({ 
+											originalLid: fullMessage.key.senderLid,
+											lidWithDevice,
+											sender 
+										}, 'Fixed LID-PN mapping with device ID')
+										
+										await repository.storeLIDPNMapping(lidWithDevice, sender)
 										
 										// WHATSMEOW: Migrate when SenderAlt is present (message.go:288)
 										await repository.migrateSession(sender, fullMessage.key.senderLid)
