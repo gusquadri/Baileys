@@ -23,6 +23,7 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 	// Link managers for cross-referencing (avoiding circular dependency)
 	lidMapping.setPrivacyTokenManager(privacyTokenManager)
 	
+	
 	// Migration deduplication cache using professional LRU library
 	const migratedSessionsCache = new LRUCache<string, boolean>({
 		max: 1000, // Maximum 1000 migration records
@@ -156,7 +157,7 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 	}
 
 
-	return {
+	const repository: SignalRepository = {
 		decryptGroupMessage({ group, authorJid, msg }) {
 			const senderName = jidToSignalSenderKeyName(group, authorJid)
 			const cipher = new GroupCipher(storage, senderName)
@@ -236,10 +237,28 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 				console.log(`⚡ Own device optimization: Skipping LID lookup for ${jid} (own device)`)
 				// Use the provided address directly - don't convert to LID
 				encryptionJid = jid
-			} else if (false && LIDMappingStore.isPN(jid)) {
-				// DISABLED: LID mapping is too complex for real-time handling
-				// Use session as received without LID conversion for consistency testing
-				console.log(`🚫 LID mapping disabled - using provided JID: ${jid}`)
+			} else {
+				// ENABLED: Use our LID priority system for proper message routing
+				try {
+					const { determineLIDEncryptionJid } = require('../Utils/decode-wa-message-lid')
+					// Create simple logger interface
+					const simpleLogger = { debug: console.log, trace: console.log, warn: console.warn }
+					const { encryptionJid: lidJid, shouldMigrate } = await determineLIDEncryptionJid(
+						jid, undefined, repository, simpleLogger, authCreds.me?.id
+					)
+					
+					if (lidJid !== jid) {
+						console.log(`🔄 LID priority routing: ${jid} → ${lidJid}`)
+						encryptionJid = lidJid
+						
+						if (shouldMigrate) {
+							console.log(`🔄 Session migration required: ${jid} → ${lidJid}`)
+						}
+					}
+				} catch (error: any) {
+					console.log(`⚠️ LID priority check failed for ${jid}, using original:`, error?.message || error)
+					encryptionJid = jid
+				}
 			}
 			
 			console.log(`📤 Final encryption identity: ${encryptionJid}`)
@@ -418,6 +437,8 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			})
 		}
 	}
+
+	return repository
 }
 
 const jidToSignalProtocolAddress = (jid: string) => {

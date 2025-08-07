@@ -15,6 +15,7 @@ import {
 } from '../WABinary'
 import { unpadRandomMax16 } from './generics'
 import type { ILogger } from './logger'
+import { determineLIDEncryptionJid } from './decode-wa-message-lid'
 
 export const NO_MESSAGE_FOUND_ERROR_TEXT = 'Message absent from node'
 export const MISSING_KEYS_ERROR_TEXT = 'Key used already or never filled'
@@ -205,42 +206,48 @@ export const decryptMessageNode = (
 						const e2eType = tag === 'plaintext' ? 'plaintext' : attrs.type
 						switch (e2eType) {
 							case 'skmsg':
-								// DISABLED: No LID mapping storage - simplified approach
-								// Group messages decrypt with author address directly (like encryption)
+								// Apply LID priority to group message author
+								const { addressingMode: groupAddressingMode, senderAlt: authorAlt } = extractAddressingContext(stanza, sender, author)
+								const { encryptionJid: authorEncryptionJid } = await determineLIDEncryptionJid(
+									author,
+									authorAlt,
+									repository,
+									logger,
+									meId
+								)
 								
 								msgBuffer = await repository.decryptGroupMessage({
 									group: sender,
-									authorJid: author,
+									authorJid: authorEncryptionJid,
 									msg: content
 								})
 								break
 							case 'pkmsg':
 							case 'msg':
-								// WHATSMEOW EXACT LOGIC (message.go:284-298) - NO reactive migrations!
-								let senderEncryptionJid = sender
+								// Apply WhatsApp's LID priority system
+								const { addressingMode, senderAlt } = extractAddressingContext(stanza, sender)
+								const { encryptionJid: senderEncryptionJid, shouldMigrate } = await determineLIDEncryptionJid(
+									sender,
+									senderAlt,
+									repository,
+									logger,
+									meId
+								)
 								
-								// OWN DEVICE OPTIMIZATION: Skip LID logic for our own devices (prevents session corruption)
-								const ownPhoneNumber = meId.split('@')[0]?.split(':')[0]
-								const targetUser = sender.split('@')[0]?.split(':')[0]
-								
-								if (ownPhoneNumber && targetUser === ownPhoneNumber) {
-									logger.debug({ sender }, '⚡ Own device optimization: Skipping LID logic for own device')
-									// Use the provided address directly - don't convert to LID
-									senderEncryptionJid = sender
-								} else if (sender.includes('@s.whatsapp.net') && !sender.includes('bot')) {
-									// SIMPLIFIED APPROACH: Use sender address directly (like encryption)
-									// No complex LID mapping - just decrypt with provided address
-									logger.debug({ 
-										sender,
-										senderLid: fullMessage.key.senderLid,
-										note: 'Using direct address for decryption (no LID mapping)'
-									}, '🔧 Simplified decryption approach')
-									
-									senderEncryptionJid = sender
+								// Trigger session migration if needed
+								if (shouldMigrate && senderEncryptionJid !== sender) {
+									try {
+										await repository.migrateSession(sender, senderEncryptionJid)
+									} catch (error) {
+										logger.error({ sender, lid: senderEncryptionJid, error }, 'Session migration failed')
+									}
 								}
 								
-								// WHATSMEOW: Single decryption attempt - NO fallbacks or migrations
-								logger.debug({ finalSender: senderEncryptionJid }, 'Using resolved sender for decryption')
+								logger.debug({ 
+									originalSender: sender,
+									finalSender: senderEncryptionJid,
+									addressingMode
+								}, 'Using LID priority for decryption')
 								
 								msgBuffer = await repository.decryptMessage({
 									jid: senderEncryptionJid,
