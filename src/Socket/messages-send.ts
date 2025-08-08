@@ -458,16 +458,11 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 						
 						// else if !lidForPN.IsEmpty()
 						if (lidForPN && lidForPN.includes('@lid')) {
-							// CRITICAL: Only use LID if we have a session for it
-							const hasLidSession = await lidStore.hasSession(lidForPN)
-							if (hasLidSession) {
-								// IMPORTANT: NO MIGRATION DURING SEND - only use LID if we already have it
-								// Migration should only happen during message RECEPTION
-								encryptionIdentity = lidForPN
-								console.log(`📤 Using existing LID with session: ${jid} → ${lidForPN}`)
-							} else {
-								console.log(`⚠️ LID found but no session: ${jid} → ${lidForPN}, using PN`)
-							}
+							// cli.migrateSessionStore(ctx, jid, lidForPN)
+							await signalRepository.migrateSession(jid, lidForPN)
+							// encryptionIdentity = lidForPN
+							encryptionIdentity = lidForPN
+							console.log(`📤 whatsmeow logic: ${jid} → ${lidForPN}`)
 						}
 					} catch (error) {
 						console.warn(`⚠️ Failed to get LID for ${jid}:`, error)
