@@ -26,7 +26,6 @@ import {
 	delay,
 	derivePairingCodeKey,
 	encodeBigEndian,
-	encodeSignedDeviceIdentity,
 	getCallStatusFromNode,
 	getHistoryMsg,
 	getNextPreKeys,
@@ -244,7 +243,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			logger.debug(`sendRetryRequest: requested placeholder resend for message ${msgId}`)
 		}
 
-		const deviceIdentity = encodeSignedDeviceIdentity(account!, true)
+		const deviceIdentity = proto.ADVSignedDeviceIdentity.encode(account!).finish()
 		await authState.keys.transaction(async () => {
 			const receipt: BinaryNode = {
 				tag: 'receipt',
