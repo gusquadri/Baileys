@@ -320,10 +320,48 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			}
 		} else {
 			const identityNode = getBinaryNodeChild(node, 'identity')
-			if (identityNode) {
-				logger.info({ jid: from }, 'identity changed')
-				// not handling right now
-				// signal will override new identity anyway
+			if (identityNode && from) {
+				logger.info({ jid: from }, 'Identity changed notification - clearing all sessions and identities')
+				
+				// Following whatsmeow's approach: clear all sessions for this user
+				try {
+					const userJid = from.split('@')[0] // Get user portion without domain
+					const signalRepo = (authState.keys as any)
+					
+					// Clear all sessions for this user (all devices)
+					const sessionKeys = Object.keys(await signalRepo.get('session') || {})
+					const userSessions = sessionKeys.filter(key => key.startsWith(userJid + '.'))
+					
+					if (userSessions.length > 0) {
+						const sessionUpdates: { [key: string]: null } = {}
+						userSessions.forEach(key => {
+							sessionUpdates[key] = null
+						})
+						
+						await signalRepo.set({ 'session': sessionUpdates })
+						logger.info({ jid: from, clearedSessions: userSessions.length }, 'Cleared sessions after identity change')
+					}
+					
+					// Clear identity keys for this user  
+					const identityKeys = Object.keys(await signalRepo.get('identity-key') || {})
+					const userIdentities = identityKeys.filter(key => key.startsWith(userJid + '.'))
+					
+					if (userIdentities.length > 0) {
+						const identityUpdates: { [key: string]: null } = {}
+						userIdentities.forEach(key => {
+							identityUpdates[key] = null
+						})
+						
+						await signalRepo.set({ 'identity-key': identityUpdates })
+						logger.info({ jid: from, clearedIdentities: userIdentities.length }, 'Cleared identities after identity change')
+					}
+					
+					// Log identity change event (custom event not in ConnectionState interface)
+					logger.info({ jid: from, timestamp: Date.now() }, 'Identity change processed - sessions and identities cleared')
+					
+				} catch (error) {
+					logger.error({ jid: from, error }, 'Failed to clear sessions/identities after identity change')
+				}
 			} else {
 				logger.info({ node }, 'unknown encrypt notification')
 			}
@@ -766,7 +804,40 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			}
 		}
 		
-		// Use enhanced assertSessions with whatsmeow retry context
+		// WhatsApp's shouldRecreateSession logic (following whatsmeow retry.go:88-107)
+		const shouldRecreateSession = (retryCount: number, participant: string): boolean => {
+			// Recreate session after specific retry thresholds (whatsmeow pattern)
+			if (retryCount >= 3) {
+				logger.info({ participant, retryCount }, 'High retry count, recreating session')
+				return true
+			}
+			
+			// Time-based session recreation (1 hour timeout like whatsmeow)
+			// Note: In production, you'd track lastSessionCreation timestamp per participant
+			// For now, use retry count as proxy for time-based recreation
+			if (retryCount === 2) {
+				logger.info({ participant, retryCount }, 'Retry threshold reached, recreating session')
+				return true  
+			}
+			
+			return false
+		}
+		
+		// Session recreation if needed (following whatsmeow approach)
+		if (shouldRecreateSession(retryCount, participant)) {
+			try {
+				// Clear existing session to force recreation (whatsmeow pattern)
+				const addr = signalRepository.jidToSignalProtocolAddress(participant)
+				await (authState.keys as any).set({
+					'session': { [addr]: null }
+				})
+				logger.info({ participant, retryCount }, 'Cleared session for recreation')
+			} catch (error) {
+				logger.error({ participant, error }, 'Failed to clear session for recreation')
+			}
+		}
+		
+		// Use enhanced assertSessions with whatsmeow retry context  
 		await assertSessions([participant], true, { retryCount, participant })
 		
 		// if it's the primary jid sending the request, send to all devices

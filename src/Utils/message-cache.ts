@@ -128,7 +128,7 @@ export class MessageCache {
 
 	/**
 	 * Built-in getMessage implementation for retry support
-	 * Simple implementation that only handles sent messages
+	 * Enhanced to handle device-specific JID lookups (e.g., 554391318447:63@s.whatsapp.net)
 	 */
 	async getMessage(key: proto.IMessageKey): Promise<proto.IMessage | undefined> {
 		if (!key) {
@@ -138,8 +138,23 @@ export class MessageCache {
 		const remoteJid = key.remoteJid || ''
 		const id = key.id || ''
 		
-		const message = this.getRecentMessage(remoteJid, id)
-		return message
+		// First try exact match
+		let message = this.getRecentMessage(remoteJid, id)
+		if (message) {
+			return message
+		}
+		
+		// If no exact match and this is a device-specific JID, try main JID
+		if (remoteJid.includes(':') && remoteJid.includes('@s.whatsapp.net')) {
+			const mainJid = remoteJid.split(':')[0] + '@s.whatsapp.net'
+			message = this.getRecentMessage(mainJid, id)
+			if (message) {
+				this.logger.trace({ deviceJid: remoteJid, mainJid, id }, 'Found message using main JID fallback')
+				return message
+			}
+		}
+		
+		return undefined
 	}
 
 	/**

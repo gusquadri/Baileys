@@ -34,6 +34,7 @@ import {
 	parseAndInjectE2ESessions,
 	unixTimestampSeconds
 } from '../Utils'
+import { makeKeyedMutex } from '../Utils/make-mutex'
 import { getUrlInfo } from '../Utils/link-preview'
 import { getMessageSenderJid } from '../Utils/sender-identity'
 import {
@@ -71,6 +72,10 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		messageCacheConfig
 	} = config
 	const sock: NewsletterSocket = makeNewsletterSocket(makeGroupsSocket(config))
+	
+	// Session coordination following whatsmeow's approach
+	const sessionOperationMutex = makeKeyedMutex()
+	
 	const {
 		ev,
 		authState,
@@ -444,35 +449,41 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				}
 
 				const bytes = encodeWAMessage(patchedMessage)
-				
-				// EXACT WHATSMEOW LOGIC: send.go:1178-1187
-				let encryptionIdentity = jid
 				const wireJid = jid
 				
-				// if jid.Server == types.DefaultUserServer
-				if (jid.includes('@s.whatsapp.net') && !jid.includes('bot')) {
-					try {
-						// lidForPN, err := cli.Store.LIDs.GetLIDForPN(ctx, jid)
-						const lidStore = signalRepository.getLIDMappingStore()
-						const lidForPN = await lidStore.getLIDForPN(jid)
-						
-						// else if !lidForPN.IsEmpty()
-						if (lidForPN && lidForPN.includes('@lid')) {
-							// cli.migrateSessionStore(ctx, jid, lidForPN)
-							await signalRepository.migrateSession(jid, lidForPN)
-							// encryptionIdentity = lidForPN
-							encryptionIdentity = lidForPN
-							console.log(`📤 whatsmeow logic: ${jid} → ${lidForPN}`)
+				// Coordinate session operations to prevent race conditions (following whatsmeow)
+				const encryptionResult = await sessionOperationMutex.mutex(jid, async () => {
+					// EXACT WHATSMEOW LOGIC: send.go:1178-1187
+					let encryptionIdentity = jid
+					
+					// if jid.Server == types.DefaultUserServer
+					if (jid.includes('@s.whatsapp.net') && !jid.includes('bot')) {
+						try {
+							// lidForPN, err := cli.Store.LIDs.GetLIDForPN(ctx, jid)
+							const lidStore = signalRepository.getLIDMappingStore()
+							const lidForPN = await lidStore.getLIDForPN(jid)
+							
+							// else if !lidForPN.IsEmpty()
+							if (lidForPN && lidForPN.includes('@lid')) {
+								// cli.migrateSessionStore(ctx, jid, lidForPN)
+								await signalRepository.migrateSession(jid, lidForPN)
+								// encryptionIdentity = lidForPN
+								encryptionIdentity = lidForPN
+								console.log(`📤 coordinated session: ${jid} → ${lidForPN}`)
+							}
+						} catch (error) {
+							console.warn(`⚠️ Failed to get LID for ${jid}:`, error)
 						}
-					} catch (error) {
-						console.warn(`⚠️ Failed to get LID for ${jid}:`, error)
 					}
-				}
-				
-				const { type, ciphertext } = await signalRepository.encryptMessage({ 
-					jid: encryptionIdentity, 
-					data: bytes
+					
+					// Encrypt with coordinated session state
+					return await signalRepository.encryptMessage({ 
+						jid: encryptionIdentity, 
+						data: bytes
+					})
 				})
+				
+				const { type, ciphertext } = encryptionResult
 				if (type === 'pkmsg') {
 					shouldIncludeDeviceIdentity = true
 				}
