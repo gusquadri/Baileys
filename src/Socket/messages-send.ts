@@ -20,7 +20,6 @@ import {
 	decryptMediaRetryData,
 	delay,
 	encodeNewsletterMessage,
-	encodeSignedDeviceIdentity,
 	encodeWAMessage,
 	encryptMediaRetryRequest,
 	extractDeviceJids,
@@ -543,21 +542,15 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		const destinationJid = !isStatus ? jidEncode(user, isLid ? 'lid' : isGroup ? 'g.us' : 's.whatsapp.net') : statusJid
 
 		// PRIVACY TOKENS: Get privacy token for recipient (following whatsmeow approach)
-		let privacyToken = !isGroup && !isStatus ? await getPrivacyToken(destinationJid) : null
+		const privacyToken = !isGroup && !isStatus ? await getPrivacyToken(destinationJid) : null
 		
-		// Auto-request privacy token if missing (proactive approach)
+		// Background token request if missing (don't wait for response)
 		if (!privacyToken && !isGroup && !isStatus && isJidUser(destinationJid)) {
-			try {
-				logger.debug({ destinationJid }, 'Privacy token missing - requesting automatically')
-				await getPrivacyTokens([destinationJid])
-				// Try to get token again after request (may not be available immediately)
-				privacyToken = await getPrivacyToken(destinationJid)
-				if (privacyToken) {
-					logger.info({ destinationJid }, 'Privacy token obtained after request')
-				}
-			} catch (error) {
-				logger.warn({ destinationJid, error }, 'Failed to request privacy token')
-			}
+			// Request token in background for future messages (following whatsmeow's async approach)
+			getPrivacyTokens([destinationJid]).catch(error => {
+				logger.warn({ destinationJid, error }, 'Background privacy token request failed')
+			})
+			logger.debug({ destinationJid }, 'Requested privacy token in background for future messages')
 		}
 		
 		const binaryNodeContent: BinaryNode[] = []
@@ -852,7 +845,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				;(stanza.content as BinaryNode[]).push({
 					tag: 'device-identity',
 					attrs: {},
-					content: encodeSignedDeviceIdentity(authState.creds.account!, true)
+					content: proto.ADVSignedDeviceIdentity.encode(authState.creds.account!).finish()
 				})
 
 				logger.debug({ jid }, 'adding device identity')
