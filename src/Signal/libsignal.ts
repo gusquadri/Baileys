@@ -79,25 +79,22 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			})
 		},
 		async decryptMessage({ jid, type, ciphertext }) {
-			// Use transaction to ensure atomicity
-			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
-				const addr = jidToSignalProtocolAddress(jid)
-				const session = new libsignal.SessionCipher(storage, addr)
-				
-				let result: Buffer
-				switch (type) {
-					case 'pkmsg':
-						result = await session.decryptPreKeyWhisperMessage(ciphertext)
-						break
-					case 'msg':
-						result = await session.decryptWhisperMessage(ciphertext)
-						break
-					default:
-						throw new Error(`Unknown message type: ${type}`)
-				}
-				
-				return result
-			})
+			const addr = jidToSignalProtocolAddress(jid)
+			const session = new libsignal.SessionCipher(storage, addr)
+			
+			let result: Buffer
+			switch (type) {
+				case 'pkmsg':
+					result = await session.decryptPreKeyWhisperMessage(ciphertext)
+					break
+				case 'msg':
+					result = await session.decryptWhisperMessage(ciphertext)
+					break
+				default:
+					throw new Error(`Unknown message type: ${type}`)
+			}
+			
+			return result
 		},
 		async encryptMessage({ jid, data }) {
 			// SAFE APPROACH: NO LID lookups during encryption
@@ -217,26 +214,23 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			
 			console.log(`🔄 Migrating device session: ${fromJid} → ${toJid}`)
 			
-			// Atomic migration in transaction
-			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
-				const fromAddr = jidToSignalProtocolAddress(fromJid)
-				const toAddr = jidToSignalProtocolAddress(toJid)
-				
-				// Load PN session for this specific device
-				const fromSession = await storage.loadSession(fromAddr.toString())
-				if (!fromSession || !fromSession.haveOpenSession()) {
-					console.log(`ℹ️ No session to migrate from ${fromJid}`)
-					return
-				}
-				
-				// Copy to LID address (keep original)
-				await storage.storeSession(toAddr.toString(), fromSession)
-				console.log(`✅ Session copied: ${fromAddr} → ${toAddr}`)
-				console.log(`🔄 Keeping original session: ${fromAddr}`)
-				
-				// Store LID mapping
-				await lidMapping.storeLIDPNMapping(toJid, fromJid)
-			})
+			const fromAddr = jidToSignalProtocolAddress(fromJid)
+			const toAddr = jidToSignalProtocolAddress(toJid)
+			
+			// Load PN session for this specific device
+			const fromSession = await storage.loadSession(fromAddr.toString())
+			if (!fromSession || !fromSession.haveOpenSession()) {
+				console.log(`ℹ️ No session to migrate from ${fromJid}`)
+				return
+			}
+			
+			// Copy to LID address (keep original) - async-mutex handles concurrency
+			await storage.storeSession(toAddr.toString(), fromSession)
+			console.log(`✅ Session copied: ${fromAddr} → ${toAddr}`)
+			console.log(`🔄 Keeping original session: ${fromAddr}`)
+			
+			// Store LID mapping
+			await lidMapping.storeLIDPNMapping(toJid, fromJid)
 		}
 	}
 
