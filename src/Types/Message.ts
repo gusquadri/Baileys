@@ -9,6 +9,20 @@ import type { CacheStore } from './Socket'
 
 // export the WAMessage Prototypes
 export { proto as WAProto }
+
+export type AddressingMode = 'pn' | 'lid'
+
+// MessageSource contains basic sender and chat information about a message
+export interface MessageSource {
+	chat: string      // The chat where the message was sent
+	sender: string    // The user who sent the message  
+	isFromMe: boolean // Whether the message was sent by the current user
+	isGroup: boolean  // Whether the chat is a group chat or broadcast list
+	
+	addressingMode?: AddressingMode // The addressing mode of the message (phone number or LID)
+	senderAlt?: string              // The alternative address of the user who sent the message
+	recipientAlt?: string           // The alternative address of the recipient (for DMs)
+}
 export type WAMessage = proto.IWebMessageInfo & { key: WAMessageKey }
 export type WAMessageContent = proto.IMessage
 export type WAContactMessage = proto.Message.IContactMessage
@@ -183,6 +197,38 @@ export type ButtonReplyInfo = {
 	index: number
 }
 
+export type ListButtonReplyInfo = {
+	title: string
+	description?: string
+	rowId: string
+}
+
+export type InteractiveButtonReplyInfo = {
+	displayText: string
+	nativeFlows: {
+		name: string
+		paramsJson: string
+		version: number
+	}
+}
+
+export type ListSection = {
+	title: string
+	rows: {
+		title: string
+		rowId: string
+		description?: string
+	}[]
+}
+
+export type Button = {
+	buttonId: string
+	buttonText: {
+		displayText: string
+	}
+	type: number
+}
+
 export type GroupInviteInfo = {
 	inviteCode: string
 	inviteExpiration: number
@@ -222,6 +268,29 @@ export type AnyRegularMessageContent = (
 			buttonReply: ButtonReplyInfo
 			type: 'template' | 'plain'
 	  }
+		| {
+			buttonReply: ListButtonReplyInfo
+			type: 'list'
+	  }
+	| {
+			buttonReply: InteractiveButtonReplyInfo
+			type: 'interactive'
+	  }
+	| ({
+			text: string
+			title: string
+			buttonText: string
+			footer?: string
+			sections: ListSection[]
+	  } & Mentionable &
+			Contextable)
+	| ({
+			text: string
+			buttons: Button[]
+			footer?: string
+			title?: string
+	  } & Mentionable &
+			Contextable)
 	| {
 			groupInvite: GroupInviteInfo
 	  }
@@ -280,6 +349,8 @@ export type MessageRelayOptions = MinimalRelayOptions & {
 	useUserDevicesCache?: boolean
 	/** jid list of participants for status@broadcast */
 	statusJidList?: string[]
+	/** specific devices to target for receipt timeout resends */
+	targetDevices?: string[]
 }
 
 export type MiscMessageGenerationOptions = MinimalRelayOptions & {

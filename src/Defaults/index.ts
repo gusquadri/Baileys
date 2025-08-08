@@ -51,7 +51,32 @@ export const DEFAULT_CONNECTION_CONFIG: SocketConfig = {
 	auth: undefined as unknown as AuthenticationState,
 	markOnlineOnConnect: true,
 	syncFullHistory: false,
-	patchMessageBeforeSending: msg => msg,
+	patchMessageBeforeSending: msg => {
+		// Apply the MD patch for interactive messages (buttons, lists, etc.)
+		if (
+			msg?.buttonsMessage ||
+			msg?.templateMessage ||
+			msg?.listMessage ||
+			msg?.interactiveMessage?.nativeFlowMessage ||
+			msg?.buttonsResponseMessage ||
+			msg?.listResponseMessage ||
+			msg?.templateButtonReplyMessage ||
+			msg?.interactiveResponseMessage
+		) {
+			return {
+				viewOnceMessageV2Extension: {
+					message: {
+						messageContextInfo: {
+							deviceListMetadataVersion: 2,
+							deviceListMetadata: {}
+						},
+						...msg
+					}
+				}
+			}
+		}
+		return msg
+	},
 	shouldSyncHistoryMessage: () => true,
 	shouldIgnoreJid: () => false,
 	linkPreviewImageThumbnailWidth: 192,
@@ -63,7 +88,6 @@ export const DEFAULT_CONNECTION_CONFIG: SocketConfig = {
 		snapshot: false
 	},
 	countryCode: 'US',
-	getMessage: async () => undefined,
 	cachedGroupMetadata: async () => undefined,
 	makeSignalRepository: makeLibSignalRepository
 }
@@ -107,9 +131,13 @@ export const MIN_PREKEY_COUNT = 5
 
 export const INITIAL_PREKEY_COUNT = 30
 
+export const UPLOAD_TIMEOUT = 30000 // 30 seconds
+export const MIN_UPLOAD_INTERVAL = 5000 // 5 seconds minimum between uploads
+
 export const DEFAULT_CACHE_TTLS = {
 	SIGNAL_STORE: 5 * 60, // 5 minutes
 	MSG_RETRY: 60 * 60, // 1 hour
 	CALL_OFFER: 5 * 60, // 5 minutes
-	USER_DEVICES: 5 * 60 // 5 minutes
+	USER_DEVICES: 5 * 60, // 5 minutes
+	LID_STORE: 24 * 60 * 60 // 24 hours for LID mappings
 }

@@ -1,6 +1,6 @@
 import { Boom } from '@hapi/boom'
 import { proto } from '../../WAProto/index.js'
-import type { SignalRepository, WAMessage, WAMessageKey } from '../Types'
+import type { SignalRepository, WAMessage, WAMessageKey, AddressingMode } from '../Types'
 import {
 	areJidsSameUser,
 	type BinaryNode,
@@ -10,13 +10,41 @@ import {
 	isJidNewsletter,
 	isJidStatusBroadcast,
 	isJidUser,
-	isLidUser
+	isLidUser,
+	jidDecode
 } from '../WABinary'
 import { unpadRandomMax16 } from './generics'
 import type { ILogger } from './logger'
+import { determineEncryptionJid, shouldMigrateSession } from './decode-wa-message-lid-simple'
 
 export const NO_MESSAGE_FOUND_ERROR_TEXT = 'Message absent from node'
 export const MISSING_KEYS_ERROR_TEXT = 'Key used already or never filled'
+
+/**
+ * Extract addressing mode and alternative identities from message stanza
+ * Following whatsmeow's approach in message.go:79-92
+ */
+export const extractAddressingContext = (stanza: BinaryNode, _from: string, _participant?: string) => {
+	const addressingMode = (stanza.attrs.addressing_mode as AddressingMode) || 'pn'
+	let senderAlt: string | undefined
+	let recipientAlt: string | undefined
+	
+	if (addressingMode === 'lid') {
+		// Message is LID-addressed: sender is LID, extract corresponding PN
+		senderAlt = stanza.attrs.participant_pn || stanza.attrs.sender_pn
+		recipientAlt = stanza.attrs.recipient_pn
+	} else {
+		// Message is PN-addressed: sender is PN, extract corresponding LID
+		senderAlt = stanza.attrs.participant_lid || stanza.attrs.sender_lid
+		recipientAlt = stanza.attrs.recipient_lid
+	}
+	
+	return {
+		addressingMode,
+		senderAlt,
+		recipientAlt
+	}
+}
 
 export const NACK_REASONS = {
 	ParsingError: 487,
@@ -110,8 +138,8 @@ export function decodeMessageNode(stanza: BinaryNode, meId: string, meLid: strin
 		remoteJid: chatId,
 		fromMe,
 		id: msgId,
-		senderLid: stanza?.attrs?.sender_lid,
-		senderPn: stanza?.attrs?.sender_pn,
+		senderLid: stanza?.attrs?.sender_lid || stanza?.attrs?.peer_recipient_lid,
+		senderPn: stanza?.attrs?.sender_pn  || stanza?.attrs?.peer_recipient_pn,
 		participant,
 		participantPn: stanza?.attrs?.participant_pn,
 		participantLid: stanza?.attrs?.participant_lid,
@@ -178,17 +206,72 @@ export const decryptMessageNode = (
 						const e2eType = tag === 'plaintext' ? 'plaintext' : attrs.type
 						switch (e2eType) {
 							case 'skmsg':
+								// Determine encryption JID for group message author
+								const { addressingMode: groupAddressingMode, senderAlt: authorAlt } = extractAddressingContext(stanza, sender, author)
+								const authorEncryptionJid = await determineEncryptionJid(
+									author,
+									authorAlt,
+									repository,
+									logger
+								)
+								
+								// Migrate if needed (following whatsmeow approach)
+								if (shouldMigrateSession(author, authorEncryptionJid, authorAlt)) {
+									try {
+										await repository.migrateSession(author, authorEncryptionJid)
+										logger.info({ author, authorEncryptionJid }, 'Migrated group author session')
+									} catch (error) {
+										logger.error({ author, authorEncryptionJid, error }, 'Group author migration failed')
+									}
+								}
+								
 								msgBuffer = await repository.decryptGroupMessage({
 									group: sender,
-									authorJid: author,
+									authorJid: authorEncryptionJid,
 									msg: content
 								})
 								break
 							case 'pkmsg':
 							case 'msg':
-								const user = isJidUser(sender) ? sender : author
+								// Determine encryption JID (following whatsmeow's simple approach)
+								const { addressingMode, senderAlt } = extractAddressingContext(stanza, sender)
+								const senderEncryptionJid = await determineEncryptionJid(
+									sender,
+									senderAlt,
+									repository,
+									logger
+								)
+								
+								// Store LID mapping when detected from message metadata
+								if (senderAlt && isLidUser(senderAlt) && isJidUser(sender)) {
+									try {
+										await repository.storeLIDPNMapping(senderAlt, sender)
+										logger.debug({ sender, senderAlt }, 'Stored LID mapping from message metadata')
+									} catch (error) {
+										logger.error({ sender, senderAlt, error }, 'Failed to store LID mapping from metadata')
+									}
+								}
+								
+								// Migrate session if needed (following whatsmeow approach)
+								if (shouldMigrateSession(sender, senderEncryptionJid, senderAlt)) {
+									try {
+										await repository.migrateSession(sender, senderEncryptionJid)
+										logger.info({ sender, senderEncryptionJid }, 'Migrated sender session')
+									} catch (error) {
+										logger.error({ sender, senderEncryptionJid, error }, 'Session migration failed')
+										// Continue with decryption attempt anyway
+									}
+								}
+								
+								logger.debug({ 
+									originalSender: sender,
+									encryptionJid: senderEncryptionJid,
+									addressingMode
+								}, 'Decrypting message')
+								
+								// Decrypt with determined JID (no fallback logic)
 								msgBuffer = await repository.decryptMessage({
-									jid: user,
+									jid: senderEncryptionJid,
 									type: e2eType,
 									ciphertext: content
 								})

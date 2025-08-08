@@ -22,10 +22,10 @@ import {
 	decodeMediaRetryNode,
 	decodeMessageNode,
 	decryptMessageNode,
+	extractAddressingContext,
 	delay,
 	derivePairingCodeKey,
 	encodeBigEndian,
-	encodeSignedDeviceIdentity,
 	getCallStatusFromNode,
 	getHistoryMsg,
 	getNextPreKeys,
@@ -58,7 +58,7 @@ import { extractGroupMetadata } from './groups'
 import { makeMessagesSocket } from './messages-send'
 
 export const makeMessagesRecvSocket = (config: SocketConfig) => {
-	const { logger, retryRequestDelayMs, maxMsgRetryCount, getMessage, shouldIgnoreJid } = config
+	const { logger, retryRequestDelayMs, maxMsgRetryCount, shouldIgnoreJid } = config
 	const sock = makeMessagesSocket(config)
 	const {
 		ev,
@@ -75,7 +75,9 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		relayMessage,
 		sendReceipt,
 		uploadPreKeys,
-		sendPeerDataOperationMessage
+		sendPeerDataOperationMessage,
+		getMessage,
+		receiptTracker
 	} = sock
 
 	/** this mutex ensures that each retryRequest will wait for the previous one to finish */
@@ -87,6 +89,10 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			stdTTL: DEFAULT_CACHE_TTLS.MSG_RETRY, // 1 hour
 			useClones: false
 		})
+
+	// Privacy token manager is accessed via signalRepository when needed
+	
+
 	const callOfferCache =
 		config.callOfferCache ||
 		new NodeCache<WACallEvent>({
@@ -167,16 +173,67 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		const { key: msgKey } = fullMessage
 		const msgId = msgKey.id!
 
-		const key = `${msgId}:${msgKey?.participant}`
-		let retryCount = msgRetryCache.get<number>(key) || 0
-		if (retryCount >= maxMsgRetryCount) {
-			logger.debug({ retryCount, msgId }, 'reached retry limit, clearing')
-			msgRetryCache.del(key)
-			return
+		const originalKey = `${msgId}:${msgKey?.participant}`
+		let retryCount = msgRetryCache.get<number>(originalKey) || 0
+		let alternativeRetryAttempted = false
+		
+		// SMART LID/PN RETRY LOGIC - Try alternative addressing after 2 failed attempts  
+		if (retryCount >= 2 && msgKey?.participant) {
+			const lidStore = signalRepository.getLIDMappingStore()
+			
+			if (msgKey.participant.includes('@s.whatsapp.net')) {
+				// Current participant is PN, try LID alternative
+				const lid = await lidStore.getLIDForPN(msgKey.participant) // Direct Redis lookup
+				if (lid) {
+					const alternativeKey = `${msgId}:${lid}`
+					const altRetryCount = msgRetryCache.get<number>(alternativeKey) || 0
+					if (altRetryCount < 2) {
+						logger.info({ 
+							msgId, 
+							originalParticipant: msgKey.participant, 
+							lidParticipant: lid,
+							attempt: altRetryCount + 1
+						}, 'smart retry: attempting with LID addressing')
+						msgKey.participant = lid
+						retryCount = altRetryCount
+						alternativeRetryAttempted = true
+					}
+				}
+			} else if (msgKey.participant.includes('@lid')) {
+				// Current participant is LID, try PN alternative  
+				const pn = await lidStore.getPNForLID(msgKey.participant)
+				if (pn) {
+					const alternativeKey = `${msgId}:${pn}`
+					const altRetryCount = msgRetryCache.get<number>(alternativeKey) || 0
+					if (altRetryCount < 2) {
+						logger.info({
+							msgId,
+							originalParticipant: msgKey.participant,
+							pnParticipant: pn,
+							attempt: altRetryCount + 1
+						}, 'smart retry: attempting with PN addressing')
+						msgKey.participant = pn
+						retryCount = altRetryCount
+						alternativeRetryAttempted = true
+					}
+				}
+			}
 		}
+		
+		const retryKey = `${msgId}:${msgKey?.participant}`
+		
+		if (retryCount >= maxMsgRetryCount) {
+				logger.debug({ retryCount, msgId, participant: msgKey?.participant }, 'reached retry limit, clearing')
+				msgRetryCache.del(retryKey)
+				// Also clear original key if we tried alternative addressing
+				if (alternativeRetryAttempted && retryKey !== originalKey) {
+					msgRetryCache.del(originalKey)
+				}
+				return
+			}
 
 		retryCount += 1
-		msgRetryCache.set(key, retryCount)
+		msgRetryCache.set(retryKey, retryCount)
 
 		const { account, signedPreKey, signedIdentityKey: identityKey } = authState.creds
 
@@ -186,7 +243,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			logger.debug(`sendRetryRequest: requested placeholder resend for message ${msgId}`)
 		}
 
-		const deviceIdentity = encodeSignedDeviceIdentity(account!, true)
+		const deviceIdentity = proto.ADVSignedDeviceIdentity.encode(account!).finish()
 		await authState.keys.transaction(async () => {
 			const receipt: BinaryNode = {
 				tag: 'receipt',
@@ -262,10 +319,48 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			}
 		} else {
 			const identityNode = getBinaryNodeChild(node, 'identity')
-			if (identityNode) {
-				logger.info({ jid: from }, 'identity changed')
-				// not handling right now
-				// signal will override new identity anyway
+			if (identityNode && from) {
+				logger.info({ jid: from }, 'Identity changed notification - clearing all sessions and identities')
+				
+				// Following whatsmeow's approach: clear all sessions for this user
+				try {
+					const userJid = from.split('@')[0] // Get user portion without domain
+					const signalRepo = (authState.keys as any)
+					
+					// Clear all sessions for this user (all devices)
+					const sessionKeys = Object.keys(await signalRepo.get('session') || {})
+					const userSessions = sessionKeys.filter(key => key.startsWith(userJid + '.'))
+					
+					if (userSessions.length > 0) {
+						const sessionUpdates: { [key: string]: null } = {}
+						userSessions.forEach(key => {
+							sessionUpdates[key] = null
+						})
+						
+						await signalRepo.set({ 'session': sessionUpdates })
+						logger.info({ jid: from, clearedSessions: userSessions.length }, 'Cleared sessions after identity change')
+					}
+					
+					// Clear identity keys for this user  
+					const identityKeys = Object.keys(await signalRepo.get('identity-key') || {})
+					const userIdentities = identityKeys.filter(key => key.startsWith(userJid + '.'))
+					
+					if (userIdentities.length > 0) {
+						const identityUpdates: { [key: string]: null } = {}
+						userIdentities.forEach(key => {
+							identityUpdates[key] = null
+						})
+						
+						await signalRepo.set({ 'identity-key': identityUpdates })
+						logger.info({ jid: from, clearedIdentities: userIdentities.length }, 'Cleared identities after identity change')
+					}
+					
+					// Log identity change event (custom event not in ConnectionState interface)
+					logger.info({ jid: from, timestamp: Date.now() }, 'Identity change processed - sessions and identities cleared')
+					
+				} catch (error) {
+					logger.error({ jid: from, error }, 'Failed to clear sessions/identities after identity change')
+				}
 			} else {
 				logger.info({ node }, 'unknown encrypt notification')
 			}
@@ -390,17 +485,89 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 		switch (nodeType) {
 			case 'privacy_token':
-				const tokenList = getBinaryNodeChildren(child, 'token')
+				// Enhanced privacy token handling following whatsmeow's validation patterns
+				const ownJID = authState.creds.me?.id
+				const ownLID = authState.creds.me?.lid
+				
+				if (!ownJID) {
+					logger.debug('Ignoring privacy token notification, session not established')
+					break
+				}
+				
+				const tokens = getBinaryNodeChild(child, 'tokens')
+				if (!tokens) {
+					logger.warn('privacy_token notification did not contain <tokens> tag')
+					break
+				}
+				
+				const sender = node.attrs.from
+				if (!sender) {
+					logger.warn('privacy_token notification did not have a sender')
+					break
+				}
+				
+				const tokenList = getBinaryNodeChildren(tokens, 'token')
 				for (const { attrs, content } of tokenList) {
-					const jid = attrs.jid
-					ev.emit('chats.update', [
-						{
-							id: jid,
-							tcToken: content as Buffer
+					const targetJID = attrs.jid
+					const tokenType = attrs.type
+					const timestamp = attrs.t ? parseInt(attrs.t) * 1000 : Date.now() // Convert to ms
+					const token = content as Buffer
+					
+					// Validate token is for current user (following whatsmeow)
+					if (targetJID !== ownJID && targetJID !== ownLID) {
+						// Don't log about own privacy tokens for other users
+						if (sender !== ownJID && sender !== ownLID) {
+							logger.warn({ targetJID, sender }, 'privacy_token notification contained token for different user')
 						}
-					])
+						continue
+					}
+					
+					// Validate token type (following whatsmeow)
+					if (tokenType && tokenType !== 'trusted_contact') {
+						logger.warn({ tokenType }, 'privacy_token notification contained unexpected token type')
+						continue
+					}
+					
+					// Validate token is binary data (following whatsmeow)
+					if (!Buffer.isBuffer(token) || token.length === 0) {
+						logger.warn('privacy_token notification contained invalid token data')
+						continue
+					}
+					
+					if (!targetJID) {
+						logger.warn('privacy_token notification missing target JID')
+						continue
+					}
+					
+					try {
+						// Store privacy token with timestamp (enhanced from whatsmeow)
+						await signalRepository.getPrivacyTokenManager().storePrivacyToken(targetJID, token)
+						
+						// Emit update event for backward compatibility
+						ev.emit('chats.update', [
+							{
+								id: targetJID,
+								tcToken: token
+							}
+						])
 
-					logger.debug({ jid }, 'got privacy token update')
+						logger.debug({ 
+							targetJID, 
+							sender, 
+							tokenLength: token.length, 
+							timestamp: new Date(timestamp).toISOString() 
+						}, 'stored privacy token from sender')
+					} catch (error) {
+						logger.error({ targetJID, sender, error }, 'failed to save privacy token')
+						
+						// Still emit update event even if storage failed
+						ev.emit('chats.update', [
+							{
+								id: targetJID,
+								tcToken: token
+							}
+						])
+					}
 				}
 
 				break
@@ -598,18 +765,88 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		// todo: implement a cache to store the last 256 sent messages (copy whatsmeow)
 		const msgs = await Promise.all(ids.map(id => getMessage({ ...key, id })))
 		const remoteJid = key.remoteJid!
-		const participant = key.participant || remoteJid
-		// if it's the primary jid sending the request
-		// just re-send the message to everyone
-		// prevents the first message decryption failure
+		let participant = key.participant || remoteJid
+		
+		// SMART RETRY: Check if we should try alternative addressing
+		const retryCount = +retryNode.attrs.count! || 1
+		let alternativeAddressingUsed = false
+		
+		if (retryCount > 2 && participant && participant !== remoteJid) {
+			const lidStore = signalRepository.getLIDMappingStore()
+			
+			if (participant.includes('@s.whatsapp.net')) {
+				// Try LID alternative for PN participant
+				const lid = await lidStore.getLIDForPN(participant)
+				if (lid) {
+					logger.info({ 
+						remoteJid, 
+						originalParticipant: participant, 
+						lidParticipant: lid, 
+						retryCount 
+					}, 'retry receipt: attempting with LID addressing')
+					participant = lid
+					alternativeAddressingUsed = true
+				}
+			} else if (participant.includes('@lid')) {
+				// Try PN alternative for LID participant
+				const pn = await lidStore.getPNForLID(participant)
+				if (pn) {
+					logger.info({ 
+						remoteJid, 
+						originalParticipant: participant, 
+						pnParticipant: pn, 
+						retryCount 
+					}, 'retry receipt: attempting with PN addressing')
+					participant = pn
+					alternativeAddressingUsed = true
+				}
+			}
+		}
+		
+		// WhatsApp's shouldRecreateSession logic (following whatsmeow retry.go:88-107)
+		const shouldRecreateSession = (retryCount: number, participant: string): boolean => {
+			// Recreate session after specific retry thresholds (whatsmeow pattern)
+			if (retryCount >= 3) {
+				logger.info({ participant, retryCount }, 'High retry count, recreating session')
+				return true
+			}
+			
+			// Time-based session recreation (1 hour timeout like whatsmeow)
+			// Note: In production, you'd track lastSessionCreation timestamp per participant
+			// For now, use retry count as proxy for time-based recreation
+			if (retryCount === 2) {
+				logger.info({ participant, retryCount }, 'Retry threshold reached, recreating session')
+				return true  
+			}
+			
+			return false
+		}
+		
+		// Session recreation if needed (following whatsmeow approach)
+		if (shouldRecreateSession(retryCount, participant)) {
+			try {
+				// Clear existing session to force recreation (whatsmeow pattern)
+				const addr = signalRepository.jidToSignalProtocolAddress(participant)
+				await (authState.keys as any).set({
+					'session': { [addr]: null }
+				})
+				logger.info({ participant, retryCount }, 'Cleared session for recreation')
+			} catch (error) {
+				logger.error({ participant, error }, 'Failed to clear session for recreation')
+			}
+		}
+		
+		// Use enhanced assertSessions with whatsmeow retry context  
+		await assertSessions([participant], true, { retryCount, participant })
+		
+		// if it's the primary jid sending the request, send to all devices
 		const sendToAll = !jidDecode(participant)?.device
-		await assertSessions([participant], true)
 
 		if (isJidGroup(remoteJid)) {
 			await authState.keys.set({ 'sender-key-memory': { [remoteJid]: null } })
 		}
 
-		logger.debug({ participant, sendToAll }, 'forced new session for retry recp')
+		logger.debug({ participant, sendToAll, alternativeAddressingUsed }, 'forced new session for retry recp')
 
 		for (const [i, msg] of msgs.entries()) {
 			if (msg) {
@@ -625,6 +862,10 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 					}
 				}
 
+				if (alternativeAddressingUsed) {
+					logger.info({ messageId: ids[i], participant, retryCount }, 'relaying message with alternative addressing')
+				}
+
 				await relayMessage(key.remoteJid!, msg, msgRelayOpts)
 			} else {
 				logger.debug({ jid: key.remoteJid, id: ids[i] }, 'recv retry request, but message not available')
@@ -633,6 +874,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	}
 
 	const handleReceipt = async (node: BinaryNode) => {
+		logger.info({ node }, 'recv receipt')
 		const { attrs, content } = node
 		const isLid = attrs.from!.includes('lid')
 		const isNodeFromMe = areJidsSameUser(
@@ -659,6 +901,14 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		if (Array.isArray(content)) {
 			const items = getBinaryNodeChildren(content[0], 'item')
 			ids.push(...items.map(i => i.attrs.id!))
+		}
+
+		// Track receipt for outgoing message timeout system
+		if (receiptTracker && attrs.type !== 'retry' && attrs.type !== 'sender') {
+			const senderJid = attrs.participant || attrs.from
+			for (const messageId of ids) {
+				receiptTracker.handleReceipt(messageId, senderJid!, attrs.type || 'delivery')
+			}
 		}
 
 		try {
@@ -699,6 +949,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 					if (attrs.type === 'retry') {
 						// correctly set who is asking for the retry
+						logger.info({ attrs, key }, 'recv retry request')
 						key.participant = key.participant || attrs.from
 						const retryNode = getBinaryNodeChild(node, 'retry')
 						if (willSendMessageAgain(ids[0]!, key.participant!)) {
@@ -706,8 +957,11 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 								try {
 									logger.debug({ attrs, key }, 'recv retry request')
 									await sendMessagesAgain(key, ids, retryNode!)
-								} catch (error: any) {
-									logger.error({ key, ids, trace: error.stack }, 'error in sending message again')
+								} catch (error: unknown) {
+									logger.error(
+										{ key, ids, trace: error instanceof Error ? error.stack : 'Unknown error' },
+										'error in sending message again'
+									)
 								}
 							} else {
 								logger.info({ attrs, key }, 'recv retry for not fromMe message')
@@ -797,6 +1051,12 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			decrypt
 		} = decryptMessageNode(node, authState.creds.me!.id, authState.creds.me!.lid || '', signalRepository, logger)
 
+		// REMOVED: LID mapping logic moved to decode-wa-message.ts for better consistency
+		// The decode-wa-message.ts handles LID mappings during decryption with:
+		// - Device consistency validation
+		// - Conservative mapping approach  
+		// - No session migration (prevents Bad MAC errors)
+
 		if (response && msg?.messageStubParameters?.[0] === NO_MESSAGE_FOUND_ERROR_TEXT) {
 			msg.messageStubParameters = [NO_MESSAGE_FOUND_ERROR_TEXT, response]
 		}
@@ -806,6 +1066,56 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			node.attrs.sender_pn
 		) {
 			ev.emit('chats.phoneNumberShare', { lid: node.attrs.from!, jid: node.attrs.sender_pn })
+		}
+		
+		// Handle LID Migration Sync Messages - MISSING from Baileys! (whatsmeow message.go:750-751)
+		if (msg.message?.protocolMessage?.lidMigrationMappingSyncMessage?.encodedMappingPayload) {
+			try {
+				const payload = msg.message.protocolMessage.lidMigrationMappingSyncMessage.encodedMappingPayload
+				const decoded = proto.LIDMigrationMappingSyncPayload.decode(payload)
+				
+				logger.debug({ 
+					mappingCount: decoded.pnToLidMappings?.length || 0,
+					timestamp: decoded.chatDbMigrationTimestamp 
+				}, 'Received LID migration sync message from server')
+				
+				// Store PN-LID mappings from server (whatsmeow message.go:893-909)
+				const lidMapping = signalRepository.getLIDMappingStore()
+				if (decoded.pnToLidMappings && decoded.pnToLidMappings.length > 0) {
+					for (const mapping of decoded.pnToLidMappings) {
+						const pn = `${mapping.pn}@s.whatsapp.net`
+						// Use latestLid if available, otherwise assignedLid (proper LID refresh)
+						const lidValue = mapping.latestLid || mapping.assignedLid
+						const lid = `${lidValue}@lid`
+						
+						await lidMapping.storeLIDPNMapping(lid, pn)
+						logger.debug({ 
+							pn, 
+							lid, 
+							assignedLid: mapping.assignedLid,
+							latestLid: mapping.latestLid,
+							usedLatest: !!mapping.latestLid
+						}, 'Stored server-provided PN-LID mapping')
+						
+						// If latestLid differs from assignedLid, this is a LID refresh/migration
+						if (mapping.latestLid && mapping.latestLid !== mapping.assignedLid) {
+							logger.info({ 
+								pn, 
+								oldLid: `${mapping.assignedLid}@lid`, 
+								newLid: lid 
+							}, 'LID refresh detected - updated to latest LID')
+						}
+					}
+				}
+				
+				// Store migration timestamp if provided
+				if (decoded.chatDbMigrationTimestamp) {
+					logger.debug({ timestamp: decoded.chatDbMigrationTimestamp }, 'Server LID migration timestamp')
+				}
+				
+			} catch (error) {
+				logger.error({ error }, 'Failed to process LID migration sync message')
+			}
 		}
 
 		try {
@@ -818,10 +1128,44 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 							return sendMessageAck(node, NACK_REASONS.ParsingError)
 						}
 
+						const errorMessage = msg?.messageStubParameters?.[0] || ''
+						const isPreKeyError = errorMessage.includes('PreKey')
+						const isNoSessionError = errorMessage.includes('No session')
+						const encType = encNode?.attrs?.type || 'unknown'
+
+						console.debug(`[handleMessage] Decrypt failed - type: ${encType}, error: ${errorMessage}`)
+
+						// Skip retry for certain message types (like whatsmeow)
+						if (encType === 'msmsg') {
+							logger.debug('Skipping retry for msmsg type')
+							return sendMessageAck(node)
+						}
+
+						// Handle both pre-key and normal retries in single mutex
 						retryMutex.mutex(async () => {
-							if (ws.isOpen) {
-								if (getBinaryNodeChild(node, 'unavailable')) {
+							try {
+								if (!ws.isOpen) {
+									logger.debug({ node }, 'Connection closed, skipping retry')
 									return
+								}
+
+								if (getBinaryNodeChild(node, 'unavailable')) {
+									logger.debug('Message unavailable, skipping retry')
+									return
+								}
+
+								// Handle pre-key errors with upload and delay
+								if (isPreKeyError) {
+									logger.info({ error: errorMessage }, 'PreKey error detected, uploading and retrying')
+
+									try {
+										logger.debug('Uploading pre-keys for error recovery')
+										await uploadPreKeys(5)
+										logger.debug('Waiting for server to process new pre-keys')
+										await delay(1000)
+									} catch (uploadErr) {
+										logger.error({ uploadErr }, 'Pre-key upload failed, proceeding with retry anyway')
+									}
 								}
 
 								const encNode = getBinaryNodeChild(node, 'enc')
@@ -829,8 +1173,15 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 								if (retryRequestDelayMs) {
 									await delay(retryRequestDelayMs)
 								}
-							} else {
-								logger.debug({ node }, 'connection closed, ignoring retry req')
+							} catch (err) {
+								logger.error({ err, isPreKeyError }, 'Failed to handle retry, attempting basic retry')
+								// Still attempt retry even if pre-key upload failed
+								try {
+									const encNode = getBinaryNodeChild(node, 'enc')
+									await sendRetryRequest(node, !encNode)
+								} catch (retryErr) {
+									logger.error({ retryErr }, 'Failed to send retry after error handling')
+								}
 							}
 						})
 					} else {
@@ -985,15 +1336,15 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		// // current hypothesis is that if pash is sent in the ack
 		// // it means -- the message hasn't reached all devices yet
 		// // we'll retry sending the message here
-		// if(attrs.phash) {
-		// 	logger.info({ attrs }, 'received phash in ack, resending message...')
-		// 	const msg = await getMessage(key)
-		// 	if(msg) {
-		// 		await relayMessage(key.remoteJid!, msg, { messageId: key.id!, useUserDevicesCache: false })
-		// 	} else {
-		// 		logger.warn({ attrs }, 'could not send message again, as it was not found')
-		// 	}
-		// }
+		if(attrs.phash) {
+			logger.info({ attrs }, 'received phash in ack, resending message...')
+			const msg = await getMessage(key)
+			if(msg) {
+				await relayMessage(key.remoteJid!, msg, { messageId: key.id!, useUserDevicesCache: false })
+			} else {
+				logger.warn({ attrs }, 'could not send message again, as it was not found')
+			}
+		}
 
 		// error in acknowledgement,
 		// device could not display the message
@@ -1256,6 +1607,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 	ws.on('CB:receipt', node => {
 		processNode('receipt', node, 'handling receipt', handleReceipt)
+		logger.info({ node }, 'received receipt')
 	})
 
 	ws.on('CB:notification', async (node: BinaryNode) => {

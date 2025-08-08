@@ -1,7 +1,9 @@
 import NodeCache from '@cacheable/node-cache'
 import { Boom } from '@hapi/boom'
 import { proto } from '../../WAProto/index.js'
+import { randomBytes } from 'crypto'
 import { DEFAULT_CACHE_TTLS, WA_DEFAULT_EPHEMERAL } from '../Defaults'
+import { MessageCache, type MessageCacheConfig } from '../Utils/message-cache'
 import type {
 	AnyMessageContent,
 	MediaConnInfo,
@@ -16,13 +18,14 @@ import {
 	assertMediaContent,
 	bindWaitForEvent,
 	decryptMediaRetryData,
+	delay,
 	encodeNewsletterMessage,
-	encodeSignedDeviceIdentity,
 	encodeWAMessage,
 	encryptMediaRetryRequest,
 	extractDeviceJids,
 	generateMessageIDV2,
 	generateWAMessage,
+	generateWAMessageFromContent,
 	getStatusCodeForMediaRetry,
 	getUrlFromDirectPath,
 	getWAUploadToServer,
@@ -30,22 +33,29 @@ import {
 	parseAndInjectE2ESessions,
 	unixTimestampSeconds
 } from '../Utils'
+import { makeKeyedMutex } from '../Utils/make-mutex'
 import { getUrlInfo } from '../Utils/link-preview'
+import { getMessageSenderJid } from '../Utils/sender-identity'
 import {
 	areJidsSameUser,
 	type BinaryNode,
 	type BinaryNodeAttributes,
+	getBinaryFilteredBizBot,
+	getBinaryFilteredButtons,
 	getBinaryNodeChild,
 	getBinaryNodeChildren,
 	isJidGroup,
+	isJidNewsletter,
 	isJidUser,
 	jidDecode,
 	jidEncode,
 	jidNormalizedUser,
 	type JidWithDevice,
-	S_WHATSAPP_NET
+	S_WHATSAPP_NET,
+	STORIES_JID
 } from '../WABinary'
 import { USyncQuery, USyncUser } from '../WAUSync'
+import { PrivacyTokenUtils } from '../Signal/privacy-tokens'
 import { makeGroupsSocket } from './groups'
 import type { NewsletterSocket } from './newsletter'
 import { makeNewsletterSocket } from './newsletter'
@@ -57,9 +67,14 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		generateHighQualityLinkPreview,
 		options: axiosOptions,
 		patchMessageBeforeSending,
-		cachedGroupMetadata
+		cachedGroupMetadata,
+		messageCacheConfig
 	} = config
 	const sock: NewsletterSocket = makeNewsletterSocket(makeGroupsSocket(config))
+	
+	// Session coordination following whatsmeow's approach
+	const sessionOperationMutex = makeKeyedMutex()
+	
 	const {
 		ev,
 		authState,
@@ -70,8 +85,41 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		fetchPrivacySettings,
 		sendNode,
 		groupMetadata,
-		groupToggleEphemeral
+		groupToggleEphemeral,
+		receiptTracker
 	} = sock
+
+	// Initialize built-in message cache (replaces external getMessage)
+	const messageCache = new MessageCache(logger, messageCacheConfig)
+	
+
+	// Helper function to get privacy token with LID-PN cross-referencing (enhanced from whatsmeow)
+	const getPrivacyToken = async (jid: string): Promise<Buffer | null> => {
+		try {
+			// Use the privacy token manager for proper LID-PN cross-referencing
+			const privacyTokenManager = signalRepository.getPrivacyTokenManager()
+			const tokenData = await privacyTokenManager.getPrivacyToken(jid)
+			
+			if (tokenData?.token && Buffer.isBuffer(tokenData.token)) {
+				logger.trace({ jid }, 'privacy token found for message sending with LID cross-referencing')
+				return tokenData.token
+			}
+			
+			return null
+		} catch (error) {
+			logger.debug({ jid, error }, 'failed to get privacy token')
+			return null
+		}
+	}
+
+	// Cleanup cache on socket destruction
+	const originalDestroy = (sock as any).destroy
+	if (originalDestroy) {
+		(sock as any).destroy = () => {
+			messageCache.destroy()
+			return originalDestroy.call(sock)
+		}
+	}
 
 	const userDevicesCache =
 		config.userDevicesCache ||
@@ -244,11 +292,79 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		return deviceResults
 	}
 
-	const assertSessions = async (jids: string[], force: boolean) => {
+	// Session recreation cache for whatsmeow pattern (separate from retry cache)
+	const sessionRecreateCache = new NodeCache<number>({ stdTTL: 60 * 60 }) // 1 hour TTL
+	
+	// Helper function for whatsmeow session recreation logic
+	const shouldRecreateSessionForRetry = async (retryCount: number, participant: string): Promise<{ recreate: boolean, reason: string }> => {
+		// Check if we have a session for this participant
+		const sessionKey = signalRepository.jidToSignalProtocolAddress(participant)
+		const participantSessions = await authState.keys.get('session', [sessionKey])
+		const hasSession = Object.keys(participantSessions).length > 0 && participantSessions[sessionKey]
+		
+		if (!hasSession) {
+			return { recreate: true, reason: "no session exists with participant" }
+		}
+		
+		// Only recreate after 2+ failed attempts (whatsmeow pattern)
+		if (retryCount < 2) {
+			return { recreate: false, reason: "retry count too low" }
+		}
+		
+		// Rate limiting: only recreate once per hour per participant (whatsmeow pattern)  
+		const sessionRecreateKey = `session-recreate:${participant}`
+		const lastRecreation = sessionRecreateCache.get(sessionRecreateKey)
+		const oneHourAgo = Date.now() - (60 * 60 * 1000)
+		
+		if (!lastRecreation || lastRecreation < oneHourAgo) {
+			sessionRecreateCache.set(sessionRecreateKey, Date.now())
+			return { recreate: true, reason: "retry count >= 2 and over an hour since last recreation" }
+		}
+		
+		return { recreate: false, reason: "session recreated recently" }
+	}
+
+	const assertSessions = async (jids: string[], force: boolean, retryContext?: { retryCount: number, participant: string }) => {
 		let didFetchNewSession = false
 		let jidsRequiringFetch: string[] = []
+		
 		if (force) {
+			// WHATSMEOW PATTERN: Enhanced force logic for session recreation
+			if (retryContext) {
+				// Check if we should recreate sessions based on whatsmeow logic
+				const { retryCount, participant } = retryContext
+				const shouldRecreate = await shouldRecreateSessionForRetry(retryCount, participant)
+				
+				if (shouldRecreate.recreate) {
+					logger.info({ participant, retryCount, reason: shouldRecreate.reason }, 'Recreating session per whatsmeow pattern')
+					
+					// CRITICAL: Delete existing broken sessions first (whatsmeow pattern)
+					const sessionsToDelete: { [key: string]: null } = {}
+					const sessionKeysToRecreate: string[] = []
+					for (const jid of jids) {
+						const sessionKey = signalRepository.jidToSignalProtocolAddress(jid)
+						sessionsToDelete[sessionKey] = null
+						sessionKeysToRecreate.push(sessionKey)
+					}
+					await authState.keys.set({ 'session': sessionsToDelete })
+					
 			jidsRequiringFetch = jids
+				} else {
+					logger.debug({ participant, retryCount, reason: shouldRecreate.reason }, 'Using existing sessions')
+					// Still check which sessions are missing
+					const addrs = jids.map(jid => signalRepository.jidToSignalProtocolAddress(jid))
+					const sessions = await authState.keys.get('session', addrs)
+					for (const jid of jids) {
+						const signalId = signalRepository.jidToSignalProtocolAddress(jid)
+						if (!sessions[signalId]) {
+							jidsRequiringFetch.push(jid)
+						}
+					}
+				}
+			} else {
+				// Standard force behavior - fetch for all
+				jidsRequiringFetch = jids
+			}
 		} else {
 			const addrs = jids.map(jid => signalRepository.jidToSignalProtocolAddress(jid))
 			const sessions = await authState.keys.get('session', addrs)
@@ -332,14 +448,52 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				}
 
 				const bytes = encodeWAMessage(patchedMessage)
-				const { type, ciphertext } = await signalRepository.encryptMessage({ jid, data: bytes })
+				
+				// Coordinate session operations to prevent race conditions (following whatsmeow)
+				const { encryptionResult, finalIdentity } = await sessionOperationMutex.mutex(jid, async () => {
+					// EXACT WHATSMEOW LOGIC: send.go:1178-1187
+					let encryptionIdentity = jid
+					
+					// if jid.Server == types.DefaultUserServer
+					if (jid.includes('@s.whatsapp.net') && !jid.includes('bot')) {
+						try {
+							// lidForPN, err := cli.Store.LIDs.GetLIDForPN(ctx, jid)
+							const lidStore = signalRepository.getLIDMappingStore()
+							const lidForPN = await lidStore.getLIDForPN(jid)
+							
+							// else if !lidForPN.IsEmpty()
+							if (lidForPN && lidForPN.includes('@lid')) {
+								// cli.migrateSessionStore(ctx, jid, lidForPN)
+								await signalRepository.migrateSession(jid, lidForPN)
+								// encryptionIdentity = lidForPN
+								encryptionIdentity = lidForPN
+								console.log(`📤 coordinated session: ${jid} → ${lidForPN}`)
+							}
+						} catch (error) {
+							console.warn(`⚠️ Failed to get LID for ${jid}:`, error)
+						}
+					}
+					
+					// Encrypt with coordinated session state
+					const result = await signalRepository.encryptMessage({ 
+						jid: encryptionIdentity, 
+						data: bytes
+					})
+					
+					return { encryptionResult: result, finalIdentity: encryptionIdentity }
+				})
+				
+				const { type, ciphertext } = encryptionResult
+				// Use final encryption identity as wire identity (whatsmeow approach)
+				const wireJid = finalIdentity
 				if (type === 'pkmsg') {
 					shouldIncludeDeviceIdentity = true
 				}
 
+				// Use wire identity in message attributes (whatsmeow approach)
 				const node: BinaryNode = {
 					tag: 'to',
-					attrs: { jid },
+					attrs: { jid: wireJid },
 					content: [
 						{
 							tag: 'enc',
@@ -368,7 +522,8 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			additionalNodes,
 			useUserDevicesCache,
 			useCachedGroupMetadata,
-			statusJidList
+			statusJidList,
+			targetDevices
 		}: MessageRelayOptions
 	) => {
 		const meId = authState.creds.me!.id
@@ -388,6 +543,19 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 		const participants: BinaryNode[] = []
 		const destinationJid = !isStatus ? jidEncode(user, isLid ? 'lid' : isGroup ? 'g.us' : 's.whatsapp.net') : statusJid
+
+		// PRIVACY TOKENS: Get privacy token for recipient (following whatsmeow approach)
+		const privacyToken = !isGroup && !isStatus ? await getPrivacyToken(destinationJid) : null
+		
+		// Background token request if missing (don't wait for response)
+		if (!privacyToken && !isGroup && !isStatus && isJidUser(destinationJid)) {
+			// Request token in background for future messages (following whatsmeow's async approach)
+			getPrivacyTokens([destinationJid]).catch(error => {
+				logger.warn({ destinationJid, error }, 'Background privacy token request failed')
+			})
+			logger.debug({ destinationJid }, 'Requested privacy token in background for future messages')
+		}
+		
 		const binaryNodeContent: BinaryNode[] = []
 		const devices: JidWithDevice[] = []
 
@@ -414,9 +582,26 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		}
 
 		await authState.keys.transaction(async () => {
+			let didPushAdditional = false
+			const messages = normalizeMessageContent(message)
+			const buttonType = messages ? getButtonType(messages) : undefined
+
 			const mediaType = getMediaType(message)
 			if (mediaType) {
 				extraAttrs['mediatype'] = mediaType
+			}
+
+			if (
+				messages?.pinInChatMessage ||
+				messages?.keepInChatMessage ||
+				message.reactionMessage ||
+				message.protocolMessage?.editedMessage
+			) {
+				extraAttrs['decrypt-fail'] = 'hide'
+			}
+
+			if (messages?.interactiveResponseMessage?.nativeFlowResponseMessage) {
+				extraAttrs['native_flow_name'] = messages?.interactiveResponseMessage?.nativeFlowResponseMessage.name || ''
 			}
 
 			if (isNewsletter) {
@@ -428,12 +613,20 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					attrs: {},
 					content: bytes
 				})
+
+				// Add privacy token for newsletter if available (following whatsmeow approach)
+				if (privacyToken) {
+					binaryNodeContent.push(PrivacyTokenUtils.createTokenNode(privacyToken))
+					logger.debug({ msgId, to: jid }, 'included privacy token in newsletter message')
+				}
+
 				const stanza: BinaryNode = {
 					tag: 'message',
 					attrs: {
 						to: jid,
 						id: msgId,
 						type: getMessageType(message),
+						// t: unixTimestampSeconds().toString(), // POTENTIAL FIX: Add timestamp attribute for WhatsApp envelope validation (investigating)
 						...(additionalAttributes || {})
 					},
 					content: binaryNodeContent
@@ -441,10 +634,6 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				logger.debug({ msgId }, `sending newsletter message to ${jid}`)
 				await sendNode(stanza)
 				return
-			}
-
-			if (normalizeMessageContent(message)?.pinInChatMessage) {
-				extraAttrs['decrypt-fail'] = 'hide'
 			}
 
 			if (isGroup || isStatus) {
@@ -504,7 +693,8 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				// ensure a connection is established with every device
 				for (const { user, device } of devices) {
 					const jid = jidEncode(user, groupData?.addressingMode === 'lid' ? 'lid' : 's.whatsapp.net', device)
-					if (!senderKeyMap[jid] || !!participant) {
+					const hasKey = !!senderKeyMap[jid]
+					if (!hasKey || !!participant) {
 						senderKeyJids.push(jid)
 						// store that this person has had the sender keys sent to them
 						senderKeyMap[jid] = true
@@ -542,14 +732,30 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				const { user: meUser } = jidDecode(meId)!
 
 				if (!participant) {
-					devices.push({ user })
-					if (user !== meUser) {
-						devices.push({ user: meUser })
-					}
+					// If targetDevices is specified (for receipt timeout resends), use only those
+					if (targetDevices && targetDevices.length > 0) {
+						for (const deviceJid of targetDevices) {
+							const decoded = jidDecode(deviceJid)
+							if (decoded) {
+								devices.push({ user: decoded.user, device: decoded.device })
+							}
+						}
+						logger.info({
+							msgId,
+							targetDevices,
+							reason: 'receipt_timeout_resend'
+						}, 'Sending to specific devices due to missing receipts')
+					} else {
+						// Normal device resolution
+						devices.push({ user })
+						if (user !== meUser) {
+							devices.push({ user: meUser })
+						}
 
-					if (additionalAttributes?.['category'] !== 'peer') {
-						const additionalDevices = await getUSyncDevices([meId, jid], !!useUserDevicesCache, true)
-						devices.push(...additionalDevices)
+						if (additionalAttributes?.['category'] !== 'peer') {
+							const additionalDevices = await getUSyncDevices([meId, jid], !!useUserDevicesCache, true)
+							devices.push(...additionalDevices)
+						}
 					}
 				}
 
@@ -602,11 +808,23 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				}
 			}
 
+			// Add privacy token to content if available (following whatsmeow approach)
+			if (privacyToken) {
+				binaryNodeContent.push(PrivacyTokenUtils.createTokenNode(privacyToken))
+				logger.debug({ msgId, to: destinationJid }, 'included privacy token in message')
+			}
+
+			// Note: addressing_mode is only used for groups in whatsmeow, not individual chats
+			const addressingModeAttrs: Record<string, string> = {}
+
 			const stanza: BinaryNode = {
 				tag: 'message',
 				attrs: {
 					id: msgId,
+					to: destinationJid,
 					type: getMessageType(message),
+					t: unixTimestampSeconds().toString(),
+					...addressingModeAttrs,
 					...(additionalAttributes || {})
 				},
 				content: binaryNodeContent
@@ -632,19 +850,94 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				;(stanza.content as BinaryNode[]).push({
 					tag: 'device-identity',
 					attrs: {},
-					content: encodeSignedDeviceIdentity(authState.creds.account!, true)
+					content: proto.ADVSignedDeviceIdentity.encode(authState.creds.account!).finish()
 				})
 
 				logger.debug({ jid }, 'adding device identity')
 			}
 
-			if (additionalNodes && additionalNodes.length > 0) {
+			if (!isNewsletter && buttonType && messages) {
+				const buttonsNode = getButtonArgs(messages)
+				const filteredButtons = getBinaryFilteredButtons(additionalNodes ? additionalNodes : [])
+
+				if (filteredButtons) {
+					;(stanza.content as BinaryNode[]).push(...(additionalNodes || []))
+					didPushAdditional = true
+				} else {
+					;(stanza.content as BinaryNode[]).push(buttonsNode)
+				}
+			}
+
+			if (isJidUser(destinationJid)) {
+				const botNode: BinaryNode = {
+					tag: 'bot',
+					attrs: {
+						biz_bot: '1'
+					}
+				}
+
+				const filteredBizBot = getBinaryFilteredBizBot(additionalNodes ? additionalNodes : [])
+
+				if (filteredBizBot) {
+					;(stanza.content as BinaryNode[]).push(...(additionalNodes || []))
+					didPushAdditional = true
+				} else {
+					;(stanza.content as BinaryNode[]).push(botNode)
+				}
+			}
+
+			if (!didPushAdditional && additionalNodes && additionalNodes.length > 0) {
 				;(stanza.content as BinaryNode[]).push(...additionalNodes)
 			}
 
 			logger.debug({ msgId }, `sending message to ${participants.length} devices`)
 
 			await sendNode(stanza)
+
+			// Track receipt timeout for outgoing messages only
+			if (receiptTracker) {
+				const messageKey: WAMessageKey = {
+					remoteJid: jid,
+					fromMe: true,
+					id: msgId
+				}
+
+				// Extract ALL device JIDs for tracking (including our own devices)
+				const allTargetDevices = participants
+					.map(p => p.attrs.jid)
+					.filter((jid): jid is string => jid != null)
+
+				// Filter to get only recipient devices (exclude our own main ID but keep our device variants)
+				const recipientDevices = allTargetDevices.filter(deviceJid => {
+					// Don't track our main JID, but track our device variants
+					const isOurMainId = deviceJid === authState.creds.me?.id
+					return !isOurMainId
+				})
+
+				logger.debug({
+					msgId,
+					totalParticipants: participants.length,
+					allTargetDevices,
+					recipientDevices,
+					ourMainId: authState.creds.me?.id
+				}, 'Device extraction for receipt tracking')
+
+				if (recipientDevices.length > 0) {
+					receiptTracker.trackMessageSent(
+						messageKey,
+						jid,
+						recipientDevices  // Always pass device list for both groups and 1-to-1
+					)
+					
+					logger.trace({
+						msgId,
+						targetDevices: recipientDevices.length,
+						allDevices: allTargetDevices.length,
+						recipientDevices: recipientDevices,
+						isGroup
+					}, 'Started receipt timeout tracking for outgoing message')
+				}
+			}
 		})
 
 		return msgId
@@ -661,20 +954,30 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 	const getMediaType = (message: proto.IMessage) => {
 		if (message.imageMessage) {
 			return 'image'
+		} else if (message.stickerMessage) {
+			return message.stickerMessage.isLottie
+				? '1p_sticker'
+				: message.stickerMessage.isAvatar
+					? 'avatar_sticker'
+					: 'sticker'
 		} else if (message.videoMessage) {
 			return message.videoMessage.gifPlayback ? 'gif' : 'video'
 		} else if (message.audioMessage) {
 			return message.audioMessage.ptt ? 'ptt' : 'audio'
+		} else if (message.ptvMessage) {
+			return 'ptv'
 		} else if (message.contactMessage) {
 			return 'vcard'
 		} else if (message.documentMessage) {
 			return 'document'
+		} else if (message.stickerPackMessage) {
+			return 'sticker_pack'
 		} else if (message.contactsArrayMessage) {
 			return 'contact_array'
+		} else if (message.locationMessage) {
+			return 'location'
 		} else if (message.liveLocationMessage) {
 			return 'livelocation'
-		} else if (message.stickerMessage) {
-			return 'sticker'
 		} else if (message.listMessage) {
 			return 'list'
 		} else if (message.listResponseMessage) {
@@ -687,8 +990,111 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			return 'product'
 		} else if (message.interactiveResponseMessage) {
 			return 'native_flow_response'
-		} else if (message.groupInviteMessage) {
+		} else if (/https:\/\/wa\.me\/c\/\d+/.test(message.extendedTextMessage?.text || '')) {
+			return 'cataloglink'
+		} else if (/https:\/\/wa\.me\/p\/\d+\/\d+/.test(message.extendedTextMessage?.text || '')) {
+			return 'productlink'
+		} else if (message.extendedTextMessage?.matchedText || message.groupInviteMessage) {
 			return 'url'
+		}
+	}
+
+	const getButtonType = (message: proto.IMessage) => {
+		if (message.listMessage) {
+			return 'list'
+		} else if (message.buttonsMessage) {
+			return 'buttons'
+		} else if (message.interactiveMessage?.nativeFlowMessage) {
+			return 'native_flow'
+		}
+	}
+
+	const getButtonArgs = (message: proto.IMessage): BinaryNode => {
+		const nativeFlow = message.interactiveMessage?.nativeFlowMessage
+		const firstButtonName = nativeFlow?.buttons?.[0]?.name
+		const nativeFlowSpecials = [
+			'mpm',
+			'cta_catalog',
+			'send_location',
+			'call_permission_request',
+			'wa_payment_transaction_details',
+			'automated_greeting_message_view_catalog'
+		]
+
+		if (nativeFlow && (firstButtonName === 'review_and_pay' || firstButtonName === 'payment_info')) {
+			return {
+				tag: 'biz',
+				attrs: {
+					native_flow_name: firstButtonName === 'review_and_pay' ? 'order_details' : firstButtonName
+				}
+			}
+		} else if (nativeFlow && firstButtonName && nativeFlowSpecials.includes(firstButtonName)) {
+			// Only works for WhatsApp Original, not WhatsApp Business
+			return {
+				tag: 'biz',
+				attrs: {},
+				content: [
+					{
+						tag: 'interactive',
+						attrs: {
+							type: 'native_flow',
+							v: '1'
+						},
+						content: [
+							{
+								tag: 'native_flow',
+								attrs: {
+									v: '2',
+									name: firstButtonName
+								}
+							}
+						]
+					}
+				]
+			}
+		} else if (nativeFlow || message.buttonsMessage) {
+			// It works for whatsapp original and whatsapp business
+			return {
+				tag: 'biz',
+				attrs: {},
+				content: [
+					{
+						tag: 'interactive',
+						attrs: {
+							type: 'native_flow',
+							v: '1'
+						},
+						content: [
+							{
+								tag: 'native_flow',
+								attrs: {
+									v: '9',
+									name: 'mixed'
+								}
+							}
+						]
+					}
+				]
+			}
+		} else if (message.listMessage) {
+			return {
+				tag: 'biz',
+				attrs: {},
+				content: [
+					{
+						tag: 'list',
+						attrs: {
+							v: '2',
+							type: 'product_list'
+						}
+					}
+				]
+			}
+		} else {
+			return {
+				tag: 'biz',
+				attrs: {}
+			}
 		}
 	}
 
@@ -724,6 +1130,243 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 	const waitForMsgMediaUpdate = bindWaitForEvent(ev, 'messages.media-update')
 
+	const sendStatusMentions = async (content: AnyMessageContent, jids: string[] = []) => {
+		const userJid = jidNormalizedUser(authState.creds.me!.id)
+		const allUsers = new Set<string>()
+		allUsers.add(userJid)
+
+		for (const id of jids) {
+			const isGroup = isJidGroup(id)
+			const isPrivate = isJidUser(id)
+
+			if (isGroup) {
+				try {
+					const metadata = (cachedGroupMetadata && (await cachedGroupMetadata(id))) || (await groupMetadata(id))
+					const participants = metadata.participants.map(p => jidNormalizedUser(p.id))
+					participants.forEach(jid => allUsers.add(jid))
+				} catch (error) {
+					logger.error(`Error getting metadata for group ${id}: ${error}`)
+				}
+			} else if (isPrivate) {
+				allUsers.add(jidNormalizedUser(id))
+			}
+		}
+
+		const uniqueUsers = Array.from(allUsers)
+		const getRandomHexColor = () =>
+			'#' +
+			Math.floor(Math.random() * 16777215)
+				.toString(16)
+				.padStart(6, '0')
+
+		const isMedia = 'image' in content || 'video' in content || 'audio' in content
+		const isAudio = !!(content as any).audio
+
+		const messageContent = { ...content }
+
+		if (isMedia && !isAudio) {
+			if ((messageContent as any).text) {
+				;(messageContent as any).caption = (messageContent as any).text
+				delete (messageContent as any).text
+			}
+
+			delete (messageContent as any).ptt
+			delete (messageContent as any).font
+			delete (messageContent as any).backgroundColor
+			delete (messageContent as any).textColor
+		}
+
+		if (isAudio) {
+			delete (messageContent as any).text
+			delete (messageContent as any).caption
+			delete (messageContent as any).font
+			delete (messageContent as any).textColor
+		}
+
+		const font = !isMedia ? (content as any).font || Math.floor(Math.random() * 9) : undefined
+		const textColor = !isMedia ? (content as any).textColor || getRandomHexColor() : undefined
+		const backgroundColor = !isMedia || isAudio ? (content as any).backgroundColor || getRandomHexColor() : undefined
+		const ptt = isAudio ? (typeof (content as any).ptt === 'boolean' ? (content as any).ptt : true) : undefined
+
+		let msg: any
+		let mediaHandle: string | undefined
+		try {
+			msg = await generateWAMessage(STORIES_JID, messageContent, {
+				logger,
+				userJid,
+				getUrlInfo: (text: string) =>
+					getUrlInfo(text, {
+						thumbnailWidth: linkPreviewImageThumbnailWidth,
+						fetchOpts: { timeout: 3000, ...(axiosOptions || {}) },
+						logger,
+						uploadImage: generateHighQualityLinkPreview ? waUploadToServer : undefined
+					}),
+				upload: async (encFilePath: string, opts: any) => {
+					const up = await waUploadToServer(encFilePath, { ...opts })
+					mediaHandle = up.mediaUrl
+					return up
+				},
+				mediaCache: config.mediaCache,
+				options: config.options,
+				font,
+				textColor,
+				backgroundColor,
+				ptt
+			} as any)
+		} catch (error) {
+			logger.error(`Error generating message: ${error}`)
+			throw error
+		}
+
+		await relayMessage(STORIES_JID, msg.message, {
+			messageId: msg.key.id!,
+			statusJidList: uniqueUsers,
+			additionalNodes: [
+				{
+					tag: 'meta',
+					attrs: {},
+					content: [
+						{
+							tag: 'mentioned_users',
+							attrs: {},
+							content: jids.map(jid => ({
+								tag: 'to',
+								attrs: { jid: jidNormalizedUser(jid) }
+							}))
+						}
+					]
+				}
+			]
+		})
+
+		for (const id of jids) {
+			try {
+				const normalizedId = jidNormalizedUser(id)
+				const isPrivate = isJidUser(normalizedId)
+				const type = isPrivate ? 'statusMentionMessage' : 'groupStatusMentionMessage'
+
+				const protocolMessage = {
+					[type]: {
+						message: {
+							protocolMessage: {
+								key: msg.key,
+								type: 25
+							}
+						}
+					},
+					messageContextInfo: {
+						messageSecret: randomBytes(32)
+					}
+				}
+
+				const statusMsg = await generateWAMessageFromContent(normalizedId, protocolMessage, { userJid })
+
+				await relayMessage(normalizedId, statusMsg.message!, {
+					additionalNodes: [
+						{
+							tag: 'meta',
+							attrs: isPrivate ? { is_status_mention: 'true' } : { is_group_status_mention: 'true' }
+						}
+					]
+				})
+
+				await delay(2000)
+			} catch (error) {
+				logger.error(`Error sending to ${id}: ${error}`)
+			}
+		}
+
+		return msg
+	}
+
+	const sendAlbumMessage = async (
+		jid: string,
+		medias: AnyMessageContent[],
+		options: MiscMessageGenerationOptions = {}
+	) => {
+		const userJid = authState.creds.me!.id
+
+		for (const media of medias) {
+			if (!('image' in media) && !('video' in media)) throw new TypeError(`medias[i] must have image or video property`)
+		}
+
+		const time = (options as any).delay || 500
+		delete (options as any).delay
+
+		const album = await generateWAMessageFromContent(
+			jid,
+			{
+				albumMessage: {
+					expectedImageCount: medias.filter(media => 'image' in media).length,
+					expectedVideoCount: medias.filter(media => 'video' in media).length,
+					...options
+				}
+			} as any,
+			{ userJid, ...options }
+		)
+
+		await relayMessage(jid, album.message!, { messageId: album.key.id! })
+
+		let mediaHandle: string | undefined
+		let msg: any
+
+		for (const i in medias) {
+			const media = medias[i]
+			if (!media) continue
+
+			if ('image' in media) {
+				msg = await generateWAMessage(
+					jid,
+					{
+						...media,
+						...options
+					},
+					{
+						userJid,
+						upload: async (encFilePath: string, opts: any) => {
+							const up = await waUploadToServer(encFilePath, { ...opts, newsletter: isJidNewsletter(jid) })
+							mediaHandle = up.mediaUrl // Fixed: use mediaUrl instead of handle
+							return up
+						},
+						...options
+					}
+				)
+			} else if ('video' in media) {
+				msg = await generateWAMessage(
+					jid,
+					{
+						...media,
+						...options
+					},
+					{
+						userJid,
+						upload: async (encFilePath: string, opts: any) => {
+							const up = await waUploadToServer(encFilePath, { ...opts, newsletter: isJidNewsletter(jid) })
+							mediaHandle = up.mediaUrl // Fixed: use mediaUrl instead of handle
+							return up
+						},
+						...options
+					}
+				)
+			}
+
+			if (msg) {
+				msg.message!.messageContextInfo = {
+					messageSecret: randomBytes(32),
+					messageAssociation: {
+						associationType: 1,
+						parentMessageKey: album.key
+					}
+				}
+			}
+
+			await relayMessage(jid, msg!.message, { messageId: msg!.key.id! })
+			await delay(time)
+		}
+
+		return album
+	}
+
 	return {
 		...sock,
 		getPrivacyTokens,
@@ -738,6 +1381,12 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		sendPeerDataOperationMessage,
 		createParticipantNodes,
 		getUSyncDevices,
+		sendStatusMentions,
+		sendAlbumMessage,
+		// Built-in getMessage implementation (replaces external getMessage)
+		getMessage: messageCache.getMessage.bind(messageCache),
+		// Message cache for monitoring and stats
+		messageCache,
 		updateMediaMessage: async (message: proto.IWebMessageInfo) => {
 			const content = assertMediaContent(message.message)
 			const mediaKey = content.mediaKey!
@@ -863,6 +1512,34 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					statusJidList: options.statusJidList,
 					additionalNodes
 				})
+				
+				// Cache message with both PN and LID versions (if LID mapping exists)
+				const originalRemoteJid = fullMsg.key.remoteJid!
+				messageCache.addRecentMessage(originalRemoteJid, fullMsg.key.id!, fullMsg.message!)
+				
+				// Automatically fetch LID mapping and cache both versions
+				try {
+					const lidStore = signalRepository.getLIDMappingStore()
+					const lidForPN = await lidStore.getLIDForPN(originalRemoteJid)
+					
+					if (lidForPN && lidForPN !== originalRemoteJid) {
+						// Cache with LID version for retry compatibility
+						messageCache.addRecentMessage(lidForPN, fullMsg.key.id!, fullMsg.message!)
+						logger.trace({ 
+							originalRemoteJid, 
+							lidVersion: lidForPN, 
+							msgId: fullMsg.key.id 
+						}, 'Message cached with both PN and LID versions')
+					} else {
+						logger.trace({ 
+							originalRemoteJid, 
+							msgId: fullMsg.key.id 
+						}, 'Message cached with PN version only (no LID mapping)')
+					}
+				} catch (error) {
+					logger.warn({ error, remoteJid: originalRemoteJid }, 'Failed to fetch LID mapping for cache')
+				}
+
 				if (config.emitOwnEvents) {
 					process.nextTick(() => {
 						processingMutex.mutex(() => upsertMessage(fullMsg, 'append'))

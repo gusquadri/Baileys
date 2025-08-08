@@ -1,5 +1,5 @@
 /* @ts-ignore */
-import { deriveSecrets } from 'libsignal/src/crypto'
+import { deriveSecrets } from 'libsignal'
 
 export class SenderMessageKey {
 	private readonly iteration: number
@@ -8,7 +8,10 @@ export class SenderMessageKey {
 	private readonly seed: Uint8Array
 
 	constructor(iteration: number, seed: Uint8Array) {
-		const derivative = deriveSecrets(seed, Buffer.alloc(32), Buffer.from('WhisperGroup'))
+		const derivative = deriveSecrets(Buffer.from(seed), Buffer.alloc(32), Buffer.from('WhisperGroup'))
+		if (!derivative || !derivative[0] || !derivative[1]) {
+			throw new Error('Failed to derive secrets for sender message key')
+		}
 		const keys = new Uint8Array(32)
 		keys.set(new Uint8Array(derivative[0].slice(16)))
 		keys.set(new Uint8Array(derivative[1].slice(0, 16)), 16)

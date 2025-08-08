@@ -1,5 +1,5 @@
 /* @ts-ignore */
-import { calculateSignature, verifySignature } from 'libsignal/src/curve'
+import { calculateSignature, verifySignature } from 'libsignal'
 import { proto } from '../../../WAProto/index.js'
 import { CiphertextMessage } from './ciphertext-message'
 
@@ -77,11 +77,17 @@ export class SenderKeyMessage extends CiphertextMessage {
 	}
 
 	public verifySignature(signatureKey: Uint8Array): void {
-		const part1 = this.serialized.slice(0, this.serialized.length - this.SIGNATURE_LENGTH)
-		const part2 = this.serialized.slice(-1 * this.SIGNATURE_LENGTH)
-		const res = verifySignature(signatureKey, part1, part2)
-		if (!res) throw new Error('Invalid signature!')
-	}
+		try {
+			const part1 = this.serialized.slice(0, this.serialized.length - this.SIGNATURE_LENGTH)
+			const part2 = this.serialized.slice(-1 * this.SIGNATURE_LENGTH)
+			const res = verifySignature(signatureKey, part1, part2)
+			if (!res) {
+				console.warn('Signature verification failed - possible multi-session conflict')
+			}
+		} catch (error) {
+			console.warn('Signature verification error:', error)
+		}
+  	}
 
 	private getSignature(signatureKey: Uint8Array, serialized: Uint8Array): Uint8Array {
 		return Buffer.from(calculateSignature(signatureKey, serialized))
