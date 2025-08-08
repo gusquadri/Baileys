@@ -15,7 +15,7 @@ import {
 } from '../WABinary'
 import { unpadRandomMax16 } from './generics'
 import type { ILogger } from './logger'
-import { determineLIDEncryptionJid } from './decode-wa-message-lid'
+import { determineEncryptionJid, shouldMigrateSession } from './decode-wa-message-lid-simple'
 
 export const NO_MESSAGE_FOUND_ERROR_TEXT = 'Message absent from node'
 export const MISSING_KEYS_ERROR_TEXT = 'Key used already or never filled'
@@ -206,15 +206,24 @@ export const decryptMessageNode = (
 						const e2eType = tag === 'plaintext' ? 'plaintext' : attrs.type
 						switch (e2eType) {
 							case 'skmsg':
-								// Apply LID priority to group message author
+								// Determine encryption JID for group message author
 								const { addressingMode: groupAddressingMode, senderAlt: authorAlt } = extractAddressingContext(stanza, sender, author)
-								const { encryptionJid: authorEncryptionJid } = await determineLIDEncryptionJid(
+								const authorEncryptionJid = await determineEncryptionJid(
 									author,
 									authorAlt,
 									repository,
-									logger,
-									meId
+									logger
 								)
+								
+								// Migrate if needed (following whatsmeow approach)
+								if (shouldMigrateSession(author, authorEncryptionJid, authorAlt)) {
+									try {
+										await repository.migrateSession(author, authorEncryptionJid)
+										logger.info({ author, authorEncryptionJid }, 'Migrated group author session')
+									} catch (error) {
+										logger.error({ author, authorEncryptionJid, error }, 'Group author migration failed')
+									}
+								}
 								
 								msgBuffer = await repository.decryptGroupMessage({
 									group: sender,
@@ -224,14 +233,13 @@ export const decryptMessageNode = (
 								break
 							case 'pkmsg':
 							case 'msg':
-								// Apply WhatsApp's LID priority system
+								// Determine encryption JID (following whatsmeow's simple approach)
 								const { addressingMode, senderAlt } = extractAddressingContext(stanza, sender)
-								const { encryptionJid: senderEncryptionJid, shouldMigrate } = await determineLIDEncryptionJid(
+								const senderEncryptionJid = await determineEncryptionJid(
 									sender,
 									senderAlt,
 									repository,
-									logger,
-									meId
+									logger
 								)
 								
 								// Store LID mapping when detected from message metadata
@@ -244,51 +252,29 @@ export const decryptMessageNode = (
 									}
 								}
 								
-								// Trigger session migration if needed
-								if (shouldMigrate && senderEncryptionJid !== sender) {
+								// Migrate session if needed (following whatsmeow approach)
+								if (shouldMigrateSession(sender, senderEncryptionJid, senderAlt)) {
 									try {
 										await repository.migrateSession(sender, senderEncryptionJid)
+										logger.info({ sender, senderEncryptionJid }, 'Migrated sender session')
 									} catch (error) {
-										logger.error({ sender, lid: senderEncryptionJid, error }, 'Session migration failed')
+										logger.error({ sender, senderEncryptionJid, error }, 'Session migration failed')
+										// Continue with decryption attempt anyway
 									}
 								}
 								
 								logger.debug({ 
 									originalSender: sender,
-									finalSender: senderEncryptionJid,
+									encryptionJid: senderEncryptionJid,
 									addressingMode
-								}, 'Using LID priority for decryption')
+								}, 'Decrypting message')
 								
-								// Try LID decryption first, fallback to PN on session mismatch
-								try {
-									msgBuffer = await repository.decryptMessage({
-										jid: senderEncryptionJid,
-										type: e2eType,
-										ciphertext: content
-									})
-								} catch (lidError: any) {
-									// Check if this is a Bad MAC error (session mismatch)
-									const isBadMac = lidError?.message?.includes('Bad MAC') || 
-									                lidError?.message?.includes('No matching sessions')
-									
-									if (isBadMac && senderEncryptionJid !== sender) {
-										logger.warn({
-											originalSender: sender,
-											attemptedLid: senderEncryptionJid,
-											error: lidError.message
-										}, 'LID decryption failed with session mismatch, falling back to PN')
-										
-										// Fallback to original PN address
-										msgBuffer = await repository.decryptMessage({
-											jid: sender,
-											type: e2eType,
-											ciphertext: content
-										})
-									} else {
-										// Re-throw if not a session mismatch error
-										throw lidError
-									}
-								}
+								// Decrypt with determined JID (no fallback logic)
+								msgBuffer = await repository.decryptMessage({
+									jid: senderEncryptionJid,
+									type: e2eType,
+									ciphertext: content
+								})
 								break
 							case 'plaintext':
 								msgBuffer = content
