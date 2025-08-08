@@ -23,149 +23,13 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 	lidMapping.setPrivacyTokenManager(privacyTokenManager)
 	
 	
-	// Migration tracking using Redis for persistence and consistency
-	// Following whatsmeow approach: permanent tracking, no TTL
-	const getMigrationKey = (fromJid: string): string => {
-		// Use full Signal address format including device ID for per-device tracking
-		const decoded = jidDecode(fromJid)
-		if (!decoded) return fromJid
-		const deviceId = decoded.device || 0
-		return `${decoded.user}.${deviceId}_migrated` // Include device ID for per-device migration tracking
+	const hasLIDSession = async (lidJid: string): Promise<boolean> => {
+		const lidAddr = jidToSignalProtocolAddress(lidJid)
+		const lidSession = await storage.loadSession(lidAddr.toString())
+		return !!(lidSession && lidSession.haveOpenSession())
 	}
 	
-	const isRecentlyMigrated = async (fromJid: string): Promise<boolean> => {
-		const key = getMigrationKey(fromJid)
-		const stored = await auth.keys.get('migration-tracker', [key])
-		return stored[key] === 'completed'
-	}
-	
-	const markAsMigrated = async (fromJid: string): Promise<void> => {
-		const key = getMigrationKey(fromJid)
-		await auth.keys.set({
-			'migration-tracker': {
-				[key]: 'completed'
-			}
-		})
-	}
-	
-	/**
-	 * Server-coordinated session migration - migrate only when server notifies
-	 * Based on actual WhatsApp/whatsmeow approach (NOT reactive)
-	 */
-	const coordinatedSessionMigration = async (fromJid: string, toJid: string): Promise<void> => {
-		// WHATSAPP'S PROPER MIGRATION: Only called when server sends migration notification
-		// This prevents reactive migration during message processing that causes Bad MAC
-		
-		console.log(`🔄 Server-coordinated migration: ${fromJid} → ${toJid}`)
-		
-		const fromAddr = jidToSignalProtocolAddress(fromJid)
-		const toAddr = jidToSignalProtocolAddress(toJid)
-		
-		try {
-			// 1. Load existing session from old address
-			const fromSession = await storage.loadSession(fromAddr.toString())
-			if (!fromSession || !fromSession.haveOpenSession()) {
-				console.log(`⚠️ No active session found at ${fromJid} - skipping migration`)
-				return
-			}
-			
-			// 2. ATOMIC MIGRATION: Copy complete session state
-			await storage.storeSession(toAddr.toString(), fromSession)
-			
-			// 3. Migrate privacy tokens
-			try {
-				await privacyTokenManager.migratePrivacyToken(fromJid, toJid)
-				console.log(`🔐 Privacy token migrated: ${fromJid} → ${toJid}`)
-			} catch (tokenError) {
-				console.warn(`⚠️ Privacy token migration failed: ${fromJid} → ${toJid}`, tokenError)
-			}
-			
-			// 4. Update LID mapping
-			await lidMapping.storeLIDPNMapping(toJid, fromJid)
-			
-			// 5. Delete old session after successful migration (whatsmeow approach)
-			await storage.storeSession(fromAddr.toString(), null)
-			
-			console.log(`✅ Coordinated migration completed: ${fromJid} → ${toJid}`)
-		} catch (error) {
-			console.error(`❌ Failed coordinated migration: ${fromJid} → ${toJid}`, error)
-			throw error
-		}
-	}
 
-	/**
-	 * Atomic session migration following whatsmeow's approach
-	 * Only migrates sessions, not identity/sender keys (simpler, more reliable)
-	 */
-	const migrateSession = async (fromJid: string, toJid: string): Promise<void> => {
-		const fromAddr = jidToSignalProtocolAddress(fromJid)
-		const toAddr = jidToSignalProtocolAddress(toJid)
-		
-		const fromAddrStr = fromAddr.toString()
-		const toAddrStr = toAddr.toString()
-		
-		if (fromAddrStr === toAddrStr) {
-			return // No migration needed
-		}
-		
-		// LRU-based deduplication check (optimal pattern for migration tracking)
-		const migrationKey = `${fromJid}→${toJid}`
-		
-		// Check if migration was recently completed
-		if (await isRecentlyMigrated(fromJid)) {
-			console.log(`✅ Migration already completed: ${migrationKey}`)
-			return
-		}
-		
-		// ATOMIC MIGRATION: All operations in single transaction (whatsmeow pattern)
-		return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
-			try {
-				let migrationCount = 0
-				const migrationLog: string[] = []
-				
-				// Check if destination already has a session - if yes, skip migration
-				const toSession = await storage.loadSession(toAddrStr)
-				if (toSession && toSession.haveOpenSession()) {
-					console.log(`✅ Session already exists at ${toJid}, skipping migration`)
-					await markAsMigrated(fromJid) // Mark as migrated in Redis
-					return
-				}
-				
-				// 1. MIGRATE SIGNAL SESSION (most critical)
-				const fromSession = await storage.loadSession(fromAddrStr)
-				if (fromSession && fromSession.haveOpenSession()) {
-					await storage.storeSession(toAddrStr, fromSession)
-					migrationCount++
-					migrationLog.push(`session: ${fromAddrStr} → ${toAddrStr}`)
-					
-					// Delete old session after successful migration (whatsmeow approach)
-					await storage.storeSession(fromAddrStr, null)
-					migrationLog.push(`deleted old session: ${fromAddrStr}`)
-				}
-				
-				// 4. UPDATE LID MAPPING (Baileys enhancement)
-				try {
-					await lidMapping.storeLIDPNMapping(toJid, fromJid)
-					migrationLog.push(`lid-mapping: ${fromJid} ↔ ${toJid}`)
-				} catch (lidError) {
-					console.warn(`⚠️ LID mapping update failed: ${lidError}`)
-				}
-				
-				// 5. MIGRATION STATISTICS (whatsmeow pattern)
-				if (migrationCount > 0) {
-					console.log(`✅ Atomic migration completed: ${fromJid} → ${toJid}`)
-					console.log(`   Migrated components (${migrationCount}): ${migrationLog.join(', ')}`)
-					await markAsMigrated(fromJid) // Mark as migrated in Redis
-				} else {
-					console.log(`ℹ️ No components to migrate: ${fromJid} → ${toJid}`)
-				}
-				
-			} catch (error) {
-				console.error(`❌ Atomic migration failed: ${fromJid} → ${toJid}`, error)
-				throw error // Transaction will rollback
-			}
-		})
-	}
 
 
 	const repository: SignalRepository = {
@@ -345,9 +209,9 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 				return
 			}
 			
-			// Check if already migrated for this specific device
-			if (await isRecentlyMigrated(fromJid)) {
-				console.log(`✅ Already migrated: ${fromJid}`)
+			// Check if LID session already exists for this device
+			if (await hasLIDSession(toJid)) {
+				console.log(`✅ LID session already exists: ${toJid}`)
 				return
 			}
 			
@@ -362,7 +226,6 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 				const fromSession = await storage.loadSession(fromAddr.toString())
 				if (!fromSession || !fromSession.haveOpenSession()) {
 					console.log(`ℹ️ No session to migrate from ${fromJid}`)
-					await markAsMigrated(fromJid) // Mark as processed
 					return
 				}
 				
@@ -370,9 +233,6 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 				await storage.storeSession(toAddr.toString(), fromSession)
 				console.log(`✅ Session copied: ${fromAddr} → ${toAddr}`)
 				console.log(`🔄 Keeping original session: ${fromAddr}`)
-				
-				// Mark as migrated for this device
-				await markAsMigrated(fromJid)
 				
 				// Store LID mapping
 				await lidMapping.storeLIDPNMapping(toJid, fromJid)

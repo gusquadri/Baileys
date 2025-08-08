@@ -74,7 +74,6 @@ export type SignalDataTypeMap = {
 	'app-state-sync-version': LTHashState
 	'lid-mapping': string
 	'privacy-tokens': { token: Buffer; timestamp: number }
-	'migration-tracker': string
 }
 
 export type SignalDataSet = { [T in keyof SignalDataTypeMap]?: { [id: string]: SignalDataTypeMap[T] | null } }
