@@ -15,8 +15,8 @@ export class LIDMappingStore {
     private readonly keys: SignalKeyStoreWithTransaction
     
     // Small LRU cache for immediate synchronous access in retry scenarios
-    private readonly syncCache = new Map<string, string>() // Limited cache for sync access
-    private readonly maxCacheSize = 100 // Keep small to avoid memory issues
+    // private readonly syncCache = new Map<string, string>() // Limited cache for sync access
+    // private readonly maxCacheSize = 100 // Keep small to avoid memory issues
     
     constructor(keys: SignalKeyStoreWithTransaction) {
         this.keys = keys
@@ -56,7 +56,7 @@ export class LIDMappingStore {
         })
         
         // Update sync cache after successful storage
-        this.updateSyncCache(pnUser, lidUser)
+        // this.updateSyncCache(pnUser, lidUser) // DISABLED FOR DOUBLE RATCHET TESTING
         
         console.log(`✅ LID mapping stored: ${pnUser} ↔ ${lidUser}`)
     }
@@ -78,7 +78,7 @@ export class LIDMappingStore {
         if (!lidUser || typeof lidUser !== 'string') return null
         
         // Update sync cache for immediate access
-        this.updateSyncCache(decoded.user, lidUser)
+        // this.updateSyncCache(decoded.user, lidUser) // DISABLED FOR DOUBLE RATCHET TESTING
         
         // CRITICAL: Preserve device ID from input
         return decoded.device !== undefined
@@ -103,7 +103,7 @@ export class LIDMappingStore {
         if (!pnUser || typeof pnUser !== 'string') return null
         
         // Update sync cache for immediate access (reverse mapping)
-        this.updateSyncCache(pnUser, decoded.user)
+        // this.updateSyncCache(pnUser, decoded.user) // DISABLED FOR DOUBLE RATCHET TESTING
         
         // CRITICAL: Preserve device ID from input
         return decoded.device !== undefined
@@ -179,35 +179,37 @@ export class LIDMappingStore {
     /**
      * Helper to manage small sync cache
      */
-    private updateSyncCache(pnUser: string, lidUser: string): void {
-        // Keep cache small - remove oldest if needed
-        if (this.syncCache.size >= this.maxCacheSize) {
-            const firstKey = this.syncCache.keys().next().value
-            if (firstKey) {
-                this.syncCache.delete(firstKey)
-            }
-        }
-        this.syncCache.set(pnUser, lidUser)
-    }
+    // private updateSyncCache(pnUser: string, lidUser: string): void {
+    //     // Keep cache small - remove oldest if needed
+    //     if (this.syncCache.size >= this.maxCacheSize) {
+    //         const firstKey = this.syncCache.keys().next().value
+    //         if (firstKey) {
+    //             this.syncCache.delete(firstKey)
+    //         }
+    //     }
+    //     this.syncCache.set(pnUser, lidUser)
+    // }
 
     /**
      * Fast synchronous cache lookup for retry scenarios
      */
-    getFromCache(pn: string): string | null {
-        if (!isJidUser(pn)) return null
+    // getFromCache(pn: string): string | null {
+        // DISABLED FOR DOUBLE RATCHET TESTING - always return null to force Redis lookup
         
-        const decoded = jidDecode(pn)
-        if (!decoded) return null
-        
-        // Check sync cache first
-        const lidUser = this.syncCache.get(decoded.user)
-        if (!lidUser) return null
-        
-        // CRITICAL: Preserve device ID from input
-        return decoded.device !== undefined
-            ? `${lidUser}:${decoded.device}@lid`
-            : `${lidUser}@lid`
-    }
+        // if (!isJidUser(pn)) return null
+        // 
+        // const decoded = jidDecode(pn)
+        // if (!decoded) return null
+        // 
+        // // Check sync cache first
+        // const lidUser = this.syncCache.get(decoded.user)
+        // if (!lidUser) return null
+        // 
+        // // CRITICAL: Preserve device ID from input
+        // return decoded.device !== undefined
+        //     ? `${lidUser}:${decoded.device}@lid`
+        //     : `${lidUser}@lid`
+    // }
 
     /**
      * Check if JID has session
