@@ -224,10 +224,13 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 				return
 			}
 			
-			// Copy to LID address (keep original) - async-mutex handles concurrency
+			// Migrate session: copy to LID then delete PN to prevent conflicts
 			await storage.storeSession(toAddr.toString(), fromSession)
 			console.log(`✅ Session copied: ${fromAddr} → ${toAddr}`)
-			console.log(`🔄 Keeping original session: ${fromAddr}`)
+			
+			// Delete PN session to prevent identity/ratchet conflicts with LID session
+			await auth.keys.set({ 'session': { [fromAddr.toString()]: null } })
+			console.log(`🗑️ Deleted PN session to prevent conflicts: ${fromAddr}`)
 			
 			// Store LID mapping
 			await lidMapping.storeLIDPNMapping(toJid, fromJid)

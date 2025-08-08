@@ -448,10 +448,9 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				}
 
 				const bytes = encodeWAMessage(patchedMessage)
-				const wireJid = jid
 				
 				// Coordinate session operations to prevent race conditions (following whatsmeow)
-				const encryptionResult = await sessionOperationMutex.mutex(jid, async () => {
+				const { encryptionResult, finalIdentity } = await sessionOperationMutex.mutex(jid, async () => {
 					// EXACT WHATSMEOW LOGIC: send.go:1178-1187
 					let encryptionIdentity = jid
 					
@@ -476,13 +475,17 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					}
 					
 					// Encrypt with coordinated session state
-					return await signalRepository.encryptMessage({ 
+					const result = await signalRepository.encryptMessage({ 
 						jid: encryptionIdentity, 
 						data: bytes
 					})
+					
+					return { encryptionResult: result, finalIdentity: encryptionIdentity }
 				})
 				
 				const { type, ciphertext } = encryptionResult
+				// Use final encryption identity as wire identity (whatsmeow approach)
+				const wireJid = finalIdentity
 				if (type === 'pkmsg') {
 					shouldIncludeDeviceIdentity = true
 				}
@@ -623,6 +626,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 						to: jid,
 						id: msgId,
 						type: getMessageType(message),
+						// t: unixTimestampSeconds().toString(), // POTENTIAL FIX: Add timestamp attribute for WhatsApp envelope validation (investigating)
 						...(additionalAttributes || {})
 					},
 					content: binaryNodeContent
@@ -819,6 +823,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					id: msgId,
 					to: destinationJid,
 					type: getMessageType(message),
+					t: unixTimestampSeconds().toString(),
 					...addressingModeAttrs,
 					...(additionalAttributes || {})
 				},
