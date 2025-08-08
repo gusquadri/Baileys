@@ -344,37 +344,72 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 				return
 			}
 			
-			// Check if already migrated
-			if (await isRecentlyMigrated(fromJid)) {
-				console.log(`✅ Already migrated: ${fromJid}`)
+			// Extract user portions (no device IDs) for bulk migration check
+			const fromDecoded = jidDecode(fromJid)
+			const toDecoded = jidDecode(toJid)
+			if (!fromDecoded || !toDecoded) return
+			
+			const pnUser = fromDecoded.user // e.g., "554391318447"
+			const lidUser = toDecoded.user  // e.g., "109822716420216"
+			
+			// Check if bulk migration already happened for this user
+			if (await isRecentlyMigrated(pnUser)) {
+				console.log(`✅ Bulk migration already completed for user: ${pnUser}`)
 				return
 			}
 			
-			console.log(`🔄 Migrating session (keeping both): ${fromJid} → ${toJid}`)
+			console.log(`🔄 Bulk migrating ALL devices: ${pnUser} → ${lidUser}`)
 			
-			// Atomic migration in transaction
+			// Atomic bulk migration in transaction (whatsmeow pattern)
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
-				const fromAddr = jidToSignalProtocolAddress(fromJid)
-				const toAddr = jidToSignalProtocolAddress(toJid)
+				let migratedCount = 0
+				const migratedDevices: string[] = []
 				
-				// Load PN session
-				const fromSession = await storage.loadSession(fromAddr.toString())
-				if (!fromSession || !fromSession.haveOpenSession()) {
-					console.log(`ℹ️ No session to migrate from ${fromJid}`)
-					await markAsMigrated(fromJid) // Mark as processed
+				// Get all existing sessions for this PN user 
+				const allSessionKeys = await auth.keys.get('session', [])
+				const sessionEntries = Object.entries(allSessionKeys)
+				
+				// Find all PN sessions for this user (all devices)
+				const userPNSessions = sessionEntries.filter(([key]) => 
+					key.startsWith(`${pnUser}.`)
+				)
+				
+				if (userPNSessions.length === 0) {
+					console.log(`ℹ️ No sessions found for user ${pnUser}`)
+					await markAsMigrated(pnUser) // Mark as processed
 					return
 				}
 				
-				// Copy to LID address (keep original)
-				await storage.storeSession(toAddr.toString(), fromSession)
-				console.log(`✅ Session copied: ${fromAddr} → ${toAddr}`)
-				console.log(`🔄 Keeping original session: ${fromAddr}`)
+				console.log(`📋 Found ${userPNSessions.length} device sessions to migrate for user ${pnUser}`)
 				
-				// Mark as migrated in Redis
-				await markAsMigrated(fromJid)
+				// Migrate each device session
+				for (const [pnSessionKey, sessionData] of userPNSessions) {
+					const deviceMatch = pnSessionKey.match(/\.(\d+)$/)
+					const deviceId = deviceMatch ? deviceMatch[1] : '0'
+					
+					// Generate LID session key: 109822716420216_1.0, 109822716420216_1.8, etc.
+					const lidSessionKey = `${lidUser}_1.${deviceId}`
+					
+					// Copy session data to LID key
+					await auth.keys.set({
+						'session': {
+							[lidSessionKey]: sessionData
+						}
+					})
+					
+					migratedCount++
+					migratedDevices.push(`${pnSessionKey} → ${lidSessionKey}`)
+					console.log(`✅ Session copied: ${pnSessionKey} → ${lidSessionKey}`)
+				}
+				
+				// Mark user as migrated (prevent future bulk migrations)
+				await markAsMigrated(pnUser)
 				
 				// Store LID mapping
 				await lidMapping.storeLIDPNMapping(toJid, fromJid)
+				
+				console.log(`🎉 Bulk migration completed: ${migratedCount} devices migrated for ${pnUser}`)
+				console.log(`📝 Migrated devices: ${migratedDevices.join(', ')}`)
 			})
 		}
 	}
