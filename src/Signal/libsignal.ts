@@ -235,39 +235,24 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			})
 		},
 		async encryptMessage({ jid, data }) {
-			// Simple approach following whatsmeow:
-			// 1. Check if we have a stored LID for this PN
-			// 2. Use LID if available, otherwise use PN
-			// 3. No complex priority logic or migration during encryption
+			// SAFE APPROACH: NO LID lookups during encryption
+			// The Socket layer should determine the correct JID before calling this
+			// Migration should happen during MESSAGE RECEPTION, not sending
 			
-			let encryptionJid = jid
+			console.log(`📤 Encrypting for: ${jid}`)
 			
-			// Skip LID lookup for non-user JIDs or bots
-			if (isJidUser(jid) && !jid.includes('bot')) {
-				try {
-					const lidStore = repository.getLIDMappingStore()
-					const storedLid = await lidStore.getLIDForPN(jid)
-					
-					if (storedLid && isLidUser(storedLid)) {
-						console.log(`📤 Using stored LID for encryption: ${jid} → ${storedLid}`)
-						encryptionJid = storedLid
-					}
-				} catch (error) {
-					console.warn(`⚠️ Failed to lookup LID for ${jid}:`, error)
-				}
-			}
-			
-			console.log(`📤 Encrypting for: ${encryptionJid}`)
-			
-			const addr = jidToSignalProtocolAddress(encryptionJid)
+			const addr = jidToSignalProtocolAddress(jid)
 			const cipher = new libsignal.SessionCipher(storage, addr)
 			
-			// Simple encryption - let it fail if session doesn't exist
-			// The retry mechanism will handle session creation
 			const { type: sigType, body } = await cipher.encrypt(data)
 			const type = sigType === 3 ? 'pkmsg' : 'msg'
 			
-			return { type, ciphertext: Buffer.from(body as any, 'binary') }
+			return { 
+				type, 
+				ciphertext: Buffer.from(body as any, 'binary'),
+				encryptionJid: jid,
+				wireJid: jid
+			}
 		},
 		async encryptGroupMessage({ group, meId, data }) {
 			const senderName = jidToSignalSenderKeyName(group, meId)
@@ -347,12 +332,12 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			return privacyTokenManager
 		},
 		/**
-		 * Migrate session from PN to LID following whatsmeow's approach
+		 * Migrate session from PN to LID - KEEP BOTH SESSIONS
 		 * Key principles:
 		 * 1. One-way migration only (PN → LID)
 		 * 2. Skip if already migrated (check Redis)
 		 * 3. Atomic operation within transaction
-		 * 4. Delete old session after migration
+		 * 4. KEEP both sessions (safer approach)
 		 */
 		async migrateSession(fromJid: string, toJid: string) {
 			// Only migrate PN → LID
@@ -367,7 +352,7 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 				return
 			}
 			
-			console.log(`🔄 Migrating session: ${fromJid} → ${toJid}`)
+			console.log(`🔄 Migrating session (keeping both): ${fromJid} → ${toJid}`)
 			
 			// Atomic migration in transaction
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
@@ -382,13 +367,10 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 					return
 				}
 				
-				// Copy to LID address
+				// Copy to LID address (keep original)
 				await storage.storeSession(toAddr.toString(), fromSession)
 				console.log(`✅ Session copied: ${fromAddr} → ${toAddr}`)
-				
-				// Delete old PN session
-				await storage.storeSession(fromAddr.toString(), null)
-				console.log(`🗑️ Deleted old session: ${fromAddr}`)
+				console.log(`🔄 Keeping original session: ${fromAddr}`)
 				
 				// Mark as migrated in Redis
 				await markAsMigrated(fromJid)

@@ -58,6 +58,8 @@ export type SignalRepository = {
 	encryptMessage(opts: EncryptMessageOpts): Promise<{
 		type: 'pkmsg' | 'msg'
 		ciphertext: Uint8Array
+		encryptionJid?: string  // Which JID was actually used for encryption
+		wireJid?: string        // Original wire identity for message attributes
 	}>
 	encryptGroupMessage(opts: EncryptGroupMessageOpts): Promise<{
 		senderKeyDistributionMessage: Uint8Array

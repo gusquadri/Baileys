@@ -445,7 +445,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 				const bytes = encodeWAMessage(patchedMessage)
 				
-				const { type, ciphertext } = await signalRepository.encryptMessage({ 
+				const { type, ciphertext, encryptionJid, wireJid } = await signalRepository.encryptMessage({ 
 					jid, 
 					data: bytes
 				})
@@ -453,9 +453,10 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					shouldIncludeDeviceIdentity = true
 				}
 
+				// Use wire identity in message attributes (whatsmeow approach)
 				const node: BinaryNode = {
 					tag: 'to',
-					attrs: { jid },
+					attrs: { jid: wireJid || jid },
 					content: [
 						{
 							tag: 'enc',
