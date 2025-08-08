@@ -1489,36 +1489,32 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					additionalNodes
 				})
 				
-				// Cache message with both original remoteJid and LID-mapped JID for retry compatibility
+				// Cache message with both PN and LID versions (if LID mapping exists)
 				const originalRemoteJid = fullMsg.key.remoteJid!
 				messageCache.addRecentMessage(originalRemoteJid, fullMsg.key.id!, fullMsg.message!)
 				
-				// Also cache with LID-mapped version (if different) for device-specific retry requests
-				const decoded = jidDecode(jid)
-				if (decoded && jid !== originalRemoteJid) {
-					// Cache with the relay JID (could be LID after migration)
-					messageCache.addRecentMessage(jid, fullMsg.key.id!, fullMsg.message!)
+				// Automatically fetch LID mapping and cache both versions
+				try {
+					const lidStore = signalRepository.getLIDMappingStore()
+					const lidForPN = await lidStore.getLIDForPN(originalRemoteJid)
 					
-					// Also cache device-specific versions if it's a user JID
-					if (decoded.server === 's.whatsapp.net' || decoded.server === 'lid') {
-						// Get LID mapping for device-specific caching
-						try {
-							const lidStore = signalRepository.getLIDMappingStore()
-							const lidForPN = await lidStore.getLIDForPN(jid)
-							if (lidForPN && lidForPN !== jid) {
-								messageCache.addRecentMessage(lidForPN, fullMsg.key.id!, fullMsg.message!)
-							}
-						} catch (error) {
-							console.warn('Failed to cache LID version:', error)
-						}
+					if (lidForPN && lidForPN !== originalRemoteJid) {
+						// Cache with LID version for retry compatibility
+						messageCache.addRecentMessage(lidForPN, fullMsg.key.id!, fullMsg.message!)
+						logger.trace({ 
+							originalRemoteJid, 
+							lidVersion: lidForPN, 
+							msgId: fullMsg.key.id 
+						}, 'Message cached with both PN and LID versions')
+					} else {
+						logger.trace({ 
+							originalRemoteJid, 
+							msgId: fullMsg.key.id 
+						}, 'Message cached with PN version only (no LID mapping)')
 					}
+				} catch (error) {
+					logger.warn({ error, remoteJid: originalRemoteJid }, 'Failed to fetch LID mapping for cache')
 				}
-				
-				logger.trace({ 
-					originalRemoteJid, 
-					relayJid: jid, 
-					msgId: fullMsg.key.id 
-				}, 'Message cached with multiple JID variants')
 
 				if (config.emitOwnEvents) {
 					process.nextTick(() => {
