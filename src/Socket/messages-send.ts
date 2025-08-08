@@ -445,33 +445,31 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 				const bytes = encodeWAMessage(patchedMessage)
 				
-				// DETERMINE ENCRYPTION JID: Check if we should encrypt for LID instead of PN
-				let encryptionJid = jid
+				// EXACT WHATSMEOW LOGIC: send.go:1178-1187
+				let encryptionIdentity = jid
 				const wireJid = jid
 				
-				// For PN addresses, check if we have a LID mapping (whatsmeow approach)
+				// if jid.Server == types.DefaultUserServer
 				if (jid.includes('@s.whatsapp.net') && !jid.includes('bot')) {
 					try {
+						// lidForPN, err := cli.Store.LIDs.GetLIDForPN(ctx, jid)
 						const lidStore = signalRepository.getLIDMappingStore()
-						const storedLid = await lidStore.getLIDForPN(jid)
+						const lidForPN = await lidStore.getLIDForPN(jid)
 						
-						if (storedLid && storedLid.includes('@lid')) {
-							// Check if we have a session for the LID
-							const hasLidSession = await lidStore.hasSession(storedLid)
-							if (hasLidSession) {
-								console.log(`📤 Socket: Using LID for encryption: ${jid} → ${storedLid}`)
-								encryptionJid = storedLid
-							} else {
-								console.log(`📤 Socket: LID found but no session, using PN: ${jid}`)
-							}
+						// else if !lidForPN.IsEmpty()
+						if (lidForPN && lidForPN.includes('@lid')) {
+							// IMPORTANT: NO MIGRATION DURING SEND - only use LID if we already have it
+							// Migration should only happen during message RECEPTION
+							encryptionIdentity = lidForPN
+							console.log(`📤 Using existing LID: ${jid} → ${lidForPN}`)
 						}
 					} catch (error) {
-						console.warn(`⚠️ Socket: Failed to lookup LID for ${jid}:`, error)
+						console.warn(`⚠️ Failed to get LID for ${jid}:`, error)
 					}
 				}
 				
 				const { type, ciphertext } = await signalRepository.encryptMessage({ 
-					jid: encryptionJid, 
+					jid: encryptionIdentity, 
 					data: bytes
 				})
 				if (type === 'pkmsg') {
