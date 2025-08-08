@@ -26,10 +26,11 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 	// Migration tracking using Redis for persistence and consistency
 	// Following whatsmeow approach: permanent tracking, no TTL
 	const getMigrationKey = (fromJid: string): string => {
-		// Use Signal address format for consistency with whatsmeow
+		// Use full Signal address format including device ID for per-device tracking
 		const decoded = jidDecode(fromJid)
 		if (!decoded) return fromJid
-		return `${decoded.user}_migrated` // Add suffix to distinguish from regular LID mappings
+		const deviceId = decoded.device || 0
+		return `${decoded.user}.${deviceId}_migrated` // Include device ID for per-device migration tracking
 	}
 	
 	const isRecentlyMigrated = async (fromJid: string): Promise<boolean> => {
