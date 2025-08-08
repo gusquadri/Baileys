@@ -34,15 +34,15 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 	
 	const isRecentlyMigrated = async (fromJid: string): Promise<boolean> => {
 		const key = getMigrationKey(fromJid)
-		const stored = await auth.keys.get('lid-mapping', [key])
-		return stored[key] === 'true' // Store as string since lid-mapping expects string values
+		const stored = await auth.keys.get('migration-tracker', [key])
+		return stored[key] === 'completed'
 	}
 	
 	const markAsMigrated = async (fromJid: string): Promise<void> => {
 		const key = getMigrationKey(fromJid)
 		await auth.keys.set({
-			'lid-mapping': {
-				[key]: 'true' // Store migration flag as string
+			'migration-tracker': {
+				[key]: 'completed'
 			}
 		})
 	}
@@ -344,72 +344,37 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 				return
 			}
 			
-			// Extract user portions (no device IDs) for bulk migration check
-			const fromDecoded = jidDecode(fromJid)
-			const toDecoded = jidDecode(toJid)
-			if (!fromDecoded || !toDecoded) return
-			
-			const pnUser = fromDecoded.user // e.g., "554391318447"
-			const lidUser = toDecoded.user  // e.g., "109822716420216"
-			
-			// Check if bulk migration already happened for this user
-			if (await isRecentlyMigrated(pnUser)) {
-				console.log(`✅ Bulk migration already completed for user: ${pnUser}`)
+			// Check if already migrated for this specific device
+			if (await isRecentlyMigrated(fromJid)) {
+				console.log(`✅ Already migrated: ${fromJid}`)
 				return
 			}
 			
-			console.log(`🔄 Bulk migrating ALL devices: ${pnUser} → ${lidUser}`)
+			console.log(`🔄 Migrating device session: ${fromJid} → ${toJid}`)
 			
-			// Atomic bulk migration in transaction (whatsmeow pattern)
+			// Atomic migration in transaction
 			return (auth.keys as SignalKeyStoreWithTransaction).transaction(async () => {
-				let migratedCount = 0
-				const migratedDevices: string[] = []
+				const fromAddr = jidToSignalProtocolAddress(fromJid)
+				const toAddr = jidToSignalProtocolAddress(toJid)
 				
-				// Get all existing sessions for this PN user 
-				const allSessionKeys = await auth.keys.get('session', [])
-				const sessionEntries = Object.entries(allSessionKeys)
-				
-				// Find all PN sessions for this user (all devices)
-				const userPNSessions = sessionEntries.filter(([key]) => 
-					key.startsWith(`${pnUser}.`)
-				)
-				
-				if (userPNSessions.length === 0) {
-					console.log(`ℹ️ No sessions found for user ${pnUser}`)
-					await markAsMigrated(pnUser) // Mark as processed
+				// Load PN session for this specific device
+				const fromSession = await storage.loadSession(fromAddr.toString())
+				if (!fromSession || !fromSession.haveOpenSession()) {
+					console.log(`ℹ️ No session to migrate from ${fromJid}`)
+					await markAsMigrated(fromJid) // Mark as processed
 					return
 				}
 				
-				console.log(`📋 Found ${userPNSessions.length} device sessions to migrate for user ${pnUser}`)
+				// Copy to LID address (keep original)
+				await storage.storeSession(toAddr.toString(), fromSession)
+				console.log(`✅ Session copied: ${fromAddr} → ${toAddr}`)
+				console.log(`🔄 Keeping original session: ${fromAddr}`)
 				
-				// Migrate each device session
-				for (const [pnSessionKey, sessionData] of userPNSessions) {
-					const deviceMatch = pnSessionKey.match(/\.(\d+)$/)
-					const deviceId = deviceMatch ? deviceMatch[1] : '0'
-					
-					// Generate LID session key: 109822716420216_1.0, 109822716420216_1.8, etc.
-					const lidSessionKey = `${lidUser}_1.${deviceId}`
-					
-					// Copy session data to LID key
-					await auth.keys.set({
-						'session': {
-							[lidSessionKey]: sessionData
-						}
-					})
-					
-					migratedCount++
-					migratedDevices.push(`${pnSessionKey} → ${lidSessionKey}`)
-					console.log(`✅ Session copied: ${pnSessionKey} → ${lidSessionKey}`)
-				}
-				
-				// Mark user as migrated (prevent future bulk migrations)
-				await markAsMigrated(pnUser)
+				// Mark as migrated for this device
+				await markAsMigrated(fromJid)
 				
 				// Store LID mapping
 				await lidMapping.storeLIDPNMapping(toJid, fromJid)
-				
-				console.log(`🎉 Bulk migration completed: ${migratedCount} devices migrated for ${pnUser}`)
-				console.log(`📝 Migrated devices: ${migratedDevices.join(', ')}`)
 			})
 		}
 	}
