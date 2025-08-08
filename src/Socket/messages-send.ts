@@ -445,53 +445,32 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 				const bytes = encodeWAMessage(patchedMessage)
 				
-				// ROBUST DUAL ENCRYPTION: Handle all session existence scenarios
+				// DUAL ENCRYPTION: Encrypt for both PN and LID sessions (if both exist)
 				const wireJid = jid
-				const encryptionTargets: string[] = []
+				const encryptionTargets: string[] = [jid] // Always include original JID
 				
 				// if jid.Server == types.DefaultUserServer
 				if (jid.includes('@s.whatsapp.net') && !jid.includes('bot')) {
 					try {
+						// Check if LID mapping exists
 						const lidStore = signalRepository.getLIDMappingStore()
-						
-						// Check PN session existence
-						const hasPNSession = await lidStore.hasSession(jid)
-						
-						// Check LID mapping and session
 						const lidForPN = await lidStore.getLIDForPN(jid)
-						const hasLIDSession = lidForPN && lidForPN.includes('@lid') ? await lidStore.hasSession(lidForPN) : false
 						
-						// Scenario handling with robust fallbacks
-						if (hasPNSession && hasLIDSession) {
-							// Scenario 3: Both sessions exist - dual encryption
-							encryptionTargets.push(jid, lidForPN!)
-							console.log(`📤 Dual encryption: ${jid} + ${lidForPN}`)
-						} else if (hasPNSession && !hasLIDSession && lidForPN) {
-							// Scenario: PN exists, LID mapping exists but no LID session - migrate
-							await signalRepository.migrateSession(jid, lidForPN)
-							encryptionTargets.push(jid, lidForPN)
-							console.log(`📤 Migrated and dual encryption: ${jid} → ${lidForPN}`)
-						} else if (hasPNSession) {
-							// Scenario 1: Only PN session exists - single encryption
-							encryptionTargets.push(jid)
-							console.log(`📤 PN only encryption: ${jid}`)
-						} else if (hasLIDSession && lidForPN) {
-							// Scenario 2: Only LID session exists (PN missing) - LID only
-							encryptionTargets.push(lidForPN)
-							console.log(`📤 LID only encryption: ${jid} → ${lidForPN}`)
-						} else {
-							// Scenario 4: No sessions exist - fallback to PN (will fail gracefully)
-							encryptionTargets.push(jid)
-							console.log(`⚠️ No sessions found, attempting PN: ${jid}`)
+						if (lidForPN && lidForPN.includes('@lid')) {
+							// Check if LID session exists
+							if (await lidStore.hasSession(lidForPN)) {
+								encryptionTargets.push(lidForPN)
+								console.log(`📤 Dual encryption: ${jid} + ${lidForPN}`)
+							} else {
+								// Migrate if LID session doesn't exist
+								await signalRepository.migrateSession(jid, lidForPN)
+								encryptionTargets.push(lidForPN)
+								console.log(`📤 Migrated and encrypting: ${jid} → ${lidForPN}`)
+							}
 						}
 					} catch (error) {
-						// Fallback: Use original JID on any error
-						encryptionTargets.push(jid)
-						console.warn(`⚠️ Session check failed, using PN fallback: ${jid}`, error)
+						console.warn(`⚠️ Failed to get LID for ${jid}:`, error)
 					}
-				} else {
-					// Non-user JIDs (groups, status, etc.) - use original JID
-					encryptionTargets.push(jid)
 				}
 				
 				// Encrypt for all targets (PN + LID if both exist)
