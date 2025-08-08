@@ -1489,9 +1489,36 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					additionalNodes
 				})
 				
-				// Cache message using simplified whatsmeow approach
-				messageCache.addRecentMessage(fullMsg.key.remoteJid!, fullMsg.key.id!, fullMsg.message!)
-				logger.trace({ remoteJid: fullMsg.key.remoteJid, msgId: fullMsg.key.id }, 'Message cached before sending')
+				// Cache message with both original remoteJid and LID-mapped JID for retry compatibility
+				const originalRemoteJid = fullMsg.key.remoteJid!
+				messageCache.addRecentMessage(originalRemoteJid, fullMsg.key.id!, fullMsg.message!)
+				
+				// Also cache with LID-mapped version (if different) for device-specific retry requests
+				const decoded = jidDecode(jid)
+				if (decoded && jid !== originalRemoteJid) {
+					// Cache with the relay JID (could be LID after migration)
+					messageCache.addRecentMessage(jid, fullMsg.key.id!, fullMsg.message!)
+					
+					// Also cache device-specific versions if it's a user JID
+					if (decoded.server === 's.whatsapp.net' || decoded.server === 'lid') {
+						// Get LID mapping for device-specific caching
+						try {
+							const lidStore = signalRepository.getLIDMappingStore()
+							const lidForPN = await lidStore.getLIDForPN(jid)
+							if (lidForPN && lidForPN !== jid) {
+								messageCache.addRecentMessage(lidForPN, fullMsg.key.id!, fullMsg.message!)
+							}
+						} catch (error) {
+							console.warn('Failed to cache LID version:', error)
+						}
+					}
+				}
+				
+				logger.trace({ 
+					originalRemoteJid, 
+					relayJid: jid, 
+					msgId: fullMsg.key.id 
+				}, 'Message cached with multiple JID variants')
 
 				if (config.emitOwnEvents) {
 					process.nextTick(() => {
