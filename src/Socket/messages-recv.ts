@@ -184,7 +184,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			
 			if (msgKey.participant.includes('@s.whatsapp.net')) {
 				// Current participant is PN, try LID alternative
-				const lid = lidStore.getFromCache(msgKey.participant) // Use fast cache lookup
+				const lid = await lidStore.getLIDForPN(msgKey.participant) // Direct Redis lookup
 				if (lid) {
 					const alternativeKey = `${msgId}:${lid}`
 					const altRetryCount = msgRetryCache.get<number>(alternativeKey) || 0
@@ -739,7 +739,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			
 			if (participant.includes('@s.whatsapp.net')) {
 				// Try LID alternative for PN participant
-				const lid = lidStore.getFromCache(participant)
+				const lid = await lidStore.getLIDForPN(participant)
 				if (lid) {
 					logger.info({ 
 						remoteJid, 
