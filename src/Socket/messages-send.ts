@@ -445,48 +445,34 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 				const bytes = encodeWAMessage(patchedMessage)
 				
-				// DUAL ENCRYPTION: Encrypt for both PN and LID sessions (if both exist)
+				// EXACT WHATSMEOW LOGIC: send.go:1178-1187
+				let encryptionIdentity = jid
 				const wireJid = jid
-				const encryptionTargets: string[] = [jid] // Always include original JID
 				
 				// if jid.Server == types.DefaultUserServer
 				if (jid.includes('@s.whatsapp.net') && !jid.includes('bot')) {
 					try {
-						// Check if LID mapping exists
+						// lidForPN, err := cli.Store.LIDs.GetLIDForPN(ctx, jid)
 						const lidStore = signalRepository.getLIDMappingStore()
 						const lidForPN = await lidStore.getLIDForPN(jid)
 						
+						// else if !lidForPN.IsEmpty()
 						if (lidForPN && lidForPN.includes('@lid')) {
-							// Check if LID session exists
-							if (await lidStore.hasSession(lidForPN)) {
-								encryptionTargets.push(lidForPN)
-								console.log(`📤 Dual encryption: ${jid} + ${lidForPN}`)
-							} else {
-								// Migrate if LID session doesn't exist
-								await signalRepository.migrateSession(jid, lidForPN)
-								encryptionTargets.push(lidForPN)
-								console.log(`📤 Migrated and encrypting: ${jid} → ${lidForPN}`)
-							}
+							// cli.migrateSessionStore(ctx, jid, lidForPN)
+							await signalRepository.migrateSession(jid, lidForPN)
+							// encryptionIdentity = lidForPN
+							encryptionIdentity = lidForPN
+							console.log(`📤 whatsmeow logic: ${jid} → ${lidForPN}`)
 						}
 					} catch (error) {
 						console.warn(`⚠️ Failed to get LID for ${jid}:`, error)
 					}
 				}
 				
-				// Encrypt for all targets (PN + LID if both exist)
-				const encryptionPromises = encryptionTargets.map(async target => {
-					const result = await signalRepository.encryptMessage({ 
-						jid: target, 
-						data: bytes
-					})
-					return { target, ...result }
+				const { type, ciphertext } = await signalRepository.encryptMessage({ 
+					jid: encryptionIdentity, 
+					data: bytes
 				})
-				
-				const encryptionResults = await Promise.all(encryptionPromises)
-				
-				// Use the last result for compatibility (prefer LID if available, otherwise PN)
-				const primaryResult = encryptionResults[encryptionResults.length - 1] // Last one is LID if it exists
-				const { type, ciphertext } = primaryResult!
 				if (type === 'pkmsg') {
 					shouldIncludeDeviceIdentity = true
 				}
