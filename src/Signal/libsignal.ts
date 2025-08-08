@@ -213,18 +213,19 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			const fromAddr = jidToSignalProtocolAddress(fromJid)
 			const fromSignalAddr = fromAddr.toString()
 			
-			// Check migration cache first (per-device, following whatsmeow's approach)
-			if (migratedPNSessionsCache.has(fromSignalAddr)) {
-				console.log(`✅ Migration already completed for device: ${fromSignalAddr}`)
-				return
-			}
-			
 			// Check if LID session already exists for this device
 			if (await hasLIDSession(toJid)) {
 				console.log(`✅ LID session already exists: ${toJid}`)
-				// Mark as migrated even if session already existed
+				// Mark as migrated since session already exists
 				migratedPNSessionsCache.add(fromSignalAddr)
 				return
+			}
+			
+			// Check migration cache after verifying LID session doesn't exist
+			if (migratedPNSessionsCache.has(fromSignalAddr)) {
+				console.log(`⚠️ Cache says migrated but no LID session found - retrying: ${fromSignalAddr}`)
+				// Remove from cache to allow retry
+				migratedPNSessionsCache.delete(fromSignalAddr)
 			}
 			
 			console.log(`🔄 Migrating device session: ${fromJid} → ${toJid}`)
