@@ -543,7 +543,22 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		const destinationJid = !isStatus ? jidEncode(user, isLid ? 'lid' : isGroup ? 'g.us' : 's.whatsapp.net') : statusJid
 
 		// PRIVACY TOKENS: Get privacy token for recipient (following whatsmeow approach)
-		const privacyToken = !isGroup && !isStatus ? await getPrivacyToken(destinationJid) : null
+		let privacyToken = !isGroup && !isStatus ? await getPrivacyToken(destinationJid) : null
+		
+		// Auto-request privacy token if missing (proactive approach)
+		if (!privacyToken && !isGroup && !isStatus && isJidUser(destinationJid)) {
+			try {
+				logger.debug({ destinationJid }, 'Privacy token missing - requesting automatically')
+				await getPrivacyTokens([destinationJid])
+				// Try to get token again after request (may not be available immediately)
+				privacyToken = await getPrivacyToken(destinationJid)
+				if (privacyToken) {
+					logger.info({ destinationJid }, 'Privacy token obtained after request')
+				}
+			} catch (error) {
+				logger.warn({ destinationJid, error }, 'Failed to request privacy token')
+			}
+		}
 		
 		const binaryNodeContent: BinaryNode[] = []
 		const devices: JidWithDevice[] = []
