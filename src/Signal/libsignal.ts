@@ -195,12 +195,12 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			return privacyTokenManager
 		},
 		/**
-		 * Migrate session from PN to LID - PREVENT DUPLICATE MIGRATIONS
+		 * Migrate session from PN to LID - PER-DEVICE MIGRATION
 		 * Key principles:
 		 * 1. One-way migration only (PN → LID)
-		 * 2. Skip if already migrated (check cache, following whatsmeow approach)
+		 * 2. Skip if already migrated (per-device cache, following whatsmeow approach)
 		 * 3. Atomic operation within transaction
-		 * 4. Use migration cache to prevent double ratchet issues
+		 * 4. Use per-device migration cache to prevent double ratchet issues
 		 */
 		async migrateSession(fromJid: string, toJid: string) {
 			// Only migrate PN → LID
@@ -209,13 +209,13 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 				return
 			}
 			
-			// Get base PN user (without device) for cache checking
-			const { user } = jidDecode(fromJid)!
-			const pnSignalUser = user
+			// Get the full device JID for per-device migration tracking (following whatsmeow)
+			const fromAddr = jidToSignalProtocolAddress(fromJid)
+			const fromSignalAddr = fromAddr.toString()
 			
-			// Check migration cache first (following whatsmeow's approach)
-			if (migratedPNSessionsCache.has(pnSignalUser)) {
-				console.log(`✅ Migration already completed for PN: ${pnSignalUser}`)
+			// Check migration cache first (per-device, following whatsmeow's approach)
+			if (migratedPNSessionsCache.has(fromSignalAddr)) {
+				console.log(`✅ Migration already completed for device: ${fromSignalAddr}`)
 				return
 			}
 			
@@ -223,21 +223,20 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			if (await hasLIDSession(toJid)) {
 				console.log(`✅ LID session already exists: ${toJid}`)
 				// Mark as migrated even if session already existed
-				migratedPNSessionsCache.add(pnSignalUser)
+				migratedPNSessionsCache.add(fromSignalAddr)
 				return
 			}
 			
 			console.log(`🔄 Migrating device session: ${fromJid} → ${toJid}`)
 			
-			const fromAddr = jidToSignalProtocolAddress(fromJid)
 			const toAddr = jidToSignalProtocolAddress(toJid)
 			
 			// Load PN session for this specific device
-			const fromSession = await storage.loadSession(fromAddr.toString())
+			const fromSession = await storage.loadSession(fromSignalAddr)
 			if (!fromSession || !fromSession.haveOpenSession()) {
 				console.log(`ℹ️ No session to migrate from ${fromJid}`)
 				// Mark as processed to prevent future attempts
-				migratedPNSessionsCache.add(pnSignalUser)
+				migratedPNSessionsCache.add(fromSignalAddr)
 				return
 			}
 			
@@ -246,15 +245,15 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			console.log(`✅ Session copied: ${fromAddr} → ${toAddr}`)
 			
 			// Delete PN session to prevent identity/ratchet conflicts with LID session
-			await auth.keys.set({ 'session': { [fromAddr.toString()]: null } })
+			await auth.keys.set({ 'session': { [fromSignalAddr]: null } })
 			console.log(`🗑️ Deleted PN session to prevent conflicts: ${fromAddr}`)
 			
 			// Store LID mapping
 			await lidMapping.storeLIDPNMapping(toJid, fromJid)
 			
-			// Mark migration as completed in cache (following whatsmeow's approach)
-			migratedPNSessionsCache.add(pnSignalUser)
-			console.log(`🎯 Migration marked complete for PN user: ${pnSignalUser}`)
+			// Mark migration as completed in cache (per-device, following whatsmeow's approach)
+			migratedPNSessionsCache.add(fromSignalAddr)
+			console.log(`🎯 Migration marked complete for device: ${fromSignalAddr}`)
 		}
 	}
 
