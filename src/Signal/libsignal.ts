@@ -249,9 +249,7 @@ export function makeLibSignalRepository(auth: SignalAuthState): SignalRepository
 			
 			return { 
 				type, 
-				ciphertext: Buffer.from(body as any, 'binary'),
-				encryptionJid: jid,
-				wireJid: jid
+				ciphertext: Buffer.from(body as any, 'binary')
 			}
 		},
 		async encryptGroupMessage({ group, meId, data }) {

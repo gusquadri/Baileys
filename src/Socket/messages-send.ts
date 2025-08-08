@@ -445,8 +445,33 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 				const bytes = encodeWAMessage(patchedMessage)
 				
-				const { type, ciphertext, encryptionJid, wireJid } = await signalRepository.encryptMessage({ 
-					jid, 
+				// DETERMINE ENCRYPTION JID: Check if we should encrypt for LID instead of PN
+				let encryptionJid = jid
+				const wireJid = jid
+				
+				// For PN addresses, check if we have a LID mapping (whatsmeow approach)
+				if (jid.includes('@s.whatsapp.net') && !jid.includes('bot')) {
+					try {
+						const lidStore = signalRepository.getLIDMappingStore()
+						const storedLid = await lidStore.getLIDForPN(jid)
+						
+						if (storedLid && storedLid.includes('@lid')) {
+							// Check if we have a session for the LID
+							const hasLidSession = await lidStore.hasSession(storedLid)
+							if (hasLidSession) {
+								console.log(`📤 Socket: Using LID for encryption: ${jid} → ${storedLid}`)
+								encryptionJid = storedLid
+							} else {
+								console.log(`📤 Socket: LID found but no session, using PN: ${jid}`)
+							}
+						}
+					} catch (error) {
+						console.warn(`⚠️ Socket: Failed to lookup LID for ${jid}:`, error)
+					}
+				}
+				
+				const { type, ciphertext } = await signalRepository.encryptMessage({ 
+					jid: encryptionJid, 
 					data: bytes
 				})
 				if (type === 'pkmsg') {
@@ -456,7 +481,7 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				// Use wire identity in message attributes (whatsmeow approach)
 				const node: BinaryNode = {
 					tag: 'to',
-					attrs: { jid: wireJid || jid },
+					attrs: { jid: wireJid },
 					content: [
 						{
 							tag: 'enc',
