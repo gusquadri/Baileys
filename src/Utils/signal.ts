@@ -1,3 +1,4 @@
+import { chunk } from 'lodash'
 import { KEY_BUNDLE_TYPE } from '../Defaults'
 import type { SignalRepository } from '../Types'
 import type {
@@ -23,14 +24,14 @@ import type { DeviceListData, ParsedDeviceInfo, USyncQueryResultList } from '../
 import { Curve, generateSignalPubKey } from './crypto'
 import { encodeBigEndian } from './generics'
 
-function chunk<T>(array: T[], size: number): T[][] {
-	const chunks: T[][] = []
-	for (let i = 0; i < array.length; i += size) {
-		chunks.push(array.slice(i, i + size))
-	}
+// function chunk<T>(array: T[], size: number): T[][] {
+// 	const chunks: T[][] = []
+// 	for (let i = 0; i < array.length; i += size) {
+// 		chunks.push(array.slice(i, i + size))
+// 	}
 
-	return chunks
-}
+// 	return chunks
+// }
 
 export const createSignalIdentity = (wid: string, accountSignatureKey: Uint8Array): SignalIdentity => {
 	return {
