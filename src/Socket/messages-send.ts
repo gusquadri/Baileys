@@ -41,7 +41,6 @@ import {
 	getBinaryNodeChild,
 	getBinaryNodeChildren,
 	isJidGroup,
-	isLidUser,
 	isPnUser,
 	jidDecode,
 	jidEncode,
