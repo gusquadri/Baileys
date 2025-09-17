@@ -110,30 +110,15 @@ export function makeLibSignalRepository(
 		},
 
 		async encryptMessage({ jid, data }) {
-			// LID SINGLE SOURCE OF TRUTH: Always prefer LID when available
+			// LID SINGLE SOURCE OF TRUTH: Always use LID when mapping exists
 			let encryptionJid = jid
 
-			// Check for LID mapping and use it if session exists
+			// Automatically filter PN to LID when mapping exists
 			if (jid.includes('@s.whatsapp.net')) {
 				const lidForPN = await lidMapping.getLIDForPN(jid)
 				if (lidForPN?.includes('@lid')) {
-					const lidAddr = jidToSignalProtocolAddress(lidForPN)
-					const { [lidAddr.toString()]: lidSession } = await auth.keys.get('session', [lidAddr.toString()])
-
-					if (lidSession) {
-						// LID session exists, use it
-						encryptionJid = lidForPN
-					} else {
-						// Try to migrate if PN session exists
-						const pnAddr = jidToSignalProtocolAddress(jid)
-						const { [pnAddr.toString()]: pnSession } = await auth.keys.get('session', [pnAddr.toString()])
-
-						if (pnSession) {
-							// Migrate PN to LID
-							await repository.migrateSession([jid], lidForPN)
-							encryptionJid = lidForPN
-						}
-					}
+					// Always use LID when mapping exists - libsignal handles session creation/migration
+					encryptionJid = lidForPN
 				}
 			}
 
@@ -338,13 +323,7 @@ function signalStorage(
 					const lidForPN = await lidMapping.getLIDForPN(pnJid)
 					if (lidForPN?.includes('@lid')) {
 						const lidAddr = jidToSignalProtocolAddress(lidForPN)
-						const lidId = lidAddr.toString()
-
-						// Check if LID session exists
-						const { [lidId]: lidSession } = await keys.get('session', [lidId])
-						if (lidSession) {
-							actualId = lidId
-						}
+						actualId = lidAddr.toString()
 					}
 				}
 
