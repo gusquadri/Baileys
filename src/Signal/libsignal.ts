@@ -155,7 +155,17 @@ export function makeLibSignalRepository(
 			}, group)
 		},
 		async injectE2ESession({ jid, session }) {
-			const cipher = new libsignal.SessionBuilder(storage, jidToSignalProtocolAddress(jid))
+			let wireJid = jid
+
+			// Automatically filter PN to LID when mapping exists
+			if (jid.includes('@s.whatsapp.net')) {
+				const lidForPN = await lidMapping.getLIDForPN(jid)
+				if (lidForPN?.includes('@lid')) {
+					wireJid = lidForPN
+				}
+			}
+
+			const cipher = new libsignal.SessionBuilder(storage, jidToSignalProtocolAddress(wireJid))
 			return parsedKeys.transaction(async () => {
 				await cipher.initOutgoing(session)
 			}, jid)
