@@ -645,6 +645,17 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 				])
 
 				if (!participant) {
+					// Store LID mappings
+					if (groupData && !isStatus) {
+						const mappingsToStore = groupData.participants
+							.map(p => ({ lid: p.lid!, pn: p.phoneNumber! }))
+						
+						if (mappingsToStore.length > 0) {
+							await signalRepository.lidMapping.storeLIDPNMappings(mappingsToStore)
+							logger.debug({ count: mappingsToStore.length }, 'Stored group LID mappings before device enumeration')
+						}
+					}
+					
 					const participantsList = groupData && !isStatus ? groupData.participants.map(p => p.id) : []
 					if (isStatus && statusJidList) {
 						participantsList.push(...statusJidList)
