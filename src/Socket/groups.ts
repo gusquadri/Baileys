@@ -31,7 +31,20 @@ export const makeGroupsSocket = (config: SocketConfig) => {
 
 	const groupMetadata = async (jid: string) => {
 		const result = await groupQuery(jid, 'get', [{ tag: 'query', attrs: { request: 'interactive' } }])
-		return extractGroupMetadata(result)
+		const metadata = extractGroupMetadata(result)
+		
+		// Store LID-PN mappings from group participants to avoid USync calls during encryption
+		const mappingsToStore = metadata.participants
+			.filter(p => p.lid && p.phoneNumber)
+			.map(p => ({ lid: p.lid!, pn: p.phoneNumber! }))
+		
+		if (mappingsToStore.length > 0) {
+			sock.signalRepository.lidMapping.storeLIDPNMappings(mappingsToStore).catch(err => {
+				console.warn('Failed to store group participant LID mappings:', err)
+			})
+		}
+		
+		return metadata
 	}
 
 	const groupFetchAllParticipating = async () => {
@@ -57,6 +70,8 @@ export const makeGroupsSocket = (config: SocketConfig) => {
 		const groupsChild = getBinaryNodeChild(result, 'groups')
 		if (groupsChild) {
 			const groups = getBinaryNodeChildren(groupsChild, 'group')
+			const allMappings: { lid: string; pn: string }[] = []
+			
 			for (const groupNode of groups) {
 				const meta = extractGroupMetadata({
 					tag: 'result',
@@ -64,6 +79,19 @@ export const makeGroupsSocket = (config: SocketConfig) => {
 					content: [groupNode]
 				})
 				data[meta.id] = meta
+				
+				// Collect LID-PN mappings from all groups
+				const mappings = meta.participants
+					.filter(p => p.lid && p.phoneNumber)
+					.map(p => ({ lid: p.lid!, pn: p.phoneNumber! }))
+				allMappings.push(...mappings)
+			}
+			
+			// Store all collected mappings in bulk to avoid USync calls
+			if (allMappings.length > 0) {
+				sock.signalRepository.lidMapping.storeLIDPNMappings(allMappings).catch(err => {
+					console.warn('Failed to store bulk group participant LID mappings:', err)
+				})
 			}
 		}
 
