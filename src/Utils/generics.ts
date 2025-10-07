@@ -272,18 +272,29 @@ export const fetchLatestBaileysVersion = async (options: RequestInit = {}) => {
  * A utility that fetches the latest web version of whatsapp.
  * Use to ensure your WA connection is always on the latest version
  */
-export const fetchLatestWaWebVersion = async (options: RequestInit = {}) => {
+export const fetchLatestWaWebVersion = async () => {
 	try {
-		const response = await fetch('https://web.whatsapp.com/sw.js', {
-			dispatcher: options.dispatcher,
-			method: 'GET',
-			headers: options.headers
-		})
-		if (!response.ok) {
-			throw new Boom(`Failed to fetch sw.js: ${response.statusText}`, { statusCode: response.status })
-		}
+		let data: string
 
-		const data = await response.text()
+		try {
+			const { execSync } = await import('child_process')
+			data = execSync('curl -s https://web.whatsapp.com/sw.js', {
+				encoding: 'utf8',
+				timeout: 10000,
+				maxBuffer: 5 * 1024 * 1024 // 5MB limit
+			})
+		} catch (curlError: any) {
+			const errorMsg = curlError?.code === 'ENOENT'
+				? 'curl command not found, please install curl'
+				: curlError?.killed
+				? 'Request timeout while fetching sw.js'
+				: `Failed to fetch sw.js: ${curlError?.message || 'Unknown error'}`
+
+			throw new Boom(errorMsg, {
+				statusCode: curlError?.code === 'ENOENT' ? 501 : 500,
+				data: { originalError: curlError }
+			})
+		}
 
 		const regex = /\\?"client_revision\\?":\s*(\d+)/
 		const match = data.match(regex)
